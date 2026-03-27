@@ -1,0 +1,55 @@
+default_provider: openrouter
+
+providers:
+  openrouter:
+    type: openrouter
+    ssl_verify: false
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY}
+    model: stepfun/step-3.5-flash:free
+
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434/v1
+    model: llama3.2
+
+  llamacpp:
+    type: llamacpp
+    base_url: http://localhost:8080/v1
+    model: default
+
+fallback:
+  fallback_chain: [ollama, openrouter, llamacpp]
+  retry_on: [timeout, connection_error, "500", "502", "503", "529"]
+
+skills_dirs:
+  - ./skills
+  - ~/.vector/skills
+
+memory_db_path: ~/.eyetor/memory.db
+
+tracking:
+  db_path: ~/.eyetor/tracking.db
+  limits:
+    openrouter:
+      daily_cost_usd: 10.0
+      daily_tokens: 1000000
+
+channels:
+  telegram:
+    enabled: true
+    bot_token: ${TELEGRAM_BOT_TOKEN}
+    streaming_chunk_size: 20
+    ssl_verify: false
+    auth:
+      enabled: true
+      allowed_users:
+        - ${TELEGRAM_ALLOWED_USER}   # your numeric chat_id, e.g.: 123456789
+
+orchestrator:
+  auto_delegate: false
+  workers: {}
+
+mcp_servers: {}
+
+log_level: INFO

@@ -1,0 +1,25 @@
+[project]
+name = "eyetor"
+version = "0.1.0"
+description = "Multi-agent AI system based on Anthropic's agent patterns"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "rich>=13.0",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+telegram = ["aiogram>=3.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eyetor"]
+
+[project.scripts]
+eyetor = "eyetor.cli:main_sync"

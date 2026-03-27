@@ -1,0 +1,6 @@
+# Quadlet Volume unit — persistent data for Eyetor
+# Place in: ~/.config/containers/systemd/
+# Manages: eyetor-data named volume
+
+[Volume]
+Label=app=eyetor

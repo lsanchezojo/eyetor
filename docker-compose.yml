@@ -1,0 +1,56 @@
+services:
+  eyetor-chat:
+    build: .
+    image: eyetor:latest
+    container_name: eyetor-chat
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist SQLite databases and user-level skills
+      - eyetor-data:/home/eyetor/.eyetor
+      # Mount local skills directory for development
+      - ./skills:/app/skills:ro
+      # Mount local config for easy customization
+      - ./config:/app/config:ro
+      # ---- HOST ACCESS (optional) ----
+      # Uncomment to give the agent read/write access to specific directories.
+      # The agent will see these paths inside the container.
+      #
+      # - C:/Users/${USERNAME}/Documents:/workspace/documents:rw
+      # - C:/Dev:/workspace/dev:rw
+      # - C:/:/workspace/host:rw   # Full disk (use with caution)
+    command: ["eyetor", "chat", "--host-tools"]
+    stdin_open: true
+    tty: true
+    healthcheck:
+      test: ["CMD", "eyetor", "providers", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  eyetor-telegram:
+    build: .
+    image: eyetor:latest
+    container_name: eyetor-telegram
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - eyetor-data:/home/eyetor/.eyetor
+      - ./skills:/app/skills:ro
+      - ./config:/app/config:ro
+    command: ["eyetor", "telegram"]
+    healthcheck:
+      test: ["CMD", "eyetor", "providers", "list"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    profiles:
+      - telegram
+
+volumes:
+  eyetor-data:
+    driver: local
