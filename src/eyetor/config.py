@@ -19,6 +19,7 @@ class ProviderConfig(BaseModel):
     api_key: str | None = None
     model: str
     ssl_verify: bool | str = True  # False to disable, or path to CA bundle
+    temperature: float = 0.7  # Sampling temperature sent in every request
 
 
 class TrackingLimits(BaseModel):

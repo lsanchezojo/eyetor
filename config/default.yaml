@@ -1,4 +1,4 @@
-default_provider: openrouter
+default_provider: llamacpp
 
 providers:
   openrouter:
@@ -17,6 +17,7 @@ providers:
     type: llamacpp
     base_url: http://localhost:8080/v1
     model: default
+    temperature: 0.6  # Qwen3 recommended (matches --temp 0.6 on server)
 
 fallback:
   fallback_chain: [ollama, openrouter, llamacpp]

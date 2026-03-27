@@ -38,6 +38,7 @@ def create_provider(config: ProviderConfig) -> BaseProvider:
         api_key=config.api_key,
         model=config.model,
         ssl_verify=config.ssl_verify,
+        temperature=config.temperature,
     )
 
 

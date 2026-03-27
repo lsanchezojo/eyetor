@@ -94,7 +94,7 @@ def chat(ctx: click.Context, provider: str | None, model: str | None, system: st
             if host_tools else
             "You are Eyetor, a helpful AI assistant."
         )
-        skills_context = skill_reg.available_skills_summary()
+        skills_context = skill_reg.build_skills_context(skill_names)
         if skills_context:
             base_system = f"{base_system}\n\n{skills_context}"
 
@@ -140,6 +140,7 @@ def chat(ctx: click.Context, provider: str | None, model: str | None, system: st
             provider=provider or cfg.default_provider,
             model=model or prov.model,
             system_prompt=base_system,
+            temperature=prov.temperature,
         )
         session_mgr = SessionManager(agent_cfg, prov, tool_registry=tool_registry)
         channel = CliChannel(session_mgr, skill_names=skill_names)
@@ -220,6 +221,7 @@ def telegram(ctx: click.Context, provider: str | None) -> None:
             provider=provider or cfg.default_provider,
             model=prov.model,
             system_prompt="You are Eyetor, a helpful AI assistant.",
+            temperature=prov.temperature,
         )
         session_mgr = SessionManager(agent_cfg, prov)
         channel = TelegramChannel(session_mgr, cfg.channels.telegram)
@@ -259,6 +261,7 @@ def run(ctx: click.Context, input_text: str, provider: str | None, model: str | 
                 provider=provider or cfg.default_provider,
                 model=prov.model,
                 system_prompt=system or "You are a helpful assistant.",
+                temperature=prov.temperature,
             ),
             provider=prov,
         )

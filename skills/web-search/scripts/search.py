@@ -59,6 +59,13 @@ def fetch(url: str) -> str:
     return text
 
 
+def _decode_entities(text: str) -> str:
+    """Decode common HTML entities in a plain-text string."""
+    for entity, char in [("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&nbsp;", " "), ("&quot;", '"'), ("&#x27;", "'")]:
+        text = text.replace(entity, char)
+    return text
+
+
 def _html_to_text(html: str) -> str:
     """Very basic HTML to plain text conversion."""
     # Remove scripts and styles
@@ -78,22 +85,37 @@ def _html_to_text(html: str) -> str:
 
 def _parse_ddg_lite(html: str) -> list[dict]:
     """Parse DuckDuckGo Lite HTML and extract results."""
-    results = []
-    # Find result links — DDG Lite uses <a class="result-link">
+    # DDG Lite uses single-quoted class attributes and redirect URLs
     link_pattern = re.compile(
-        r'<a[^>]+class="result-link"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+        r"<a[^>]+class=['\"]result-link['\"][^>]*href=['\"]([^'\"]+)['\"][^>]*>(.*?)</a>"
+        r"|<a[^>]+href=['\"]([^'\"]+)['\"][^>]+class=['\"]result-link['\"][^>]*>(.*?)</a>",
         re.IGNORECASE | re.DOTALL,
     )
     snippet_pattern = re.compile(
-        r'<td[^>]+class="result-snippet"[^>]*>(.*?)</td>',
+        r"<td[^>]+class=['\"]result-snippet['\"][^>]*>(.*?)</td>",
         re.IGNORECASE | re.DOTALL,
     )
-    links = link_pattern.findall(html)
-    snippets = [m for m in snippet_pattern.findall(html)]
 
+    links = []
+    for m in link_pattern.finditer(html):
+        raw_url = m.group(1) or m.group(3)
+        title = _decode_entities(re.sub(r"<[^>]+>", "", m.group(2) or m.group(4) or "").strip())
+        # Decode redirect: //duckduckgo.com/l/?uddg=ENCODED_URL&rut=...
+        uddg = re.search(r"[?&]uddg=([^&]+)", raw_url)
+        url = urllib.parse.unquote(uddg.group(1)) if uddg else raw_url
+        # Fix protocol-relative URLs
+        if url.startswith("//"):
+            url = "https:" + url
+        links.append((url, title))
+
+    snippets = [
+        _decode_entities(re.sub(r"<[^>]+>", "", m.group(1)).strip())
+        for m in snippet_pattern.finditer(html)
+    ]
+
+    results = []
     for i, (url, title) in enumerate(links):
-        title = re.sub(r"<[^>]+>", "", title).strip()
-        snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip() if i < len(snippets) else ""
+        snippet = snippets[i] if i < len(snippets) else ""
         results.append({"title": title, "url": url, "snippet": snippet})
     return results
 

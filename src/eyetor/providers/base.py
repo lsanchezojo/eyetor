@@ -25,11 +25,13 @@ class BaseProvider(ABC):
         model: str,
         api_key: str | None = None,
         ssl_verify: bool | str = True,
+        temperature: float = 0.7,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.ssl_verify = ssl_verify
+        self.temperature = temperature
 
     # ------------------------------------------------------------------
     # Public API

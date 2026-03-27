@@ -104,7 +104,7 @@ def discover_skills(skills_dirs: list[str | Path]) -> list[SkillMetadata]:
     """
     found: dict[str, SkillMetadata] = {}
     for raw_dir in skills_dirs:
-        base = Path(raw_dir).expanduser()
+        base = Path(raw_dir).expanduser().resolve()
         if not base.exists():
             continue
         for candidate in sorted(base.iterdir()):
