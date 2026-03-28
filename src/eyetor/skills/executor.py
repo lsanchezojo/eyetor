@@ -10,7 +10,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT = 30.0  # seconds
+DEFAULT_TIMEOUT = 120.0  # seconds
 
 
 async def run_script(
@@ -51,8 +51,10 @@ async def run_script(
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         if proc.returncode != 0:
             err = stderr.decode(errors="replace").strip()
-            logger.warning("Script %s exited %d: %s", script_path.name, proc.returncode, err)
-            return json.dumps({"error": err or f"Script exited with code {proc.returncode}"})
+            out = stdout.decode(errors="replace").strip()
+            logger.warning("Script %s exited %d: %s", script_path.name, proc.returncode, err or out)
+            # Prefer stdout (scripts print JSON errors there); fall back to stderr
+            return out or json.dumps({"error": err or f"Script exited with code {proc.returncode}"})
         return stdout.decode(errors="replace").strip()
     except asyncio.TimeoutError:
         logger.error("Script %s timed out after %.1fs", script_path.name, timeout)

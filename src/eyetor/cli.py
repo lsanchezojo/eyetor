@@ -90,13 +90,17 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
         # System prompt
         if use_host_tools:
             base_system = (
-                "You are Eyetor, a helpful AI assistant with access to tools that can act on the user's computer. "
-                "You can run shell commands, manage files, open URLs, and search the web. "
-                "Always explain what you are about to do before doing it. "
-                "Ask for confirmation before destructive operations (delete, overwrite, format)."
+                "Eres Eyetor, un asistente de IA con acceso a herramientas que pueden actuar en el ordenador del usuario. "
+                "Puedes ejecutar comandos de shell, gestionar ficheros, abrir URLs y buscar en internet. "
+                "Responde siempre en español de España. "
+                "Explica brevemente lo que vas a hacer antes de hacerlo. "
+                "Pide confirmación antes de operaciones destructivas (borrar, sobreescribir, formatear)."
             )
         else:
-            base_system = "You are Eyetor, a helpful AI assistant."
+            base_system = (
+                "Eres Eyetor, un asistente de IA útil. "
+                "Responde siempre en español de España."
+            )
 
         skills_context = skill_reg.build_skills_context(skill_names)
         if skills_context:

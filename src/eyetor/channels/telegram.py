@@ -14,6 +14,7 @@ import logging
 import re
 import tempfile
 import os
+from pathlib import Path
 
 from eyetor.channels.base import BaseChannel
 from eyetor.chat.manager import SessionManager
@@ -125,7 +126,8 @@ class TelegramChannel(BaseChannel):
                 "/skills — list available skills\n"
                 "/tasks — list scheduled tasks\n"
                 "/help — show this help\n\n"
-                "Just send me a message to chat!"
+                "Send a message to chat, a voice note to transcribe, "
+                "or a receipt photo (with store name as caption) to ingest prices."
             )
 
         @dp.message(F.text)
@@ -160,6 +162,65 @@ class TelegramChannel(BaseChannel):
             except Exception as exc:
                 logger.error("Telegram message handler error: %s", exc)
                 await placeholder.edit_text(f"Error: {exc}")
+
+        @dp.message(F.photo)
+        async def on_photo(msg: Message) -> None:
+            if not _is_authorized(msg):
+                await msg.answer("Unauthorized. Contact the administrator.")
+                return
+
+            photo = msg.photo[-1]  # last = largest
+            if photo.file_size and photo.file_size > 25 * 1024 * 1024:
+                await msg.answer("Photo too large (max 25 MB).")
+                return
+
+            caption = msg.caption or ""
+            try:
+                # Save to a persistent path so it survives follow-up messages
+                receipts_dir = Path.home() / ".eyetor" / "receipts"
+                receipts_dir.mkdir(parents=True, exist_ok=True)
+                import time as _time
+                img_path = receipts_dir / f"{msg.chat.id}_{int(_time.time())}.jpg"
+
+                tg_file = await bot.get_file(photo.file_id)
+                await bot.download_file(tg_file.file_path, destination=str(img_path))
+
+                store_hint = (
+                    f' La tienda es "{caption.strip()}".' if caption.strip() else ""
+                )
+                prompt = (
+                    f"Te mando una foto de un ticket de supermercado.{store_hint} "
+                    f"Ingéstalo con la skill grocery-intel (usa receipt.py ingest). "
+                    f"La imagen está en: {img_path}"
+                )
+                session_id = f"telegram-{msg.chat.id}"
+                session = self._manager.get_or_create(session_id)
+
+                placeholder = await msg.answer("🧾 Procesando ticket...")
+                buffer = ""
+                last_edit = ""
+                try:
+                    async for chunk in session.send(prompt):
+                        buffer += chunk
+                        if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
+                            try:
+                                await placeholder.edit_text(buffer or "...")
+                                last_edit = buffer
+                            except Exception:
+                                pass
+                    if buffer:
+                        try:
+                            await placeholder.edit_text(
+                                _md_to_html(buffer), parse_mode="HTML"
+                            )
+                        except Exception:
+                            await msg.answer(_md_to_html(buffer), parse_mode="HTML")
+                except Exception as exc:
+                    logger.error("Telegram photo handler error: %s", exc)
+                    await placeholder.edit_text(f"Error: {exc}")
+            except Exception as exc:
+                logger.error("Photo download error: %s", exc)
+                await msg.answer(f"No se pudo procesar la foto: {exc}")
 
         @dp.message(F.voice | F.audio)
         async def on_voice(msg: Message) -> None:
