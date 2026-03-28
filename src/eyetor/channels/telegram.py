@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from eyetor.channels.base import BaseChannel
 from eyetor.chat.manager import SessionManager
@@ -136,12 +137,12 @@ class TelegramChannel(BaseChannel):
                         except Exception:
                             pass  # Ignore edit conflicts
 
-                # Final edit with complete response
-                if buffer and buffer != last_edit:
+                # Final edit always applies HTML formatting
+                if buffer:
                     try:
-                        await placeholder.edit_text(buffer)
+                        await placeholder.edit_text(_md_to_html(buffer), parse_mode="HTML")
                     except Exception:
-                        await msg.answer(buffer)
+                        await msg.answer(_md_to_html(buffer), parse_mode="HTML")
             except Exception as exc:
                 logger.error("Telegram message handler error: %s", exc)
                 await placeholder.edit_text(f"Error: {exc}")
@@ -161,6 +162,69 @@ class TelegramChannel(BaseChannel):
             await self._dp.stop_polling()
         if self._bot:
             await self._bot.session.close()
+
+
+def _escape_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _md_to_html(text: str) -> str:
+    """Convert Markdown to Telegram HTML (supported subset).
+
+    Handles code blocks first (protected from inline processing), then
+    applies inline transforms on the remaining text segments.
+    """
+    # Split on fenced code blocks to protect their content
+    code_block_re = re.compile(r"```(\w*)\n?(.*?)```", re.DOTALL)
+    segments = []
+    last = 0
+    for m in code_block_re.finditer(text):
+        segments.append(("text", text[last:m.start()]))
+        lang = m.group(1).strip()
+        code = _escape_html(m.group(2).strip())
+        tag = f'<code class="language-{lang}">' if lang else "<code>"
+        segments.append(("code", f"<pre>{tag}{code}</code></pre>"))
+        last = m.end()
+    segments.append(("text", text[last:]))
+
+    parts = []
+    for kind, content in segments:
+        if kind == "code":
+            parts.append(content)
+        else:
+            parts.append(_inline_md_to_html(content))
+    return "".join(parts)
+
+
+def _inline_md_to_html(text: str) -> str:
+    """Apply inline Markdown → HTML transforms on a plain-text segment."""
+    # Escape HTML entities before adding any tags
+    text = _escape_html(text)
+
+    # Inline code `...`
+    text = re.sub(r"`([^`\n]+)`", lambda m: f"<code>{m.group(1)}</code>", text)
+
+    # Bold: **text** or __text__
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.DOTALL)
+
+    # Italic: *text* or _text_ (single, not preceded/followed by same char)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
+    text = re.sub(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)", r"<i>\1</i>", text)
+
+    # Strikethrough: ~~text~~
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text, flags=re.DOTALL)
+
+    # Headers: # ## ### → bold on its own line
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+
+    # Horizontal rules
+    text = re.sub(r"^[-*_]{3,}\s*$", "─────", text, flags=re.MULTILINE)
+
+    # Unordered list items: - / * / + at line start → bullet
+    text = re.sub(r"^[ \t]*[-*+] ", "• ", text, flags=re.MULTILINE)
+
+    return text
 
 
 def _format_skills_text(skill_reg) -> str:

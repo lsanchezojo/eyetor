@@ -19,29 +19,46 @@ Use this skill when:
 
 ## How to search the web
 1. Run `scripts/search.py --query "<search terms>" --max-results 5`
-2. The script returns JSON with a list of results: `[{"title": "...", "url": "...", "snippet": "..."}]`
-3. Pick the most relevant results to answer the user's question
-4. Optionally fetch the full content of a result URL (see below)
+2. The script returns JSON: `[{"title": "...", "url": "...", "snippet": "..."}]`
+3. If the snippets contain enough information to fully answer the question, use them directly.
+4. **If the snippets are too brief or don't contain the actual data needed** (weather, prices, scores, news body, etc.) you MUST fetch the most relevant URL before answering.
 
 ## How to fetch a URL
 1. Run `scripts/search.py --fetch "<url>"`
 2. Returns the page content as plain text (HTML stripped)
-3. Use this when a search result snippet is not enough
+3. **Always fetch when the user needs specific data** that cannot be inferred from titles and snippets alone.
+
+## When to always fetch (never answer from snippets alone)
+- Weather / forecast queries → fetch a weather site URL from the results
+- Sports scores or live results
+- News article content (not just the headline)
+- Prices, stock values, exchange rates
+- Any question requiring up-to-date numeric or structured data
 
 ## Examples
 
-Search for Python asyncio:
+Search then fetch weather:
 ```
-scripts/search.py --query "Python asyncio tutorial" --max-results 3
+scripts/search.py --query "tiempo Lebrija Sevilla hoy" --max-results 3
+# pick best URL from results, then:
+scripts/search.py --fetch "https://www.tiempo.es/lebrija.htm"
 ```
 
-Fetch a specific page:
+Search for an article:
 ```
-scripts/search.py --fetch "https://docs.python.org/3/library/asyncio.html"
+scripts/search.py --query "OpenAI GPT-5 release" --max-results 3
+# then fetch the most relevant article URL
+scripts/search.py --fetch "https://..."
+```
+
+Search for reference docs:
+```
+scripts/search.py --query "Python asyncio tutorial" --max-results 3
+# snippets are enough for general questions — no need to fetch
 ```
 
 ## Notes
 - Search uses DuckDuckGo Lite (no API key required)
-- Fetch strips HTML and returns readable text
-- Respect robots.txt and rate limits
+- Fetch strips HTML and returns readable text (truncated at 8000 chars)
+- If a URL cannot be fetched, try the next result URL
 - If a URL cannot be fetched, the script returns an error JSON object
