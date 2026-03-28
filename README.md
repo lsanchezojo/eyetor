@@ -147,8 +147,21 @@ Skills live in `skills/` following the [agentskills.io](https://agentskills.io) 
 | `filesystem` | Read, write, list, search files |
 | `browser` | Open URLs, fetch page content |
 | `web-search` | Search the web via DuckDuckGo |
+| `google-workspace` | Google Calendar, Gmail, and Tasks (requires setup) |
 
 Use `/skills` in any channel (CLI or Telegram) to list active skills with their descriptions. New skills are picked up automatically at startup from all directories listed under `skills_dirs` in `config/default.yaml`.
+
+### google-workspace setup
+
+Requires a Google Cloud project with the Calendar, Gmail, and Tasks APIs enabled.
+
+1. Create OAuth 2.0 credentials (type: **Desktop App**) in [Google Cloud Console](https://console.cloud.google.com/) and download `credentials.json`
+2. Place it at `~/.eyetor/google_credentials.json` (or set `GOOGLE_CREDENTIALS_FILE` env var)
+3. Install dependencies:
+   ```bash
+   pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
+   ```
+4. On first use the agent will trigger a browser OAuth flow — the token is saved automatically for subsequent runs
 
 ## Providers
 
