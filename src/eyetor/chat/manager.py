@@ -12,6 +12,7 @@ from eyetor.providers.base import BaseProvider
 
 if TYPE_CHECKING:
     from eyetor.memory.manager import MemoryManager
+    from eyetor.scheduler.channel import SchedulerChannel
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +31,14 @@ class SessionManager:
         tool_registry: ToolRegistry | None = None,
         system_prompt_suffix: str = "",
         memory_manager: "MemoryManager | None" = None,
+        scheduler: "SchedulerChannel | None" = None,
     ) -> None:
         self._config = config
         self._provider = provider
         self._tool_registry = tool_registry
         self._system_prompt_suffix = system_prompt_suffix
         self._memory = memory_manager
+        self._scheduler = scheduler
         self._sessions: dict[str, ChatSession] = {}
 
     def get_or_create(self, session_id: str) -> ChatSession:
@@ -48,6 +51,7 @@ class SessionManager:
                 tool_registry=self._tool_registry,
                 system_prompt_suffix=self._system_prompt_suffix,
                 memory_manager=self._memory,
+                scheduler=self._scheduler,
             )
             logger.debug("Created new session: %s", session_id)
         return self._sessions[session_id]

@@ -13,6 +13,7 @@ from eyetor.providers.base import BaseProvider
 
 if TYPE_CHECKING:
     from eyetor.memory.manager import MemoryManager
+    from eyetor.scheduler.channel import SchedulerChannel
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ class ChatSession:
         tool_registry: ToolRegistry | None = None,
         system_prompt_suffix: str = "",
         memory_manager: "MemoryManager | None" = None,
+        scheduler: "SchedulerChannel | None" = None,
     ) -> None:
         self.session_id = session_id
         self.config = config
@@ -39,14 +41,18 @@ class ChatSession:
         self._messages: list[Message] = []
         self._system_prompt_suffix = system_prompt_suffix
         self._memory = memory_manager
+        self._scheduler = scheduler
 
-        if memory_manager is not None:
-            # Copy the shared registry so memory tools are session-specific
+        if memory_manager is not None or scheduler is not None:
+            # Copy the shared registry so per-session tools don't pollute other sessions
             shared = tool_registry or ToolRegistry()
             self.tool_registry = ToolRegistry()
             for tool in shared._tools.values():
                 self.tool_registry.register(tool)
-            self._register_memory_tools(memory_manager)
+            if memory_manager is not None:
+                self._register_memory_tools(memory_manager)
+            if scheduler is not None:
+                self._register_scheduler_tools(scheduler)
         else:
             self.tool_registry = tool_registry or ToolRegistry()
 
@@ -174,4 +180,109 @@ class ChatSession:
                 "required": ["key"],
             },
             handler=forget_handler,
+        ))
+
+    def _register_scheduler_tools(self, scheduler: "SchedulerChannel") -> None:
+        """Register schedule_task / list_tasks / cancel_task tools."""
+        from eyetor.scheduler.store import ScheduledTask
+
+        session_id = self.session_id
+        # Auto-derive Telegram chat_id from session_id (e.g. "telegram-123456" → "123456")
+        notify_target = session_id.split("-", 1)[1] if session_id.startswith("telegram-") else None
+
+        async def handle_schedule_task(
+            name: str,
+            prompt: str,
+            schedule: str,
+            notify: str = "telegram",
+            timezone: str = "Europe/Madrid",
+            notify_target_override: str | None = None,
+        ) -> str:
+            target = notify_target_override or (notify_target if notify == "telegram" else None)
+            task = ScheduledTask(
+                name=name,
+                prompt=prompt,
+                schedule=schedule,
+                timezone=timezone,
+                session_id=f"scheduler-{session_id}",
+                notify=notify,
+                notify_target=target,
+            )
+            added = scheduler.add_task(task)
+            tasks = scheduler.list_tasks()
+            next_run = next((t["next_run"] for t in tasks if t["id"] == added.id), None)
+            return json.dumps({
+                "ok": True,
+                "task_id": added.id,
+                "name": added.name,
+                "schedule": added.schedule,
+                "notify": added.notify,
+                "next_run": next_run,
+            })
+
+        async def handle_list_tasks() -> str:
+            return json.dumps({"ok": True, "tasks": scheduler.list_tasks()})
+
+        async def handle_cancel_task(task_id: str) -> str:
+            deleted = scheduler.cancel_task(task_id)
+            if deleted:
+                return json.dumps({"ok": True, "cancelled": task_id})
+            return json.dumps({"ok": False, "error": f"Task '{task_id}' not found."})
+
+        self.tool_registry.register(ToolDefinition(
+            name="schedule_task",
+            description=(
+                "Create a scheduled task that runs automatically at a given time or interval. "
+                "The task sends a prompt to the agent and optionally delivers the response. "
+                "Notify options: 'telegram' (send to this chat), 'log' (write to file), 'none' (silent)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short descriptive name for the task"},
+                    "prompt": {"type": "string", "description": "The message to send to the agent when the task fires"},
+                    "schedule": {
+                        "type": "string",
+                        "description": (
+                            "When to run. Cron (5 fields): '0 9 * * *' (daily at 9am), '0 8 * * 1' (Mondays at 8am). "
+                            "Interval: 'every 30m', 'every 2h', 'every 1d'."
+                        ),
+                    },
+                    "notify": {
+                        "type": "string",
+                        "enum": ["telegram", "log", "none"],
+                        "description": "Where to deliver the result. Default: 'telegram'",
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "Timezone for cron schedules (e.g. 'Europe/Madrid'). Default: 'Europe/Madrid'",
+                    },
+                    "notify_target_override": {
+                        "type": "string",
+                        "description": "Override log file path (only for notify='log'). Leave empty for default.",
+                    },
+                },
+                "required": ["name", "prompt", "schedule"],
+            },
+            handler=handle_schedule_task,
+        ))
+
+        self.tool_registry.register(ToolDefinition(
+            name="list_tasks",
+            description="List all scheduled tasks with their next run time and status.",
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=handle_list_tasks,
+        ))
+
+        self.tool_registry.register(ToolDefinition(
+            name="cancel_task",
+            description="Cancel and delete a scheduled task by its ID.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "The task ID to cancel (from list_tasks)"},
+                },
+                "required": ["task_id"],
+            },
+            handler=handle_cancel_task,
         ))

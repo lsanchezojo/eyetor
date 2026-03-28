@@ -47,6 +47,11 @@ channels:
       allowed_users:
         - ${TELEGRAM_ALLOWED_USER}   # your numeric chat_id, e.g.: 123456789
 
+scheduler:
+  enabled: true
+  db_path: ~/.eyetor/scheduler.db
+  default_timezone: Europe/Madrid
+
 orchestrator:
   auto_delegate: false
   workers: {}

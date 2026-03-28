@@ -144,21 +144,41 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
             temperature=prov.temperature,
         )
 
+        # Scheduler (shared across all channels)
+        scheduler = None
+        sched_cfg = cfg.scheduler
+        if sched_cfg.enabled:
+            from eyetor.scheduler.store import SchedulerStore
+            from eyetor.scheduler.channel import SchedulerChannel
+            sched_store = SchedulerStore(sched_cfg.db_path)
+            tg_token = cfg.channels.telegram.bot_token if cfg.channels.telegram.enabled else None
+            # Scheduler needs a SessionManager; create a dedicated one (no scheduler to avoid recursion)
+            sched_session_mgr = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory)
+            scheduler = SchedulerChannel(
+                store=sched_store,
+                session_manager=sched_session_mgr,
+                bot_token=tg_token,
+                default_timezone=sched_cfg.default_timezone,
+            )
+
         # Build channels
         channels = []
 
         if interactive:
             from eyetor.channels.cli_channel import CliChannel
-            session_mgr_cli = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory)
+            session_mgr_cli = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory, scheduler=scheduler)
             channels.append(CliChannel(session_mgr_cli, skill_reg=skill_reg))
 
         tg_cfg = cfg.channels.telegram
         if tg_cfg.enabled and tg_cfg.bot_token:
             from eyetor.channels.telegram import TelegramChannel
-            session_mgr_tg = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory)
-            channels.append(TelegramChannel(session_mgr_tg, tg_cfg, skill_reg=skill_reg))
+            session_mgr_tg = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory, scheduler=scheduler)
+            channels.append(TelegramChannel(session_mgr_tg, tg_cfg, skill_reg=skill_reg, scheduler=scheduler))
 
-        if not channels:
+        if scheduler:
+            channels.append(scheduler)
+
+        if not channels or (len(channels) == 1 and scheduler in channels):
             console.print("[red]No channels available. Run interactively or configure Telegram.[/red]")
             return
 

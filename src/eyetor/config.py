@@ -98,6 +98,14 @@ class FallbackConfig(BaseModel):
     retry_on: list[str] = ["timeout", "connection_error", "500", "502", "503", "529"]
 
 
+class SchedulerConfig(BaseModel):
+    """Configuration for the task scheduler."""
+
+    enabled: bool = True
+    db_path: str = "~/.eyetor/scheduler.db"
+    default_timezone: str = "Europe/Madrid"
+
+
 class VectorConfig(BaseModel):
     """Root configuration for Eyetor."""
 
@@ -108,6 +116,7 @@ class VectorConfig(BaseModel):
     memory_db_path: str = "~/.eyetor/memory.db"
     tracking: TrackingConfig = TrackingConfig()
     channels: ChannelsConfig = ChannelsConfig()
+    scheduler: SchedulerConfig = SchedulerConfig()
     orchestrator: OrchestratorConfig = OrchestratorConfig()
     mcp_servers: dict[str, McpServerConfig] = {}
     log_level: str = "INFO"

@@ -79,7 +79,7 @@ When run from a terminal, `eyetor start` opens an interactive CLI session. If Te
 
 **CLI commands:** `/reset`, `/history`, `/skills`, `/help`, `/exit`
 
-**Telegram bot commands:** `/start`, `/reset`, `/skills`, `/help`
+**Telegram bot commands:** `/start`, `/reset`, `/skills`, `/tasks`, `/help`
 
 ### Voice messages (Telegram)
 
@@ -144,6 +144,55 @@ journalctl --user -u eyetor -f          # live logs
 systemctl --user status eyetor          # status
 systemctl --user restart eyetor         # restart after config changes
 systemctl --user disable --now eyetor   # stop and disable
+```
+
+## Scheduled tasks
+
+The agent can create, list, and cancel tasks that run automatically on a schedule. Tasks are persisted in SQLite (`~/.eyetor/scheduler.db`) and survive restarts.
+
+### Managing tasks
+
+Ask the agent in natural language:
+
+```
+"Remind me to drink water every hour"
+"Every weekday at 8am summarise my unread emails and send here"
+"Run a silent cleanup script every night at 2am"
+"List my scheduled tasks"
+"Cancel the task with id abc123"
+```
+
+The agent uses `schedule_task`, `list_tasks`, and `cancel_task` tools internally.
+
+### Schedule format
+
+| Format | Example | Meaning |
+|--------|---------|---------|
+| Cron (5 fields) | `0 9 * * *` | Every day at 09:00 |
+| Cron (5 fields) | `0 8 * * 1` | Every Monday at 08:00 |
+| Interval | `every 30m` | Every 30 minutes |
+| Interval | `every 2h` | Every 2 hours |
+| Interval | `every 1d` | Every day |
+
+### Notification modes
+
+| Mode | Behaviour |
+|------|-----------|
+| `telegram` (default) | Result sent to the Telegram chat that created the task |
+| `log` | Result appended to `~/.eyetor/scheduler.log` (or a custom path) |
+| `none` | Silent — task runs but no output is delivered |
+
+### `/tasks` command
+
+Use `/tasks` in Telegram at any time to list all scheduled tasks with their next run time and notification mode.
+
+### Config
+
+```yaml
+scheduler:
+  enabled: true
+  db_path: ~/.eyetor/scheduler.db
+  default_timezone: Europe/Madrid
 ```
 
 ## Memory

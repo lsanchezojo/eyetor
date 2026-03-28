@@ -38,10 +38,12 @@ class TelegramChannel(BaseChannel):
         session_manager: SessionManager,
         config: TelegramChannelConfig,
         skill_reg=None,
+        scheduler=None,
     ) -> None:
         self._manager = session_manager
         self._config = config
         self._skill_reg = skill_reg
+        self._scheduler = scheduler
         self._dp = None
         self._bot = None
 
@@ -109,12 +111,19 @@ class TelegramChannel(BaseChannel):
                 return
             await msg.answer(_format_skills_text(self._skill_reg), parse_mode="HTML")
 
+        @dp.message(Command("tasks"))
+        async def cmd_tasks(msg: Message) -> None:
+            if not _is_authorized(msg):
+                return
+            await msg.answer(_format_tasks_text(self._scheduler), parse_mode="HTML")
+
         @dp.message(Command("help"))
         async def cmd_help(msg: Message) -> None:
             await msg.answer(
                 "Eyetor commands:\n"
                 "/reset — start a new conversation\n"
                 "/skills — list available skills\n"
+                "/tasks — list scheduled tasks\n"
                 "/help — show this help\n\n"
                 "Just send me a message to chat!"
             )
@@ -197,6 +206,7 @@ class TelegramChannel(BaseChannel):
             BotCommand(command="start", description="Start the bot"),
             BotCommand(command="reset", description="Start a new conversation"),
             BotCommand(command="skills", description="List available skills"),
+            BotCommand(command="tasks", description="List scheduled tasks"),
             BotCommand(command="help", description="Show help"),
         ])
 
@@ -370,6 +380,30 @@ def _inline_md_to_html(text: str) -> str:
     text = re.sub(r"^[ \t]*[-*+] ", "• ", text, flags=re.MULTILINE)
 
     return text
+
+
+def _format_tasks_text(scheduler) -> str:
+    """Return an HTML-formatted list of scheduled tasks."""
+    if scheduler is None:
+        return "Scheduler is not configured."
+    tasks = scheduler.list_tasks()
+    if not tasks:
+        return "No scheduled tasks."
+    lines = ["<b>Scheduled tasks:</b>"]
+    for t in tasks:
+        status = "✅" if t["enabled"] else "⏸"
+        next_run = t["next_run"]
+        if next_run:
+            # Trim to readable format: 2026-03-28T09:00:00+01:00 → 2026-03-28 09:00
+            next_run = next_run[:16].replace("T", " ")
+        next_str = f" — next: {next_run}" if next_run else ""
+        notify_icon = {"telegram": "💬", "log": "📄", "none": "🔇"}.get(t["notify"], "")
+        lines.append(
+            f"{status} {notify_icon} <b>{_escape_html(t['name'])}</b>\n"
+            f"    <code>{_escape_html(t['schedule'])}</code>{next_str}\n"
+            f"    ID: <code>{t['id']}</code>"
+        )
+    return "\n\n".join(lines)
 
 
 def _format_skills_text(skill_reg) -> str:
