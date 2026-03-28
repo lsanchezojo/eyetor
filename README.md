@@ -81,6 +81,21 @@ When run from a terminal, `eyetor start` opens an interactive CLI session. If Te
 
 **Telegram bot commands:** `/start`, `/reset`, `/skills`, `/help`
 
+### Voice messages (Telegram)
+
+The bot transcribes voice and audio messages automatically. Transcription priority:
+
+1. **Local Whisper server** — set `WHISPER_BASE_URL` in `.env` (e.g. `http://localhost:8000`), any OpenAI-compatible `/v1/audio/transcriptions` endpoint
+2. **OpenAI Whisper API** — set `OPENAI_API_KEY` in `.env`
+3. **Local faster-whisper** — install with `pip install faster-whisper`, no server needed
+
+If none is configured, the bot replies with setup instructions.
+
+```
+WHISPER_BASE_URL=http://localhost:8000   # optional: local whisper server
+OPENAI_API_KEY=sk-...                    # optional: OpenAI Whisper API
+```
+
 ## Deploying as a systemd service
 
 The service runs `eyetor start` without a tty, so only Telegram (or other non-interactive channels) start.

@@ -2,6 +2,9 @@
 
 Requires the 'telegram' optional dependency:
     pip install eyetor[telegram]
+
+Voice message transcription requires faster-whisper:
+    pip install faster-whisper
 """
 
 from __future__ import annotations
@@ -9,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import tempfile
+import os
 
 from eyetor.channels.base import BaseChannel
 from eyetor.chat.manager import SessionManager
@@ -147,6 +152,47 @@ class TelegramChannel(BaseChannel):
                 logger.error("Telegram message handler error: %s", exc)
                 await placeholder.edit_text(f"Error: {exc}")
 
+        @dp.message(F.voice | F.audio)
+        async def on_voice(msg: Message) -> None:
+            if not _is_authorized(msg):
+                await msg.answer("Unauthorized. Contact the administrator.")
+                return
+
+            # Transcribe audio with faster-whisper
+            transcription = await _transcribe_voice(bot, msg)
+            if transcription is None:
+                return  # error already sent to user
+
+            session_id = f"telegram-{msg.chat.id}"
+            session = self._manager.get_or_create(session_id)
+
+            placeholder = await msg.answer(f"🎤 <i>{_escape_html(transcription)}</i>\n\n...", parse_mode="HTML")
+            buffer = ""
+            last_edit = ""
+            try:
+                async for chunk in session.send(transcription):
+                    buffer += chunk
+                    if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
+                        try:
+                            await placeholder.edit_text(
+                                f"🎤 <i>{_escape_html(transcription)}</i>\n\n{buffer}",
+                            )
+                            last_edit = buffer
+                        except Exception:
+                            pass
+
+                if buffer:
+                    try:
+                        await placeholder.edit_text(
+                            f"🎤 <i>{_escape_html(transcription)}</i>\n\n{_md_to_html(buffer)}",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        await msg.answer(_md_to_html(buffer), parse_mode="HTML")
+            except Exception as exc:
+                logger.error("Telegram voice handler error: %s", exc)
+                await placeholder.edit_text(f"Error: {exc}")
+
         await bot.set_my_commands([
             BotCommand(command="start", description="Start the bot"),
             BotCommand(command="reset", description="Start a new conversation"),
@@ -162,6 +208,105 @@ class TelegramChannel(BaseChannel):
             await self._dp.stop_polling()
         if self._bot:
             await self._bot.session.close()
+
+
+_whisper_model = None  # Module-level cache — loaded once on first use
+
+
+async def _transcribe_voice(bot, msg) -> str | None:
+    """Download voice/audio and transcribe it.
+
+    Priority:
+    1. OpenAI-compatible /v1/audio/transcriptions API (WHISPER_BASE_URL or OPENAI_API_KEY)
+    2. Local faster-whisper (if installed)
+
+    Returns the transcription string, or None if an error occurred
+    (error message already sent to the user).
+    """
+    file_obj = msg.voice or msg.audio
+    if file_obj is None:
+        await msg.answer("Could not read the audio file.")
+        return None
+
+    # Size guard: 25 MB max
+    if getattr(file_obj, "file_size", None) and file_obj.file_size > 25 * 1024 * 1024:
+        await msg.answer("Audio file too large (max 25 MB).")
+        return None
+
+    tmp_path = None
+    try:
+        tg_file = await bot.get_file(file_obj.file_id)
+        suffix = ".ogg" if msg.voice else ".mp3"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+        await bot.download_file(tg_file.file_path, destination=tmp_path)
+
+        whisper_url = os.environ.get("WHISPER_BASE_URL", "").strip()
+        openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+
+        if whisper_url or openai_key:
+            return await _transcribe_via_api(tmp_path, whisper_url or None, openai_key or None, suffix)
+
+        return await _transcribe_local(msg, tmp_path)
+
+    except Exception as exc:
+        logger.error("Voice transcription error: %s", exc)
+        await msg.answer(f"Error transcribing audio: {exc}")
+        return None
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+async def _transcribe_via_api(path: str, base_url: str | None, api_key: str | None, suffix: str) -> str:
+    """Transcribe using an OpenAI-compatible /v1/audio/transcriptions endpoint."""
+    import httpx
+    url = f"{base_url.rstrip('/')}/v1/audio/transcriptions" if base_url else "https://api.openai.com/v1/audio/transcriptions"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    mime = "audio/ogg" if suffix == ".ogg" else "audio/mpeg"
+    async with httpx.AsyncClient(timeout=60) as client:
+        with open(path, "rb") as f:
+            r = await client.post(
+                url,
+                headers=headers,
+                files={"file": (os.path.basename(path), f, mime)},
+                data={"model": "whisper-1"},
+            )
+        r.raise_for_status()
+        return r.json()["text"].strip()
+
+
+async def _transcribe_local(msg, path: str) -> str | None:
+    """Transcribe using local faster-whisper, with module-level model cache."""
+    global _whisper_model
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        await msg.answer(
+            "Voice transcription is not configured. Options:\n"
+            "• Set <code>WHISPER_BASE_URL</code> to a local Whisper server\n"
+            "• Set <code>OPENAI_API_KEY</code> to use OpenAI Whisper API\n"
+            "• Install faster-whisper: <code>pip install faster-whisper</code>",
+            parse_mode="HTML",
+        )
+        return None
+
+    if _whisper_model is None:
+        _whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _run_whisper_model, _whisper_model, path)
+
+
+def _run_whisper_model(model, audio_path: str) -> str:
+    """Run faster-whisper transcription synchronously (called in thread pool)."""
+    segments, _ = model.transcribe(audio_path, beam_size=5)
+    return " ".join(seg.text.strip() for seg in segments).strip()
 
 
 def _escape_html(text: str) -> str:
