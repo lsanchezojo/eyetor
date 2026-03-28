@@ -53,9 +53,16 @@ class TelegramChannelConfig(BaseModel):
     auth: TelegramAuthConfig = TelegramAuthConfig()
 
 
+class CliChannelConfig(BaseModel):
+    """CLI channel configuration."""
+
+    host_tools: bool = True  # Enable shell/filesystem/browser/web-search skills
+
+
 class ChannelsConfig(BaseModel):
     """Configuration for communication channels."""
 
+    cli: CliChannelConfig = CliChannelConfig()
     telegram: TelegramChannelConfig = TelegramChannelConfig()
 
 

@@ -1,6 +1,6 @@
 # Eyetor
 
-Multi-agent AI system based on Anthropic's agent patterns. Supports interactive CLI chat and Telegram bot, with tool use (shell, filesystem, browser, web search) backed by local or remote LLM providers.
+Multi-agent AI system based on Anthropic's agent patterns. Runs as a background service with simultaneous CLI and Telegram channels, tool use (shell, filesystem, browser, web search), and persistent memory across conversations.
 
 ## Requirements
 
@@ -13,16 +13,11 @@ Multi-agent AI system based on Anthropic's agent patterns. Supports interactive 
 git clone <repo>
 cd eyetor
 
-# Base install
-pip install -e .
-
-# With Telegram bot support
+# With Telegram support
 pip install -e ".[telegram]"
 ```
 
 ## Configuration
-
-Copy the example environment file and fill in your values:
 
 ```bash
 cp .env.example .env
@@ -30,12 +25,12 @@ cp .env.example .env
 
 **.env**
 ```
-TELEGRAM_BOT_TOKEN=   # from @BotFather on Telegram
+TELEGRAM_BOT_TOKEN=     # from @BotFather on Telegram
 TELEGRAM_ALLOWED_USER=  # your numeric chat_id (get it from @userinfobot)
-OPENROUTER_API_KEY=   # only if using OpenRouter provider
+OPENROUTER_API_KEY=     # only if using OpenRouter provider
 ```
 
-The main config file is `config/default.yaml`. The default provider is `llamacpp` pointing to `http://localhost:8080/v1`. Adjust `default_provider` and provider settings as needed:
+Main config: `config/default.yaml`. Key sections:
 
 ```yaml
 default_provider: llamacpp
@@ -47,27 +42,31 @@ providers:
     model: default
     temperature: 0.6
 
-  openrouter:
-    type: openrouter
-    base_url: https://openrouter.ai/api/v1
-    api_key: ${OPENROUTER_API_KEY}
-    model: stepfun/step-3.5-flash:free
+channels:
+  cli:
+    host_tools: true      # enable shell/filesystem/browser/web-search
+  telegram:
+    enabled: true
+    bot_token: ${TELEGRAM_BOT_TOKEN}
+    auth:
+      enabled: true
+      allowed_users:
+        - ${TELEGRAM_ALLOWED_USER}
+
+memory_db_path: ~/.eyetor/memory.db
 ```
 
 ## Usage
 
 ```bash
-# Interactive chat with host tools (shell, filesystem, browser, web-search)
-eyetor chat
+# Start the agent (CLI if interactive, Telegram if configured)
+eyetor start
 
-# Interactive chat without host access
-eyetor chat --no-host-tools
+# Start without host tools
+eyetor start --no-host-tools
 
 # One-shot query
 eyetor run "what is the current directory?"
-
-# Telegram bot (foreground)
-eyetor telegram
 
 # List available skills
 eyetor skills list
@@ -76,21 +75,23 @@ eyetor skills list
 eyetor providers test
 ```
 
-## Deploying as a systemd service (Telegram bot)
+When run from a terminal, `eyetor start` opens an interactive CLI session. If Telegram is enabled in config, the bot starts simultaneously in the same process. When run without a terminal (e.g. as a systemd service), only the configured background channels start.
 
-This runs the Telegram bot as a persistent background service under your user session.
+**CLI commands:** `/reset`, `/history`, `/skills`, `/help`, `/exit`
+
+**Telegram bot commands:** `/start`, `/reset`, `/skills`, `/help`
+
+## Deploying as a systemd service
+
+The service runs `eyetor start` without a tty, so only Telegram (or other non-interactive channels) start.
 
 **1. Create the service unit**
 
-```bash
-mkdir -p ~/.config/systemd/user
-```
-
-Create `~/.config/systemd/user/eyetor-telegram.service`:
+Create `~/.config/systemd/user/eyetor.service`:
 
 ```ini
 [Unit]
-Description=Eyetor Telegram Bot
+Description=Eyetor Agent
 After=network-online.target
 Wants=network-online.target
 
@@ -98,7 +99,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/path/to/eyetor
 EnvironmentFile=/path/to/eyetor/.env
-ExecStart=/home/<user>/.local/bin/eyetor telegram
+ExecStart=/home/<user>/.local/bin/eyetor start
 Restart=on-failure
 RestartSec=10s
 
@@ -112,10 +113,10 @@ Replace `/path/to/eyetor` with the absolute path to the project and `<user>` wit
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now eyetor-telegram.service
+systemctl --user enable --now eyetor.service
 ```
 
-**3. Persist across logouts (optional)**
+**3. Persist across logouts**
 
 ```bash
 loginctl enable-linger $USER
@@ -124,22 +125,21 @@ loginctl enable-linger $USER
 **Useful commands**
 
 ```bash
-# Live logs
-journalctl --user -u eyetor-telegram -f
-
-# Status
-systemctl --user status eyetor-telegram
-
-# Restart after config changes
-systemctl --user restart eyetor-telegram
-
-# Stop and disable
-systemctl --user disable --now eyetor-telegram
+journalctl --user -u eyetor -f          # live logs
+systemctl --user status eyetor          # status
+systemctl --user restart eyetor         # restart after config changes
+systemctl --user disable --now eyetor   # stop and disable
 ```
+
+## Memory
+
+The agent has persistent memory backed by SQLite (`~/.eyetor/memory.db`). It can save facts, preferences, and notes across sessions using the `remember` and `forget` tools. Saved memories are injected into the system prompt at the start of every conversation.
+
+In Telegram, each user has an independent memory space. In CLI, memory is shared under the `cli` session.
 
 ## Skills
 
-Skills live in `skills/` and follow the [agentskills.io](https://agentskills.io) format: a `SKILL.md` with YAML frontmatter and a `scripts/` subdirectory. Built-in skills:
+Skills live in `skills/` following the [agentskills.io](https://agentskills.io) format: a `SKILL.md` with YAML frontmatter and a `scripts/` subdirectory. Built-in skills:
 
 | Skill | Description |
 |-------|-------------|
@@ -148,7 +148,7 @@ Skills live in `skills/` and follow the [agentskills.io](https://agentskills.io)
 | `browser` | Open URLs, fetch page content |
 | `web-search` | Search the web via DuckDuckGo |
 
-To add custom skills, place them in any directory listed under `skills_dirs` in `config/default.yaml`.
+Use `/skills` in any channel (CLI or Telegram) to list active skills with their descriptions. New skills are picked up automatically at startup from all directories listed under `skills_dirs` in `config/default.yaml`.
 
 ## Providers
 
@@ -158,7 +158,7 @@ To add custom skills, place them in any directory listed under `skills_dirs` in 
 | Ollama | `ollama` | Local model runner, OpenAI-compatible |
 | OpenRouter | `openrouter` | Cloud proxy, requires API key |
 
-A fallback chain can be configured so the agent retries across providers on timeout or server errors:
+A fallback chain retries across providers on timeout or server errors:
 
 ```yaml
 fallback:

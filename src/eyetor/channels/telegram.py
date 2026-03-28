@@ -31,9 +31,11 @@ class TelegramChannel(BaseChannel):
         self,
         session_manager: SessionManager,
         config: TelegramChannelConfig,
+        skill_reg=None,
     ) -> None:
         self._manager = session_manager
         self._config = config
+        self._skill_reg = skill_reg
         self._dp = None
         self._bot = None
 
@@ -41,7 +43,7 @@ class TelegramChannel(BaseChannel):
         try:
             from aiogram import Bot, Dispatcher, F
             from aiogram.filters import Command
-            from aiogram.types import Message
+            from aiogram.types import Message, BotCommand
         except ImportError:
             raise ImportError(
                 "aiogram is required for the Telegram channel. "
@@ -95,11 +97,18 @@ class TelegramChannel(BaseChannel):
             self._manager.reset(session_id)
             await msg.answer("Conversation reset. How can I help you?")
 
+        @dp.message(Command("skills"))
+        async def cmd_skills(msg: Message) -> None:
+            if not _is_authorized(msg):
+                return
+            await msg.answer(_format_skills_text(self._skill_reg), parse_mode="HTML")
+
         @dp.message(Command("help"))
         async def cmd_help(msg: Message) -> None:
             await msg.answer(
                 "Eyetor commands:\n"
                 "/reset — start a new conversation\n"
+                "/skills — list available skills\n"
                 "/help — show this help\n\n"
                 "Just send me a message to chat!"
             )
@@ -137,6 +146,13 @@ class TelegramChannel(BaseChannel):
                 logger.error("Telegram message handler error: %s", exc)
                 await placeholder.edit_text(f"Error: {exc}")
 
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Start the bot"),
+            BotCommand(command="reset", description="Start a new conversation"),
+            BotCommand(command="skills", description="List available skills"),
+            BotCommand(command="help", description="Show help"),
+        ])
+
         logger.info("Starting Telegram bot...")
         await dp.start_polling(bot)
 
@@ -145,3 +161,16 @@ class TelegramChannel(BaseChannel):
             await self._dp.stop_polling()
         if self._bot:
             await self._bot.session.close()
+
+
+def _format_skills_text(skill_reg) -> str:
+    """Return a plain-text skills list with descriptions for Telegram (HTML)."""
+    if skill_reg is None:
+        return "No skills configured."
+    metadata = skill_reg.all_metadata()
+    if not metadata:
+        return "No skills configured."
+    lines = ["<b>Available skills:</b>"]
+    for m in metadata:
+        lines.append(f"  <code>{m.name}</code> — {m.description}")
+    return "\n".join(lines)

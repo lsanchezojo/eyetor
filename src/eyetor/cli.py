@@ -47,58 +47,62 @@ def cli(ctx: click.Context, config: str | None, log_level: str | None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# eyetor chat
+# eyetor start  (unified entry point)
 # ---------------------------------------------------------------------------
 
 @cli.command()
 @click.option("--provider", "-p", default=None, help="Provider name (default from config).")
 @click.option("--model", "-m", default=None, help="Model override.")
-@click.option("--system", "-s", default=None, help="System prompt override.")
 @click.option(
-    "--host-tools/--no-host-tools", default=True,
-    help="Enable system skills (shell, filesystem, browser) to act on this PC. "
-         "Enabled by default. Use --no-host-tools to disable."
+    "--host-tools/--no-host-tools", default=None,
+    help="Enable/disable host skills (shell, filesystem, browser). Default from config."
 )
 @click.pass_context
-def chat(ctx: click.Context, provider: str | None, model: str | None, system: str | None, host_tools: bool) -> None:
-    """Start an interactive chat session."""
+def start(ctx: click.Context, provider: str | None, model: str | None, host_tools: bool | None) -> None:
+    """Start the agent — launches all configured channels (CLI and/or Telegram)."""
+    import sys
     cfg = ctx.obj["cfg"]
 
-    if not host_tools:
-        console.print("[dim]Host tools disabled (--no-host-tools). Shell, filesystem and browser skills inactive.[/dim]\n")
+    # --host-tools flag overrides config; config default is True
+    use_host_tools = host_tools if host_tools is not None else cfg.channels.cli.host_tools
+    interactive = sys.stdin.isatty()
 
     async def _run():
         from eyetor.providers import get_provider
         from eyetor.models.agents import AgentConfig
         from eyetor.chat.manager import SessionManager
-        from eyetor.channels.cli_channel import CliChannel
-        from eyetor.skills.registry import SkillRegistry
         from eyetor.models.tools import ToolRegistry, ToolDefinition
+        from eyetor.memory.manager import MemoryManager
+        from eyetor.skills.registry import SkillRegistry
         from eyetor.skills.executor import run_script
 
         prov = get_provider(cfg, provider)
         if model:
             prov.model = model
 
-        # Discover skills
+        memory = MemoryManager.from_path(cfg.memory_db_path)
+
+        # Shared skill registry
         skill_reg = SkillRegistry()
         skill_reg.discover(cfg.skills_dirs)
         skill_names = skill_reg.list_names()
 
-        # Build system prompt with skills context
-        base_system = system or (
-            "You are Eyetor, a helpful AI assistant with access to tools that can act on the user's computer. "
-            "You can run shell commands, manage files, open URLs, and search the web. "
-            "Always explain what you are about to do before doing it. "
-            "Ask for confirmation before destructive operations (delete, overwrite, format)."
-            if host_tools else
-            "You are Eyetor, a helpful AI assistant."
-        )
+        # System prompt
+        if use_host_tools:
+            base_system = (
+                "You are Eyetor, a helpful AI assistant with access to tools that can act on the user's computer. "
+                "You can run shell commands, manage files, open URLs, and search the web. "
+                "Always explain what you are about to do before doing it. "
+                "Ask for confirmation before destructive operations (delete, overwrite, format)."
+            )
+        else:
+            base_system = "You are Eyetor, a helpful AI assistant."
+
         skills_context = skill_reg.build_skills_context(skill_names)
         if skills_context:
             base_system = f"{base_system}\n\n{skills_context}"
 
-        # Build tool registry
+        # Shared tool registry
         tool_registry = ToolRegistry()
         if skill_names:
             async def run_skill_script_handler(skill: str, script: str, args: str = "") -> str:
@@ -107,13 +111,10 @@ def chat(ctx: click.Context, provider: str | None, model: str | None, system: st
                 if not script_path:
                     return json.dumps({"error": f"Script '{script}' not found in skill '{skill}'"})
                 arg_list = _split_args(args)
-
-                # Confirmation for dangerous operations when host-tools is active
-                if host_tools and _is_dangerous(skill, script, args):
+                if use_host_tools and _is_dangerous(skill, script, args):
                     confirmed = await _ask_confirm(skill, script, args)
                     if not confirmed:
                         return json.dumps({"error": "Operation cancelled by user."})
-
                 return await run_script(script_path, arg_list)
 
             tool_registry.register(ToolDefinition(
@@ -142,9 +143,26 @@ def chat(ctx: click.Context, provider: str | None, model: str | None, system: st
             system_prompt=base_system,
             temperature=prov.temperature,
         )
-        session_mgr = SessionManager(agent_cfg, prov, tool_registry=tool_registry)
-        channel = CliChannel(session_mgr, skill_names=skill_names)
-        await channel.start()
+
+        # Build channels
+        channels = []
+
+        if interactive:
+            from eyetor.channels.cli_channel import CliChannel
+            session_mgr_cli = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory)
+            channels.append(CliChannel(session_mgr_cli, skill_reg=skill_reg))
+
+        tg_cfg = cfg.channels.telegram
+        if tg_cfg.enabled and tg_cfg.bot_token:
+            from eyetor.channels.telegram import TelegramChannel
+            session_mgr_tg = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory)
+            channels.append(TelegramChannel(session_mgr_tg, tg_cfg, skill_reg=skill_reg))
+
+        if not channels:
+            console.print("[red]No channels available. Run interactively or configure Telegram.[/red]")
+            return
+
+        await asyncio.gather(*[ch.start() for ch in channels])
 
     asyncio.run(_run())
 
@@ -154,16 +172,13 @@ def chat(ctx: click.Context, provider: str | None, model: str | None, system: st
 # ---------------------------------------------------------------------------
 
 _DANGEROUS_PATTERNS = [
-    # shell: destructive commands
     ("shell", "run.py", ["rm -rf", "rmdir /s", "format", "del /f", "dd if=", "mkfs",
                           "drop table", "drop database", "> /dev/", "shutdown", "reboot"]),
-    # filesystem: delete recursive
     ("filesystem", "fs.py", ["delete --recursive", "delete"]),
 ]
 
 
 def _is_dangerous(skill: str, script: str, args: str) -> bool:
-    """Return True if this operation should require user confirmation."""
     args_lower = args.lower()
     for d_skill, d_script, patterns in _DANGEROUS_PATTERNS:
         if skill == d_skill and script == d_script:
@@ -174,7 +189,6 @@ def _is_dangerous(skill: str, script: str, args: str) -> bool:
 
 
 async def _ask_confirm(skill: str, script: str, args: str) -> bool:
-    """Prompt the user to confirm a dangerous operation."""
     console.print(
         f"\n[bold red]⚠  Dangerous operation requested:[/bold red]\n"
         f"  Skill: [cyan]{skill}[/cyan]  Script: [cyan]{script}[/cyan]\n"
@@ -189,46 +203,11 @@ async def _ask_confirm(skill: str, script: str, args: str) -> bool:
 
 
 def _split_args(args: str) -> list[str]:
-    """Split args string respecting quoted strings."""
     import shlex
     try:
         return shlex.split(args)
     except ValueError:
         return args.split()
-
-
-# ---------------------------------------------------------------------------
-# eyetor telegram
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.option("--provider", "-p", default=None, help="Provider name.")
-@click.pass_context
-def telegram(ctx: click.Context, provider: str | None) -> None:
-    """Start the Telegram bot channel."""
-    cfg = ctx.obj["cfg"]
-
-    async def _run():
-        from eyetor.providers import get_provider
-        from eyetor.models.agents import AgentConfig
-        from eyetor.chat.manager import SessionManager
-        from eyetor.channels.telegram import TelegramChannel
-        from eyetor.models.tools import ToolRegistry
-
-        prov = get_provider(cfg, provider)
-        agent_cfg = AgentConfig(
-            name="eyetor-telegram",
-            provider=provider or cfg.default_provider,
-            model=prov.model,
-            system_prompt="You are Eyetor, a helpful AI assistant.",
-            temperature=prov.temperature,
-        )
-        session_mgr = SessionManager(agent_cfg, prov)
-        channel = TelegramChannel(session_mgr, cfg.channels.telegram)
-        console.print("[bold green]Starting Telegram bot...[/bold green]")
-        await channel.start()
-
-    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------

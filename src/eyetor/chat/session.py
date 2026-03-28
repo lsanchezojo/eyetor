@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import AsyncIterator
+from typing import AsyncIterator, TYPE_CHECKING
 
 from eyetor.models.agents import AgentConfig
 from eyetor.models.messages import Message, ToolCall
-from eyetor.models.tools import ToolRegistry
+from eyetor.models.tools import ToolRegistry, ToolDefinition
 from eyetor.providers.base import BaseProvider
+
+if TYPE_CHECKING:
+    from eyetor.memory.manager import MemoryManager
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +31,24 @@ class ChatSession:
         provider: BaseProvider,
         tool_registry: ToolRegistry | None = None,
         system_prompt_suffix: str = "",
+        memory_manager: "MemoryManager | None" = None,
     ) -> None:
         self.session_id = session_id
         self.config = config
         self.provider = provider
-        self.tool_registry = tool_registry or ToolRegistry()
         self._messages: list[Message] = []
         self._system_prompt_suffix = system_prompt_suffix
+        self._memory = memory_manager
+
+        if memory_manager is not None:
+            # Copy the shared registry so memory tools are session-specific
+            shared = tool_registry or ToolRegistry()
+            self.tool_registry = ToolRegistry()
+            for tool in shared._tools.values():
+                self.tool_registry.register(tool)
+            self._register_memory_tools(memory_manager)
+        else:
+            self.tool_registry = tool_registry or ToolRegistry()
 
     # ------------------------------------------------------------------
     # Conversation history
@@ -106,8 +121,57 @@ class ChatSession:
         system_content = self.config.system_prompt
         if self._system_prompt_suffix:
             system_content = f"{system_content}\n\n{self._system_prompt_suffix}"
+        if self._memory:
+            memory_context = self._memory.build_context(self.session_id)
+            if memory_context:
+                system_content = f"{system_content}\n\n{memory_context}"
         messages: list[Message] = []
         if system_content:
             messages.append(Message(role="system", content=system_content))
         messages.extend(self._messages)
         return messages
+
+    def _register_memory_tools(self, memory_manager: "MemoryManager") -> None:
+        """Register remember/forget tools backed by persistent memory."""
+        session_id = self.session_id
+
+        async def remember_handler(key: str, value: str, type: str = "fact") -> str:
+            memory_manager.remember(session_id, key, value, type)
+            return json.dumps({"status": "ok", "key": key, "type": type})
+
+        async def forget_handler(key: str, type: str = "fact") -> str:
+            memory_manager.forget(session_id, key, type)
+            return json.dumps({"status": "ok", "key": key})
+
+        self.tool_registry.register(ToolDefinition(
+            name="remember",
+            description=(
+                "Save a fact, preference or note to persistent memory so it is available "
+                "in future conversations. Use whenever the user shares something important "
+                "about themselves, their preferences, or context you should not forget."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "Short identifier (e.g. 'user_name', 'preferred_language', 'project')"},
+                    "value": {"type": "string", "description": "The value to remember"},
+                    "type": {"type": "string", "enum": ["fact", "preference", "note"], "default": "fact"},
+                },
+                "required": ["key", "value"],
+            },
+            handler=remember_handler,
+        ))
+
+        self.tool_registry.register(ToolDefinition(
+            name="forget",
+            description="Delete a previously saved memory entry by key.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "The key of the memory to delete"},
+                    "type": {"type": "string", "enum": ["fact", "preference", "note"], "default": "fact"},
+                },
+                "required": ["key"],
+            },
+            handler=forget_handler,
+        ))

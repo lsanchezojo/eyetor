@@ -21,7 +21,7 @@ _HELP = """
   /help     — show this help
   /reset    — clear conversation history
   /history  — show conversation history
-  /skills   — list available skills
+  /skills   — list available skills with descriptions
   /exit     — quit
 """
 
@@ -32,10 +32,10 @@ class CliChannel(BaseChannel):
     def __init__(
         self,
         session_manager: SessionManager,
-        skill_names: list[str] | None = None,
+        skill_reg=None,
     ) -> None:
         self._manager = session_manager
-        self._skill_names = skill_names or []
+        self._skill_reg = skill_reg
         self._console = Console()
         self._running = False
 
@@ -72,7 +72,7 @@ class CliChannel(BaseChannel):
                 self._show_history(session)
                 continue
             elif user_input.lower() == "/skills":
-                self._show_skills()
+                self._console.print(_format_skills(self._skill_reg))
                 continue
             elif user_input.lower() == "/help":
                 self._console.print(_HELP)
@@ -103,10 +103,16 @@ class CliChannel(BaseChannel):
             role_color = {"user": "blue", "assistant": "green", "tool": "yellow"}.get(msg.role, "white")
             self._console.print(f"[{role_color}]{msg.role}[/{role_color}]: {msg.content or '[tool call]'}")
 
-    def _show_skills(self) -> None:
-        if not self._skill_names:
-            self._console.print("[dim]No skills configured.[/dim]")
-            return
-        self._console.print("[bold]Available skills:[/bold]")
-        for name in self._skill_names:
-            self._console.print(f"  • {name}")
+
+def _format_skills(skill_reg) -> str:
+    """Return a formatted skills list with descriptions for display in any channel."""
+    if skill_reg is None:
+        return "[dim]No skills configured.[/dim]"
+    metadata = skill_reg.all_metadata()
+    if not metadata:
+        return "[dim]No skills configured.[/dim]"
+    lines = ["[bold]Available skills:[/bold]"]
+    for m in metadata:
+        lines.append(f"  [cyan]{m.name}[/cyan] — {m.description}")
+    return "\n".join(lines)
+
