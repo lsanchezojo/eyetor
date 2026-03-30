@@ -143,7 +143,7 @@ class SchedulerChannel(BaseChannel):
                 id=task.id,
                 args=[task.id],
                 replace_existing=True,
-                misfire_grace_time=300,
+                misfire_grace_time=3700,  # >1h to survive DST transitions
             )
         except Exception as exc:
             logger.error("Failed to schedule task '%s': %s", task.name, exc)
