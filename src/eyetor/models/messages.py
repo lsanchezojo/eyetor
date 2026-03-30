@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel
@@ -41,3 +42,26 @@ class ToolResult(BaseModel):
 
     tool_call_id: str
     content: str
+
+
+@dataclass
+class TokenUsage:
+    """Token counts from an LLM API response."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+@dataclass
+class CompletionResult:
+    """Wraps a Message with API metadata (usage, model, finish reason).
+
+    This is the return type of BaseProvider.complete(). The Message itself
+    stays clean (wire format only); metadata lives here.
+    """
+
+    message: Message
+    usage: TokenUsage | None = None
+    model: str | None = None
+    finish_reason: str | None = None

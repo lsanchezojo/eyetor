@@ -10,6 +10,7 @@ from eyetor.models.agents import AgentConfig
 from eyetor.models.messages import Message, ToolCall
 from eyetor.models.tools import ToolRegistry, ToolDefinition
 from eyetor.providers.base import BaseProvider
+from eyetor.providers.tracking import current_session_id
 
 if TYPE_CHECKING:
     from eyetor.memory.manager import MemoryManager
@@ -79,6 +80,7 @@ class ChatSession:
         """
         self._messages.append(Message(role="user", content=user_input))
         tool_defs = list(self.tool_registry._tools.values()) if self.tool_registry._tools else None
+        current_session_id.set(self.session_id)
 
         full_messages = self._get_full_messages()
         iterations = 0
@@ -86,11 +88,12 @@ class ChatSession:
         while iterations < self.config.max_iterations:
             iterations += 1
             # Non-streaming call to detect tool calls
-            response = await self.provider.complete(
+            result = await self.provider.complete(
                 messages=full_messages,
                 tools=tool_defs,
                 temperature=self.config.temperature,
             )
+            response = result.message
             self._messages.append(response)
             full_messages.append(response)
 

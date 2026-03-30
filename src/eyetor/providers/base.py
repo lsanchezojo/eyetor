@@ -6,7 +6,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator
 
-from eyetor.models.messages import Message
+from eyetor.models.messages import CompletionResult, Message
 from eyetor.models.tools import ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ class BaseProvider(ABC):
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
-    ) -> Message:
+    ) -> CompletionResult:
         """Send messages and return the assistant reply (non-streaming)."""
 
     @abstractmethod

@@ -52,11 +52,12 @@ class ToolAgent:
 
         while iterations < self.config.max_iterations:
             iterations += 1
-            response = await self.provider.complete(
+            result = await self.provider.complete(
                 messages=messages,
                 tools=tool_defs if tool_defs else None,
                 temperature=self.config.temperature,
             )
+            response = result.message
             messages.append(response)
 
             if not response.tool_calls:

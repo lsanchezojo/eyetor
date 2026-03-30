@@ -7,7 +7,7 @@ from typing import AsyncIterator
 
 import httpx
 
-from eyetor.models.messages import Message
+from eyetor.models.messages import CompletionResult, Message
 from eyetor.models.tools import ToolDefinition
 from eyetor.providers.base import BaseProvider
 
@@ -50,7 +50,7 @@ class FallbackProvider(BaseProvider):
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
-    ) -> Message:
+    ) -> CompletionResult:
         last_exc: Exception | None = None
         for provider in self._providers:
             try:

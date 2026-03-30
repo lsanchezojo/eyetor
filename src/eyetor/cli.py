@@ -74,11 +74,17 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
         from eyetor.models.tools import ToolRegistry, ToolDefinition
         from eyetor.memory.manager import MemoryManager
         from eyetor.skills.registry import SkillRegistry
-        from eyetor.skills.executor import run_script
+        from eyetor.skills.executor import run_script, DEFAULT_TIMEOUT
+        from eyetor.tracking.usage import UsageTracker
+        from eyetor.tracking.pricing import CostEstimator
 
-        prov = get_provider(cfg, provider)
+        tracker = UsageTracker.from_config(cfg.tracking)
+        cost_estimator = CostEstimator()
+        prov = get_provider(cfg, provider, tracker=tracker, cost_estimator=cost_estimator)
         if model:
             prov.model = model
+            if hasattr(prov, '_inner'):
+                prov._inner.model = model
 
         memory = MemoryManager.from_path(cfg.memory_db_path)
 
@@ -119,7 +125,9 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
                     confirmed = await _ask_confirm(skill, script, args)
                     if not confirmed:
                         return json.dumps({"error": "Operation cancelled by user."})
-                return await run_script(script_path, arg_list)
+                meta = skill_reg.get_metadata(skill)
+                timeout = meta.timeout if meta.timeout is not None else DEFAULT_TIMEOUT
+                return await run_script(script_path, arg_list, timeout=timeout)
 
             tool_registry.register(ToolDefinition(
                 name="run_skill_script",
@@ -177,7 +185,7 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
         if tg_cfg.enabled and tg_cfg.bot_token:
             from eyetor.channels.telegram import TelegramChannel
             session_mgr_tg = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory, scheduler=scheduler)
-            channels.append(TelegramChannel(session_mgr_tg, tg_cfg, skill_reg=skill_reg, scheduler=scheduler))
+            channels.append(TelegramChannel(session_mgr_tg, tg_cfg, skill_reg=skill_reg, scheduler=scheduler, tracker=tracker))
 
         if scheduler:
             channels.append(scheduler)
@@ -253,10 +261,16 @@ def run(ctx: click.Context, input_text: str, provider: str | None, model: str | 
         from eyetor.providers import get_provider
         from eyetor.agents.base import BaseAgent
         from eyetor.models.agents import AgentConfig
+        from eyetor.tracking.usage import UsageTracker
+        from eyetor.tracking.pricing import CostEstimator
 
-        prov = get_provider(cfg, provider)
+        tracker = UsageTracker.from_config(cfg.tracking)
+        cost_estimator = CostEstimator()
+        prov = get_provider(cfg, provider, tracker=tracker, cost_estimator=cost_estimator)
         if model:
             prov.model = model
+            if hasattr(prov, '_inner'):
+                prov._inner.model = model
 
         agent = BaseAgent(
             config=AgentConfig(
@@ -382,10 +396,10 @@ def providers_test(ctx: click.Context, name: str | None) -> None:
 
         console.print(f"Testing provider [bold]{target}[/bold] ({prov.model})...")
         try:
-            msg = await prov.complete(
+            result = await prov.complete(
                 messages=[Message(role="user", content="Reply with exactly: OK")],
             )
-            console.print(f"[green]✓ Response:[/green] {msg.content}")
+            console.print(f"[green]✓ Response:[/green] {result.message.content}")
         except Exception as exc:
             console.print(f"[red]✗ Failed: {exc}[/red]")
             sys.exit(1)
@@ -482,12 +496,41 @@ def mcp_test(ctx: click.Context, server_name: str) -> None:
 @cli.command()
 @click.option("--period", default="day", type=click.Choice(["day", "week", "month"]))
 @click.option("--provider", default=None)
+@click.option("--detail", is_flag=True, default=False, help="Show individual calls instead of summary.")
+@click.option("--limit", "-n", default=20, help="Number of recent calls (with --detail).")
 @click.pass_context
-def usage(ctx: click.Context, period: str, provider: str | None) -> None:
+def usage(ctx: click.Context, period: str, provider: str | None, detail: bool, limit: int) -> None:
     """Show LLM usage and cost statistics."""
     cfg = ctx.obj["cfg"]
     from eyetor.tracking.usage import UsageTracker
     tracker = UsageTracker.from_config(cfg.tracking)
+
+    if detail:
+        records = tracker.get_recent(limit=limit, provider=provider)
+        if not records:
+            console.print("[yellow]No usage records found.[/yellow]")
+            return
+        table = Table(title="Recent LLM Calls")
+        table.add_column("Timestamp", style="dim")
+        table.add_column("Provider", style="cyan")
+        table.add_column("Model")
+        table.add_column("Tokens", justify="right")
+        table.add_column("Cost ($)", justify="right")
+        table.add_column("Speed", justify="right")
+        table.add_column("Finish")
+        table.add_column("Session", style="dim")
+        for r in records:
+            ts = r.timestamp[:19].replace("T", " ")
+            tokens = f"{r.prompt_tokens} → {r.completion_tokens}"
+            speed = f"{r.speed_tps:.1f} tps" if r.speed_tps else "—"
+            cost = f"{r.estimated_cost:.4f}" if r.estimated_cost else "0"
+            table.add_row(
+                ts, r.provider, r.model, tokens, cost, speed,
+                r.finish_reason or "—", r.session_id,
+            )
+        console.print(table)
+        return
+
     summaries = tracker.get_summary(period=period, provider=provider)
     if not summaries:
         console.print(f"[yellow]No usage data for period '{period}'.[/yellow]")

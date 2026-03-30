@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 
 from eyetor.config import TrackingConfig
-from eyetor.tracking.store import TrackingStore, UsageSummary
+from eyetor.tracking.store import TrackingStore, UsageRecord, UsageSummary
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,9 @@ class UsageTracker:
         prompt_tokens: int,
         completion_tokens: int,
         estimated_cost: float = 0.0,
+        duration_ms: int = 0,
+        speed_tps: float = 0.0,
+        finish_reason: str = "",
     ) -> None:
         """Record a completed LLM call."""
         self._store.record(
@@ -41,14 +44,19 @@ class UsageTracker:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             estimated_cost=estimated_cost,
+            duration_ms=duration_ms,
+            speed_tps=speed_tps,
+            finish_reason=finish_reason,
         )
         logger.debug(
-            "Usage recorded: provider=%s model=%s tokens=%d+%d cost=%.4f",
+            "Usage recorded: provider=%s model=%s tokens=%d+%d cost=%.4f speed=%.1ftps finish=%s",
             provider,
             model,
             prompt_tokens,
             completion_tokens,
             estimated_cost,
+            speed_tps,
+            finish_reason,
         )
 
     def check_limits(self, provider: str) -> bool:
@@ -74,6 +82,10 @@ class UsageTracker:
             )
             return False
         return True
+
+    def get_recent(self, limit: int = 10, provider: str | None = None) -> list[UsageRecord]:
+        """Return the most recent individual usage records."""
+        return self._store.get_recent(limit=limit, provider=provider)
 
     def get_summary(self, period: str = "day", provider: str | None = None) -> list[UsageSummary]:
         """Return aggregated usage summaries."""

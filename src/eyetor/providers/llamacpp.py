@@ -7,7 +7,7 @@ from typing import AsyncIterator
 
 import httpx
 
-from eyetor.models.messages import Message
+from eyetor.models.messages import CompletionResult, Message
 from eyetor.models.tools import ToolDefinition
 from eyetor.providers.base import BaseProvider
 from eyetor.providers.openrouter import _parse_completion_response
@@ -27,7 +27,7 @@ class LlamaCppProvider(BaseProvider):
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
-    ) -> Message:
+    ) -> CompletionResult:
         payload = self._build_payload(messages, tools, temperature, stream=False)
         async with self._client(timeout=300.0) as client:
             response = await client.post(

@@ -20,6 +20,11 @@ from eyetor.channels.base import BaseChannel
 from eyetor.chat.manager import SessionManager
 from eyetor.config import TelegramChannelConfig
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from eyetor.tracking.usage import UsageTracker
+
 logger = logging.getLogger(__name__)
 
 _CHUNK_TOKENS = 20  # Edit message every N characters
@@ -41,11 +46,13 @@ class TelegramChannel(BaseChannel):
         config: TelegramChannelConfig,
         skill_reg=None,
         scheduler=None,
+        tracker: "UsageTracker | None" = None,
     ) -> None:
         self._manager = session_manager
         self._config = config
         self._skill_reg = skill_reg
         self._scheduler = scheduler
+        self._tracker = tracker
         self._dp = None
         self._bot = None
 
@@ -118,6 +125,13 @@ class TelegramChannel(BaseChannel):
             if not _is_authorized(msg):
                 return
             await msg.answer(_format_tasks_text(self._scheduler), parse_mode="HTML")
+
+        @dp.message(Command("usage"))
+        async def cmd_usage(msg: Message) -> None:
+            if not _is_authorized(msg):
+                return
+            text = _format_usage_text(self._tracker)
+            await _send_long(msg, text, parse_mode="HTML")
 
         # --- Dynamic skill commands ---
         _skill_commands = []
@@ -197,6 +211,7 @@ class TelegramChannel(BaseChannel):
                 "/reset — start a new conversation\n"
                 "/skills — list available skills\n"
                 "/tasks — list scheduled tasks\n"
+                "/usage — show token usage and costs\n"
                 f"{extra}"
                 "/help — show this help\n\n"
                 "Send a message to chat, a voice note to transcribe, "
@@ -351,6 +366,7 @@ class TelegramChannel(BaseChannel):
             BotCommand(command="reset", description="Start a new conversation"),
             BotCommand(command="skills", description="List available skills"),
             BotCommand(command="tasks", description="List scheduled tasks"),
+            BotCommand(command="usage", description="Show token usage and costs"),
         ]
         for _sc in _skill_commands:
             commands.append(BotCommand(command=_sc.name, description=_sc.description))
@@ -584,6 +600,57 @@ def _format_tasks_text(scheduler) -> str:
         )
     return "\n\n".join(lines)
 
+
+
+def _format_usage_text(tracker) -> str:
+    """Return an HTML-formatted usage report for Telegram."""
+    if tracker is None:
+        return "Usage tracking is not configured."
+
+    lines: list[str] = []
+
+    # Recent individual calls
+    recent = tracker.get_recent(limit=10)
+    if recent:
+        lines.append("<b>Recent calls:</b>")
+        for r in recent:
+            # Parse timestamp for display
+            ts = r.timestamp[:16].replace("T", " ")
+            # Shorten model name
+            model_short = r.model.split("/")[-1] if "/" in r.model else r.model
+            if len(model_short) > 30:
+                model_short = model_short[:27] + "..."
+            speed = f"{r.speed_tps:.1f} tps" if r.speed_tps else "—"
+            cost = f"${r.estimated_cost:.4f}" if r.estimated_cost else "$0"
+            finish = r.finish_reason or "—"
+            lines.append(
+                f"\n<code>{ts}</code> — <b>{_escape_html(model_short)}</b>\n"
+                f"  {r.prompt_tokens} → {r.completion_tokens} tokens | "
+                f"{cost} | {speed} | {finish}"
+            )
+    else:
+        lines.append("No usage data recorded yet.")
+
+    # Daily summary
+    summaries = tracker.get_summary(period="day")
+    if summaries:
+        lines.append("\n<b>Today's summary:</b>")
+        total_tokens = 0
+        total_cost = 0.0
+        for s in summaries:
+            model_short = s.model.split("/")[-1] if "/" in s.model else s.model
+            if len(model_short) > 30:
+                model_short = model_short[:27] + "..."
+            lines.append(
+                f"  {_escape_html(s.provider)} / {_escape_html(model_short)} — "
+                f"{s.calls} calls, {s.total_tokens:,} tokens, ${s.estimated_cost:.4f}"
+            )
+            total_tokens += s.total_tokens
+            total_cost += s.estimated_cost
+        if len(summaries) > 1:
+            lines.append(f"  <b>Total: {total_tokens:,} tokens, ${total_cost:.4f}</b>")
+
+    return "\n".join(lines)
 
 
 def _format_skills_text(skill_reg) -> str:

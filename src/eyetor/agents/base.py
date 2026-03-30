@@ -33,10 +33,11 @@ class BaseAgent:
             AgentResult with the assistant response.
         """
         messages = self._build_messages(user_input, history)
-        response = await self.provider.complete(
+        result = await self.provider.complete(
             messages=messages,
             temperature=self.config.temperature,
         )
+        response = result.message
         messages.append(response)
         return AgentResult(
             messages=messages,

@@ -51,6 +51,7 @@ class SkillMetadata:
     compatibility: str = ""
     author: str = ""
     version: str = ""
+    timeout: float | None = None  # Per-skill timeout override (seconds); None = use default
     commands: list[SkillCommand] = field(default_factory=list)
 
 
@@ -133,6 +134,10 @@ def load_skill_metadata(skill_dir: Path) -> SkillMetadata | None:
             parse_mode=raw_cmd.get("parse_mode", "HTML"),
         ))
 
+    # Optional per-skill timeout (seconds)
+    raw_timeout = fm.get("timeout")
+    timeout = float(raw_timeout) if raw_timeout is not None else None
+
     return SkillMetadata(
         name=name,
         description=description,
@@ -141,6 +146,7 @@ def load_skill_metadata(skill_dir: Path) -> SkillMetadata | None:
         compatibility=fm.get("compatibility", ""),
         author=meta_block.get("author", ""),
         version=str(meta_block.get("version", "")),
+        timeout=timeout,
         commands=commands,
     )
 
