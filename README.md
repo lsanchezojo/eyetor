@@ -79,7 +79,7 @@ When run from a terminal, `eyetor start` opens an interactive CLI session. If Te
 
 **CLI commands:** `/reset`, `/history`, `/skills`, `/help`, `/exit`
 
-**Telegram bot commands:** `/start`, `/reset`, `/skills`, `/tasks`, `/help`
+**Telegram bot commands:** `/start`, `/reset`, `/skills`, `/tasks`, `/help` + any commands declared by skills (see [Skill commands](#skill-commands))
 
 ### Voice messages (Telegram)
 
@@ -214,6 +214,50 @@ Skills live in `skills/` following the [agentskills.io](https://agentskills.io) 
 | `google-workspace` | Google Calendar, Gmail, and Tasks (requires setup) |
 
 Use `/skills` in any channel (CLI or Telegram) to list active skills with their descriptions. New skills are picked up automatically at startup from all directories listed under `skills_dirs` in `config/default.yaml`.
+
+### Skill commands
+
+Skills can declare their own `/` commands for the Telegram bot by adding a `commands` block to their `SKILL.md` frontmatter. These are registered automatically at startup — no changes to the bot core needed.
+
+Two action types are supported:
+
+| Action | Behaviour |
+|--------|-----------|
+| `script` | Runs a skill script directly and sends its output to the chat |
+| `prompt` | Sends a prompt to the agent session (supports `{args}` placeholder for user input) |
+
+Example in `SKILL.md`:
+
+```yaml
+---
+name: my-skill
+description: "..."
+commands:
+  - name: mycommand
+    description: "Does something useful"
+    action: script
+    script: my_script.py
+    args: ["--format", "telegram"]
+  - name: ask
+    description: "Ask the agent a question about this skill"
+    action: prompt
+    prompt: "Using my-skill, answer: {args}"
+---
+```
+
+**Fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Command name without `/` (lowercase, alphanumeric + underscores) |
+| `description` | yes | Shown in Telegram's command menu and `/help` |
+| `action` | yes | `script` or `prompt` |
+| `script` | if script | Script filename relative to `scripts/` |
+| `args` | no | Default arguments passed to the script |
+| `prompt` | if prompt | Prompt template; `{args}` is replaced with the user's input after the command |
+| `parse_mode` | no | Telegram parse mode for script output (default: `HTML`) |
+
+Reserved command names (`start`, `reset`, `skills`, `tasks`, `help`) cannot be overridden by skills.
 
 ### google-workspace setup
 

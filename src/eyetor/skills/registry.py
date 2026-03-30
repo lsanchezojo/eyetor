@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from eyetor.skills.loader import SkillInfo, SkillMetadata, discover_skills, load_skill_info
+from eyetor.skills.loader import SkillCommand, SkillInfo, SkillMetadata, discover_skills, load_skill_info
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,14 @@ class SkillRegistry:
             except KeyError:
                 logger.warning("Skill not found in registry: %s", name)
         return "\n".join(parts)
+
+    def get_all_commands(self) -> list[tuple[SkillMetadata, SkillCommand]]:
+        """Return all skill-declared channel commands with their parent metadata."""
+        result = []
+        for meta in self._metadata.values():
+            for cmd in meta.commands:
+                result.append((meta, cmd))
+        return result
 
     def available_skills_summary(self) -> str:
         """One-line summary of all skills for system prompts (metadata only)."""

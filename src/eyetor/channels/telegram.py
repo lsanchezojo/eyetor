@@ -119,21 +119,79 @@ class TelegramChannel(BaseChannel):
                 return
             await msg.answer(_format_tasks_text(self._scheduler), parse_mode="HTML")
 
-        _has_grocery = (
-            self._skill_reg is not None
-            and "grocery-intel" in self._skill_reg.list_names()
-        )
+        # --- Dynamic skill commands ---
+        _skill_commands = []
+        if self._skill_reg:
+            from eyetor.skills.executor import run_script as _run_skill_script
 
-        if _has_grocery:
-            @dp.message(Command("compra"))
-            async def cmd_compra(msg: Message) -> None:
-                if not _is_authorized(msg):
-                    return
-                await msg.answer(await _format_shopping_list(), parse_mode="HTML")
+            for _meta, _cmd in self._skill_reg.get_all_commands():
+                _skill_commands.append(_cmd)
+
+                if _cmd.action == "script":
+                    _script_path = _meta.path / "scripts" / _cmd.script
+                    _default_args = list(_cmd.args)
+                    _parse = _cmd.parse_mode or None
+
+                    @dp.message(Command(_cmd.name))
+                    async def _skill_script_handler(
+                        msg: Message,
+                        _path=_script_path,
+                        _args=_default_args,
+                        _pm=_parse,
+                    ) -> None:
+                        if not _is_authorized(msg):
+                            return
+                        user_args = (msg.text or "").split()[1:]
+                        raw = await _run_skill_script(_path, _args + user_args)
+                        await _send_long(msg, raw, parse_mode=_pm)
+
+                elif _cmd.action == "prompt":
+                    _template = _cmd.prompt
+
+                    @dp.message(Command(_cmd.name))
+                    async def _skill_prompt_handler(
+                        msg: Message,
+                        _tmpl=_template,
+                    ) -> None:
+                        if not _is_authorized(msg):
+                            return
+                        user_parts = (msg.text or "").split(maxsplit=1)
+                        args_text = user_parts[1] if len(user_parts) > 1 else ""
+                        prompt_text = _tmpl.replace("{args}", args_text)
+
+                        session_id = f"telegram-{msg.chat.id}"
+                        session = self._manager.get_or_create(session_id)
+                        placeholder = await msg.answer("...")
+                        buffer = ""
+                        last_edit = ""
+                        try:
+                            async for chunk in session.send(prompt_text):
+                                buffer += chunk
+                                if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
+                                    try:
+                                        await placeholder.edit_text(buffer or "...")
+                                        last_edit = buffer
+                                    except Exception:
+                                        pass
+                            if buffer:
+                                html = _md_to_html(buffer)
+                                if len(html) <= _TG_MAX_LEN:
+                                    try:
+                                        await placeholder.edit_text(html, parse_mode="HTML")
+                                    except Exception:
+                                        await msg.answer(html, parse_mode="HTML")
+                                else:
+                                    await placeholder.delete()
+                                    await _send_long(msg, html, parse_mode="HTML")
+                        except Exception as exc:
+                            logger.error("Skill prompt command error: %s", exc)
+                            await placeholder.edit_text(f"Error: {exc}")
 
         @dp.message(Command("help"))
         async def cmd_help(msg: Message) -> None:
-            extra = "/compra — show the shopping list\n" if _has_grocery else ""
+            extra = ""
+            for _sc in _skill_commands:
+                extra += f"/{_sc.name} — {_sc.description}\n"
             await msg.answer(
                 "Eyetor commands:\n"
                 "/reset — start a new conversation\n"
@@ -293,10 +351,10 @@ class TelegramChannel(BaseChannel):
             BotCommand(command="reset", description="Start a new conversation"),
             BotCommand(command="skills", description="List available skills"),
             BotCommand(command="tasks", description="List scheduled tasks"),
-            BotCommand(command="help", description="Show help"),
         ]
-        if _has_grocery:
-            commands.insert(-1, BotCommand(command="compra", description="Lista de la compra"))
+        for _sc in _skill_commands:
+            commands.append(BotCommand(command=_sc.name, description=_sc.description))
+        commands.append(BotCommand(command="help", description="Show help"))
         await bot.set_my_commands(commands)
 
         logger.info("Starting Telegram bot...")
@@ -526,39 +584,6 @@ def _format_tasks_text(scheduler) -> str:
         )
     return "\n\n".join(lines)
 
-
-async def _format_shopping_list() -> str:
-    """Run list.py show and format the result as Telegram HTML."""
-    import json
-    from eyetor.skills.executor import run_script
-    from pathlib import Path
-
-    script = Path(__file__).resolve().parents[3] / "skills" / "grocery-intel" / "scripts" / "list.py"
-    if not script.exists():
-        return "grocery-intel skill not found."
-
-    raw = await run_script(script, ["show"])
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return "Could not read the shopping list."
-
-    if not data.get("ok"):
-        return f"Error: {data.get('error', 'unknown')}"
-
-    items = data.get("items", [])
-    if not items:
-        return "🛒 <b>Shopping list is empty.</b>"
-
-    lines = [f"🛒 <b>Shopping list</b> ({len(items)} items):"]
-    for it in items:
-        qty = it["quantity"]
-        unit = f" {it['unit']}" if it.get("unit") else ""
-        # Show qty only when not 1
-        qty_str = f" x{qty:g}{unit}" if qty != 1 else (unit or "")
-        notes = f"  <i>({_escape_html(it['notes'])})</i>" if it.get("notes") else ""
-        lines.append(f"  • {_escape_html(it['product'])}{qty_str}{notes}")
-    return "\n".join(lines)
 
 
 def _format_skills_text(skill_reg) -> str:
