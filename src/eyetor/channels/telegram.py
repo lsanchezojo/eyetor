@@ -23,6 +23,7 @@ from eyetor.config import TelegramChannelConfig
 logger = logging.getLogger(__name__)
 
 _CHUNK_TOKENS = 20  # Edit message every N characters
+_TG_MAX_LEN = 4096  # Telegram message character limit
 
 
 class TelegramChannel(BaseChannel):
@@ -118,13 +119,27 @@ class TelegramChannel(BaseChannel):
                 return
             await msg.answer(_format_tasks_text(self._scheduler), parse_mode="HTML")
 
+        _has_grocery = (
+            self._skill_reg is not None
+            and "grocery-intel" in self._skill_reg.list_names()
+        )
+
+        if _has_grocery:
+            @dp.message(Command("compra"))
+            async def cmd_compra(msg: Message) -> None:
+                if not _is_authorized(msg):
+                    return
+                await msg.answer(await _format_shopping_list(), parse_mode="HTML")
+
         @dp.message(Command("help"))
         async def cmd_help(msg: Message) -> None:
+            extra = "/compra — show the shopping list\n" if _has_grocery else ""
             await msg.answer(
                 "Eyetor commands:\n"
                 "/reset — start a new conversation\n"
                 "/skills — list available skills\n"
                 "/tasks — list scheduled tasks\n"
+                f"{extra}"
                 "/help — show this help\n\n"
                 "Send a message to chat, a voice note to transcribe, "
                 "or a receipt photo (with store name as caption) to ingest prices."
@@ -155,10 +170,15 @@ class TelegramChannel(BaseChannel):
 
                 # Final edit always applies HTML formatting
                 if buffer:
-                    try:
-                        await placeholder.edit_text(_md_to_html(buffer), parse_mode="HTML")
-                    except Exception:
-                        await msg.answer(_md_to_html(buffer), parse_mode="HTML")
+                    html = _md_to_html(buffer)
+                    if len(html) <= _TG_MAX_LEN:
+                        try:
+                            await placeholder.edit_text(html, parse_mode="HTML")
+                        except Exception:
+                            await msg.answer(html, parse_mode="HTML")
+                    else:
+                        await placeholder.delete()
+                        await _send_long(msg, html, parse_mode="HTML")
             except Exception as exc:
                 logger.error("Telegram message handler error: %s", exc)
                 await placeholder.edit_text(f"Error: {exc}")
@@ -209,12 +229,15 @@ class TelegramChannel(BaseChannel):
                             except Exception:
                                 pass
                     if buffer:
-                        try:
-                            await placeholder.edit_text(
-                                _md_to_html(buffer), parse_mode="HTML"
-                            )
-                        except Exception:
-                            await msg.answer(_md_to_html(buffer), parse_mode="HTML")
+                        html = _md_to_html(buffer)
+                        if len(html) <= _TG_MAX_LEN:
+                            try:
+                                await placeholder.edit_text(html, parse_mode="HTML")
+                            except Exception:
+                                await msg.answer(html, parse_mode="HTML")
+                        else:
+                            await placeholder.delete()
+                            await _send_long(msg, html, parse_mode="HTML")
                 except Exception as exc:
                     logger.error("Telegram photo handler error: %s", exc)
                     await placeholder.edit_text(f"Error: {exc}")
@@ -252,24 +275,29 @@ class TelegramChannel(BaseChannel):
                             pass
 
                 if buffer:
-                    try:
-                        await placeholder.edit_text(
-                            f"🎤 <i>{_escape_html(transcription)}</i>\n\n{_md_to_html(buffer)}",
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        await msg.answer(_md_to_html(buffer), parse_mode="HTML")
+                    html = f"🎤 <i>{_escape_html(transcription)}</i>\n\n{_md_to_html(buffer)}"
+                    if len(html) <= _TG_MAX_LEN:
+                        try:
+                            await placeholder.edit_text(html, parse_mode="HTML")
+                        except Exception:
+                            await msg.answer(html, parse_mode="HTML")
+                    else:
+                        await placeholder.delete()
+                        await _send_long(msg, html, parse_mode="HTML")
             except Exception as exc:
                 logger.error("Telegram voice handler error: %s", exc)
                 await placeholder.edit_text(f"Error: {exc}")
 
-        await bot.set_my_commands([
+        commands = [
             BotCommand(command="start", description="Start the bot"),
             BotCommand(command="reset", description="Start a new conversation"),
             BotCommand(command="skills", description="List available skills"),
             BotCommand(command="tasks", description="List scheduled tasks"),
             BotCommand(command="help", description="Show help"),
-        ])
+        ]
+        if _has_grocery:
+            commands.insert(-1, BotCommand(command="compra", description="Lista de la compra"))
+        await bot.set_my_commands(commands)
 
         logger.info("Starting Telegram bot...")
         await dp.start_polling(bot)
@@ -380,6 +408,38 @@ def _run_whisper_model(model, audio_path: str) -> str:
     return " ".join(seg.text.strip() for seg in segments).strip()
 
 
+def _split_message(text: str, limit: int = _TG_MAX_LEN) -> list[str]:
+    """Split text into chunks of at most *limit* characters.
+
+    Tries to break at newlines first, then at spaces, to keep messages
+    readable.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        # Try to break at last newline within limit
+        cut = text.rfind("\n", 0, limit)
+        if cut <= 0:
+            # Try space
+            cut = text.rfind(" ", 0, limit)
+        if cut <= 0:
+            cut = limit  # hard cut
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    return chunks
+
+
+async def _send_long(msg: Message, text: str, parse_mode: str | None = None) -> None:
+    """Send a potentially long message, splitting if it exceeds Telegram's limit."""
+    for part in _split_message(text):
+        await msg.answer(part, parse_mode=parse_mode)
+
+
 def _escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -465,6 +525,40 @@ def _format_tasks_text(scheduler) -> str:
             f"    ID: <code>{t['id']}</code>"
         )
     return "\n\n".join(lines)
+
+
+async def _format_shopping_list() -> str:
+    """Run list.py show and format the result as Telegram HTML."""
+    import json
+    from eyetor.skills.executor import run_script
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[3] / "skills" / "grocery-intel" / "scripts" / "list.py"
+    if not script.exists():
+        return "grocery-intel skill not found."
+
+    raw = await run_script(script, ["show"])
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return "Could not read the shopping list."
+
+    if not data.get("ok"):
+        return f"Error: {data.get('error', 'unknown')}"
+
+    items = data.get("items", [])
+    if not items:
+        return "🛒 <b>Shopping list is empty.</b>"
+
+    lines = [f"🛒 <b>Shopping list</b> ({len(items)} items):"]
+    for it in items:
+        qty = it["quantity"]
+        unit = f" {it['unit']}" if it.get("unit") else ""
+        # Show qty only when not 1
+        qty_str = f" x{qty:g}{unit}" if qty != 1 else (unit or "")
+        notes = f"  <i>({_escape_html(it['notes'])})</i>" if it.get("notes") else ""
+        lines.append(f"  • {_escape_html(it['product'])}{qty_str}{notes}")
+    return "\n".join(lines)
 
 
 def _format_skills_text(skill_reg) -> str:
