@@ -66,29 +66,30 @@ class TrackingProvider(BaseProvider):
         duration_s = time.monotonic() - t0
         duration_ms = int(duration_s * 1000)
 
-        if result.usage:
-            completion_tokens = result.usage.completion_tokens
-            speed_tps = completion_tokens / duration_s if duration_s > 0 else 0.0
+        prompt_tokens = result.usage.prompt_tokens if result.usage else 0
+        completion_tokens = result.usage.completion_tokens if result.usage else 0
+        speed_tps = completion_tokens / duration_s if duration_s > 0 else 0.0
 
-            cost = 0.0
-            if self._cost_estimator:
-                cost = self._cost_estimator.estimate(
-                    result.model or self._inner.model,
-                    result.usage.prompt_tokens,
-                    completion_tokens,
-                )
-
-            self._tracker.record(
-                session_id=current_session_id.get(),
+        cost = 0.0
+        if self._cost_estimator:
+            cost = self._cost_estimator.estimate(
+                result.model or self._inner.model,
+                prompt_tokens,
+                completion_tokens,
                 provider=self._provider_name,
-                model=result.model or self._inner.model,
-                prompt_tokens=result.usage.prompt_tokens,
-                completion_tokens=completion_tokens,
-                estimated_cost=cost,
-                duration_ms=duration_ms,
-                speed_tps=round(speed_tps, 1),
-                finish_reason=result.finish_reason or "",
             )
+
+        self._tracker.record(
+            session_id=current_session_id.get(),
+            provider=self._provider_name,
+            model=result.model or self._inner.model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            estimated_cost=cost,
+            duration_ms=duration_ms,
+            speed_tps=round(speed_tps, 1),
+            finish_reason=result.finish_reason or "",
+        )
 
         return result
 

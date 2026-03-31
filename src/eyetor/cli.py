@@ -129,17 +129,24 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
                 timeout = meta.timeout if meta.timeout is not None else DEFAULT_TIMEOUT
                 return await run_script(script_path, arg_list, timeout=timeout)
 
+            # Build dynamic skill list for tool description
+            _skill_summaries = []
+            for _sn in skill_names:
+                _sm = skill_reg.get_metadata(_sn)
+                if _sm:
+                    _skill_summaries.append(f"{_sm.name} ({_sm.description[:80]})")
+            _skills_desc = ", ".join(_skill_summaries) if _skill_summaries else "none"
+
             tool_registry.register(ToolDefinition(
                 name="run_skill_script",
                 description=(
                     "Execute a script from an available skill. "
-                    "Skills: shell (run commands), filesystem (read/write/list/search files), "
-                    "browser (open URLs), web-search (search the web)."
+                    f"Available skills: {_skills_desc}"
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "skill": {"type": "string", "description": "Skill name (shell, filesystem, browser, web-search)"},
+                        "skill": {"type": "string", "description": f"Skill name. One of: {', '.join(skill_names)}"},
                         "script": {"type": "string", "description": "Script filename (e.g. run.py, fs.py, browser.py, search.py)"},
                         "args": {"type": "string", "description": "CLI arguments as a single string (e.g. '--cmd \"ls -la\"')"},
                     },
@@ -147,6 +154,87 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
                 },
                 handler=run_skill_script_handler,
             ))
+
+        # Image generation tool
+        if cfg.default_image_provider and cfg.image_providers:
+            from eyetor.image_providers import get_image_provider
+            from eyetor.models.images import ImageGenerationRequest
+
+            _img_provider_names = list(cfg.image_providers.keys())
+
+            async def generate_image_handler(
+                prompt: str,
+                negative_prompt: str = "",
+                width: int = 1024,
+                height: int = 1024,
+                steps: int | None = None,
+                seed: int | None = None,
+                provider: str | None = None,
+            ) -> str:
+                from eyetor.providers.tracking import current_session_id
+                img_prov = get_image_provider(cfg, provider)
+                request = ImageGenerationRequest(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    width=width,
+                    height=height,
+                    steps=steps,
+                    seed=seed,
+                )
+                result = await img_prov.generate(request)
+                img = result.images[0]
+
+                # Track image generation usage
+                duration_ms = int((result.generation_time_s or 0) * 1000)
+                img_cost = cost_estimator.estimate_image(
+                    result.model, num_images=len(result.images)
+                )
+                tracker.record(
+                    session_id=current_session_id.get(),
+                    provider=f"image:{result.provider}",
+                    model=result.model,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    estimated_cost=img_cost,
+                    duration_ms=duration_ms,
+                    finish_reason="image_generated",
+                )
+
+                return json.dumps({
+                    "status": "ok",
+                    "image_path": str(img.path),
+                    "width": img.width,
+                    "height": img.height,
+                    "provider": result.provider,
+                    "model": result.model,
+                })
+
+            tool_registry.register(ToolDefinition(
+                name="generate_image",
+                description=(
+                    "Generate an image from a text prompt. Returns local file path. "
+                    f"Available image providers: {', '.join(_img_provider_names)}"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string", "description": "Text description of the image to generate"},
+                        "negative_prompt": {"type": "string", "description": "What to avoid in the image (optional)"},
+                        "width": {"type": "integer", "description": "Image width in pixels (default 1024)"},
+                        "height": {"type": "integer", "description": "Image height in pixels (default 1024)"},
+                        "steps": {"type": "integer", "description": "Number of generation steps (optional, provider default)"},
+                        "seed": {"type": "integer", "description": "Random seed for reproducibility (optional)"},
+                        "provider": {"type": "string", "description": f"Image provider name. One of: {', '.join(_img_provider_names)} (optional, uses default)"},
+                    },
+                    "required": ["prompt"],
+                },
+                handler=generate_image_handler,
+            ))
+
+            base_system += (
+                "\n\nCuando generes una imagen con generate_image, incluye la ruta en tu respuesta "
+                "con el formato [IMAGE:/ruta/al/archivo.png] para que se muestre correctamente al usuario."
+            )
 
         agent_cfg = AgentConfig(
             name="eyetor",

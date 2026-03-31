@@ -8,6 +8,7 @@ from eyetor.providers.base import BaseProvider
 from eyetor.providers.openrouter import OpenRouterProvider
 from eyetor.providers.ollama import OllamaProvider
 from eyetor.providers.llamacpp import LlamaCppProvider
+from eyetor.providers.gemini import GeminiProvider
 from eyetor.providers.fallback import FallbackProvider
 from eyetor.providers.tracking import TrackingProvider, UsageLimitExceeded
 from eyetor.config import ProviderConfig, VectorConfig
@@ -24,6 +25,7 @@ __all__ = [
     "OpenRouterProvider",
     "OllamaProvider",
     "LlamaCppProvider",
+    "GeminiProvider",
     "FallbackProvider",
     "TrackingProvider",
     "UsageLimitExceeded",
@@ -36,6 +38,7 @@ _PROVIDER_MAP = {
     "openrouter": OpenRouterProvider,
     "ollama": OllamaProvider,
     "llamacpp": LlamaCppProvider,
+    "gemini": GeminiProvider,
 }
 
 

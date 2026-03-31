@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -15,6 +17,7 @@ from eyetor.chat.manager import SessionManager
 logger = logging.getLogger(__name__)
 
 _SESSION_ID = "cli-local"
+_IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(.*?)\]")
 
 _HELP = """
 [bold]Eyetor CLI Commands[/bold]
@@ -85,7 +88,13 @@ class CliChannel(BaseChannel):
                 with self._console.status("", spinner="dots"):
                     async for chunk in session.send(user_input):
                         response_text += chunk
-                self._console.print(Markdown(response_text))
+                # Strip image markers from text
+                clean_text = _IMAGE_MARKER_RE.sub("", response_text).strip()
+                if clean_text:
+                    self._console.print(Markdown(clean_text))
+                # Show generated images from markers + tool results
+                for img_path in _collect_image_paths(response_text, session):
+                    self._console.print(f"[green]Imagen guardada:[/green] {img_path}")
             except Exception as exc:
                 self._console.print(f"[red]Error: {exc}[/red]")
                 logger.error("Chat error: %s", exc)
@@ -102,6 +111,29 @@ class CliChannel(BaseChannel):
         for msg in history:
             role_color = {"user": "blue", "assistant": "green", "tool": "yellow"}.get(msg.role, "white")
             self._console.print(f"[{role_color}]{msg.role}[/{role_color}]: {msg.content or '[tool call]'}")
+
+
+def _collect_image_paths(buffer: str, session) -> list[str]:
+    """Collect image paths from [IMAGE:] markers and generate_image tool results.
+
+    Only scans tool results from the latest turn (after the last user message).
+    """
+    paths: set[str] = set()
+    for p in _IMAGE_MARKER_RE.findall(buffer):
+        paths.add(p.strip())
+    # Scan only messages after the last user message
+    history = session.get_history()
+    for msg in reversed(history):
+        if msg.role == "user":
+            break
+        if msg.role == "tool" and msg.content:
+            try:
+                data = json.loads(msg.content)
+                if isinstance(data, dict) and data.get("status") == "ok" and "image_path" in data:
+                    paths.add(data["image_path"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return list(paths)
 
 
 def _format_skills(skill_reg) -> str:

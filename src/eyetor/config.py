@@ -14,7 +14,7 @@ from pydantic import BaseModel
 class ProviderConfig(BaseModel):
     """Configuration for a single LLM provider."""
 
-    type: Literal["openrouter", "ollama", "llamacpp"]
+    type: Literal["openrouter", "ollama", "llamacpp", "gemini"]
     base_url: str
     api_key: str | None = None
     model: str
@@ -106,6 +106,26 @@ class SchedulerConfig(BaseModel):
     default_timezone: str = "Europe/Madrid"
 
 
+class ImageProviderConfig(BaseModel):
+    """Configuration for a single image generation provider.
+
+    When ``provider`` is set, connection details (base_url, api_key, ssl_verify)
+    are inherited from the named LLM provider in ``providers`` unless explicitly
+    overridden here.
+    """
+
+    type: Literal["openai_compat", "gemini", "automatic1111", "comfyui"]
+    provider: str | None = None  # reference to an LLM provider for shared config
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str = ""
+    ssl_verify: bool | str = True
+    output_dir: str = "~/.eyetor/generated_images"
+    default_timeout: float = 300.0
+    workflow_template: str | None = None  # ComfyUI only
+    extra_params: dict[str, Any] = {}
+
+
 class VectorConfig(BaseModel):
     """Root configuration for Eyetor."""
 
@@ -119,6 +139,8 @@ class VectorConfig(BaseModel):
     scheduler: SchedulerConfig = SchedulerConfig()
     orchestrator: OrchestratorConfig = OrchestratorConfig()
     mcp_servers: dict[str, McpServerConfig] = {}
+    image_providers: dict[str, ImageProviderConfig] = {}
+    default_image_provider: str | None = None
     log_level: str = "INFO"
 
 

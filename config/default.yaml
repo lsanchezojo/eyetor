@@ -19,6 +19,12 @@ providers:
     model: default
     temperature: 0.6  # Qwen3 recommended (matches --temp 0.6 on server)
 
+  gemini:
+    type: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    api_key: ${GEMINI_API_KEY}
+    model: gemini-2.0-flash
+
 fallback:
   fallback_chain: [ollama, openrouter, llamacpp]
   retry_on: [timeout, connection_error, "500", "502", "503", "529"]
@@ -55,6 +61,14 @@ scheduler:
 orchestrator:
   auto_delegate: false
   workers: {}
+
+image_providers:
+  gemini-flash:
+    type: gemini
+    provider: gemini          # inherits base_url, api_key from providers.gemini
+    model: gemini-3.1-flash-image-preview
+
+default_image_provider: gemini-flash
 
 mcp_servers: {}
 

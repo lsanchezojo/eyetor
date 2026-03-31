@@ -5,7 +5,7 @@ Multi-agent AI system based on Anthropic's agent patterns. Runs as a background 
 ## Requirements
 
 - Python 3.11+
-- A running LLM backend: [llama.cpp server](https://github.com/ggerganov/llama.cpp), [Ollama](https://ollama.com), or an [OpenRouter](https://openrouter.ai) API key
+- A running LLM backend: [llama.cpp server](https://github.com/ggerganov/llama.cpp), [Ollama](https://ollama.com), [OpenRouter](https://openrouter.ai), or [Google Gemini](https://ai.google.dev/) API key
 
 ## Installation
 
@@ -28,6 +28,7 @@ cp .env.example .env
 TELEGRAM_BOT_TOKEN=     # from @BotFather on Telegram
 TELEGRAM_ALLOWED_USER=  # your numeric chat_id (get it from @userinfobot)
 OPENROUTER_API_KEY=     # only if using OpenRouter provider
+GEMINI_API_KEY=         # only if using Gemini provider (LLM and/or images)
 ```
 
 Main config: `config/default.yaml`. Key sections:
@@ -315,6 +316,7 @@ Costs are estimated from a built-in pricing table (`tracking/pricing.py`) coveri
 | llama.cpp | `llamacpp` | Local inference server, OpenAI-compatible |
 | Ollama | `ollama` | Local model runner, OpenAI-compatible |
 | OpenRouter | `openrouter` | Cloud proxy, requires API key |
+| Google Gemini | `gemini` | Google AI, OpenAI-compatible endpoint. Supports both LLM and image generation |
 
 A fallback chain retries across providers on timeout or server errors:
 
@@ -323,3 +325,82 @@ fallback:
   fallback_chain: [llamacpp, openrouter]
   retry_on: [timeout, connection_error, "500", "502", "503"]
 ```
+
+## Image generation
+
+The agent can generate images via the `generate_image` tool. Multiple backends are supported:
+
+| Provider | Type | Notes |
+|----------|------|-------|
+| OpenAI-compatible | `openai_compat` | Together AI, OpenAI DALL-E, any `/v1/images/generations` API |
+| Google Gemini | `gemini` | Gemini Imagen API — can share config with the Gemini LLM provider |
+| Automatic1111 | `automatic1111` | Stable Diffusion WebUI / Forge (`/sdapi/v1/txt2img`) |
+| ComfyUI | `comfyui` | Workflow-based generation with custom templates |
+
+### Configuration
+
+Add an `image_providers` section to `config/default.yaml`:
+
+```yaml
+image_providers:
+  gemini:
+    type: gemini
+    provider: gemini          # inherits config from providers.gemini
+    model: gemini-2.0-flash-exp
+
+default_image_provider: gemini
+```
+
+### Dual providers (LLM + image)
+
+Providers like Google Gemini that support both text and image generation are configured once as a normal LLM provider, then referenced from `image_providers` to inherit connection details:
+
+```yaml
+providers:
+  gemini:
+    type: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    api_key: ${GEMINI_API_KEY}
+    model: gemini-2.0-flash
+
+image_providers:
+  gemini:
+    type: gemini
+    provider: gemini          # inherits base_url, api_key from providers.gemini
+    model: gemini-2.0-flash-exp
+
+default_provider: llamacpp              # main LLM
+default_image_provider: gemini          # images via Gemini
+```
+
+For OpenAI-compatible services (Together AI, OpenAI DALL-E, etc.):
+
+```yaml
+image_providers:
+  together:
+    type: openai_compat
+    base_url: https://api.together.xyz/v1
+    api_key: ${TOGETHER_API_KEY}
+    model: black-forest-labs/FLUX.1-schnell
+```
+
+### Local Stable Diffusion
+
+```yaml
+image_providers:
+  local_sd:
+    type: automatic1111
+    base_url: http://localhost:7860
+
+  comfyui:
+    type: comfyui
+    base_url: http://localhost:8188
+    workflow_template: ~/.eyetor/workflows/txt2img.json  # optional custom workflow
+```
+
+### How it works
+
+When image generation is configured, the agent gets a `generate_image` tool. It generates the image, saves it to `~/.eyetor/generated_images/`, and includes an `[IMAGE:/path/to/file.png]` marker in the response. Channels render it accordingly:
+
+- **Telegram:** sends the image as a photo with `answer_photo`
+- **CLI:** displays the file path

@@ -10,6 +10,7 @@ Voice message transcription requires faster-whisper:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import tempfile
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 _CHUNK_TOKENS = 20  # Edit message every N characters
 _TG_MAX_LEN = 4096  # Telegram message character limit
+_IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(.*?)\]")
 
 
 class TelegramChannel(BaseChannel):
@@ -243,15 +245,24 @@ class TelegramChannel(BaseChannel):
 
                 # Final edit always applies HTML formatting
                 if buffer:
-                    html = _md_to_html(buffer)
-                    if len(html) <= _TG_MAX_LEN:
+                    # Strip [IMAGE:...] markers from text (images sent separately)
+                    clean_buffer = _IMAGE_MARKER_RE.sub("", buffer).strip()
+                    html = _md_to_html(clean_buffer) if clean_buffer else ""
+                    if html and len(html) <= _TG_MAX_LEN:
                         try:
                             await placeholder.edit_text(html, parse_mode="HTML")
                         except Exception:
                             await msg.answer(html, parse_mode="HTML")
-                    else:
+                    elif html:
                         await placeholder.delete()
                         await _send_long(msg, html, parse_mode="HTML")
+                    else:
+                        await placeholder.delete()
+
+                # Send generated images: from [IMAGE:] markers + tool results
+                image_paths = _collect_image_paths(buffer, session)
+                await _send_images(msg, image_paths)
+
             except Exception as exc:
                 logger.error("Telegram message handler error: %s", exc)
                 await placeholder.edit_text(f"Error: {exc}")
@@ -570,10 +581,56 @@ def _split_message(text: str, limit: int = _TG_MAX_LEN) -> list[str]:
     return chunks
 
 
-async def _send_long(msg: Message, text: str, parse_mode: str | None = None) -> None:
+async def _send_long(msg, text: str, parse_mode: str | None = None) -> None:
     """Send a potentially long message, splitting if it exceeds Telegram's limit."""
     for part in _split_message(text):
         await msg.answer(part, parse_mode=parse_mode)
+
+
+def _collect_image_paths(buffer: str, session) -> list[str]:
+    """Collect image paths from [IMAGE:] markers and generate_image tool results.
+
+    Only scans tool results from the latest turn (after the last user message).
+    """
+    paths: set[str] = set()
+
+    # From markers in LLM text
+    for p in _IMAGE_MARKER_RE.findall(buffer):
+        paths.add(p.strip())
+
+    # From tool results in session history (only current turn)
+    history = session.get_history()
+    for msg in reversed(history):
+        if msg.role == "user":
+            break
+        if msg.role == "tool" and msg.content:
+            try:
+                data = json.loads(msg.content)
+                if isinstance(data, dict) and data.get("status") == "ok" and "image_path" in data:
+                    paths.add(data["image_path"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    return list(paths)
+
+
+async def _send_images(msg, image_paths: list[str]) -> None:
+    """Send image files as Telegram photos."""
+    if not image_paths:
+        return
+    from aiogram.types import FSInputFile
+
+    for img_path in image_paths:
+        p = Path(img_path)
+        if p.exists():
+            try:
+                await msg.answer_photo(FSInputFile(p))
+            except Exception as exc:
+                logger.error("Failed to send image %s: %s", img_path, exc)
+                await msg.answer(f"[Image: {img_path}]")
+        else:
+            logger.warning("Image file not found: %s", img_path)
+            await msg.answer(f"[Image not found: {img_path}]")
 
 
 def _escape_html(text: str) -> str:
