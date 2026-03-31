@@ -413,7 +413,11 @@ async def _describe_image(img_b64: str, caption: str = "") -> str:
 
     prompt = caption.strip() if caption.strip() else "Describe esta imagen de forma detallada."
 
-    headers: dict[str, str] = {"Content-Type": "application/json"}
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/lsanchezojo/eyetor",
+        "X-Title": "Eyetor",
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
