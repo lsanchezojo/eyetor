@@ -79,7 +79,7 @@ When run from a terminal, `eyetor start` opens an interactive CLI session. If Te
 
 **CLI commands:** `/reset`, `/history`, `/skills`, `/help`, `/exit`
 
-**Telegram bot commands:** `/start`, `/reset`, `/skills`, `/tasks`, `/help` + any commands declared by skills (see [Skill commands](#skill-commands))
+**Telegram bot commands:** `/start`, `/reset`, `/skills`, `/tasks`, `/usage`, `/help` + any commands declared by skills (see [Skill commands](#skill-commands))
 
 ### Voice messages (Telegram)
 
@@ -257,7 +257,7 @@ commands:
 | `prompt` | if prompt | Prompt template; `{args}` is replaced with the user's input after the command |
 | `parse_mode` | no | Telegram parse mode for script output (default: `HTML`) |
 
-Reserved command names (`start`, `reset`, `skills`, `tasks`, `help`) cannot be overridden by skills.
+Reserved command names (`start`, `reset`, `skills`, `tasks`, `usage`, `help`) cannot be overridden by skills.
 
 ### google-workspace setup
 
@@ -270,6 +270,43 @@ Requires a Google Cloud project with the Calendar, Gmail, and Tasks APIs enabled
    pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
    ```
 4. On first use the agent will trigger a browser OAuth flow — the token is saved automatically for subsequent runs
+
+## Usage tracking
+
+Every LLM call is automatically tracked in SQLite (`~/.eyetor/tracking.db`). Recorded fields per call: timestamp, provider, model, prompt/completion tokens, estimated cost, speed (tokens/second), finish reason, and session ID.
+
+### Viewing usage
+
+**CLI:**
+
+```bash
+# Summary by provider/model (default: today)
+eyetor usage
+eyetor usage --period week --provider openrouter
+
+# Individual call log
+eyetor usage --detail
+eyetor usage --detail -n 50
+```
+
+**Telegram:** Use `/usage` to see the last 10 calls and today's summary.
+
+### Daily limits
+
+Set per-provider limits in `config/default.yaml`. Requests are blocked when a limit is reached, and the fallback chain tries the next available provider.
+
+```yaml
+tracking:
+  db_path: ~/.eyetor/tracking.db
+  limits:
+    openrouter:
+      daily_cost_usd: 10.0
+      daily_tokens: 1000000
+```
+
+### Cost estimation
+
+Costs are estimated from a built-in pricing table (`tracking/pricing.py`) covering OpenAI, Anthropic, Google, Meta, DeepSeek, and Qwen models. Local models (ollama, llamacpp) default to $0. The table can be extended as needed.
 
 ## Providers
 

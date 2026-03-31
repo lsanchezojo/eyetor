@@ -215,7 +215,7 @@ class TelegramChannel(BaseChannel):
                 f"{extra}"
                 "/help — show this help\n\n"
                 "Send a message to chat, a voice note to transcribe, "
-                "or a receipt photo (with store name as caption) to ingest prices."
+                "or a photo to analyze."
             )
 
         @dp.message(F.text)
@@ -269,27 +269,43 @@ class TelegramChannel(BaseChannel):
 
             caption = msg.caption or ""
             try:
-                # Save to a persistent path so it survives follow-up messages
-                receipts_dir = Path.home() / ".eyetor" / "receipts"
-                receipts_dir.mkdir(parents=True, exist_ok=True)
-                import time as _time
-                img_path = receipts_dir / f"{msg.chat.id}_{int(_time.time())}.jpg"
+                import base64 as _b64
+                import io as _io
 
+                # Download photo bytes into memory
                 tg_file = await bot.get_file(photo.file_id)
-                await bot.download_file(tg_file.file_path, destination=str(img_path))
+                buf = _io.BytesIO()
+                await bot.download_file(tg_file.file_path, destination=buf)
+                img_bytes = buf.getvalue()
+                img_b64 = _b64.b64encode(img_bytes).decode()
 
-                store_hint = (
-                    f' La tienda es "{caption.strip()}".' if caption.strip() else ""
-                )
+                # Persist to disk (skills that need the file path still work)
+                images_dir = Path.home() / ".eyetor" / "images"
+                images_dir.mkdir(parents=True, exist_ok=True)
+                import time as _time
+                img_path = images_dir / f"{msg.chat.id}_{int(_time.time())}.jpg"
+                img_path.write_bytes(img_bytes)
+
+                placeholder = await msg.answer("📷 Procesando imagen...")
+
+                # Step 1: Send image to the vision provider to get a description
+                description = await _describe_image(img_b64, caption)
+
+                # Step 2: Send the description (+ metadata) to the main LLM session
+                user_text = caption.strip() if caption.strip() else ""
                 prompt = (
-                    f"Te mando una foto de un ticket de supermercado.{store_hint} "
-                    f"Ingéstalo con la skill grocery-intel (usa receipt.py ingest). "
-                    f"La imagen está en: {img_path}"
+                    f"El usuario ha enviado una imagen."
+                    f"{f' Texto del usuario: {user_text}' if user_text else ''}\n\n"
+                    f"Descripción de la imagen (generada por modelo de visión):\n"
+                    f"{description}\n\n"
+                    f"[La imagen está guardada en: {img_path}]\n\n"
+                    f"Analiza la imagen y responde acorde. Si es un ticket de compra "
+                    f"puedes usar la skill grocery-intel para procesarlo."
                 )
+
                 session_id = f"telegram-{msg.chat.id}"
                 session = self._manager.get_or_create(session_id)
 
-                placeholder = await msg.answer("🧾 Procesando ticket...")
                 buffer = ""
                 last_edit = ""
                 try:
@@ -381,6 +397,49 @@ class TelegramChannel(BaseChannel):
             await self._dp.stop_polling()
         if self._bot:
             await self._bot.session.close()
+
+
+async def _describe_image(img_b64: str, caption: str = "") -> str:
+    """Send an image to the configured vision LLM and return a text description.
+
+    Uses VISION_BASE_URL / VISION_API_KEY / VISION_MODEL environment variables
+    (same ones used by the grocery-intel skill).
+    """
+    import httpx
+
+    base_url = os.environ.get("VISION_BASE_URL", "http://localhost:8080/v1").rstrip("/")
+    api_key = os.environ.get("VISION_API_KEY", "").strip()
+    model = os.environ.get("VISION_MODEL", "default")
+
+    prompt = caption.strip() if caption.strip() else "Describe esta imagen de forma detallada."
+
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                    },
+                ],
+            }
+        ],
+        "max_tokens": 1024,
+        "temperature": 0.3,
+    }
+
+    async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
+        resp = await client.post(f"{base_url}/chat/completions", json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
 
 
 _whisper_model = None  # Module-level cache — loaded once on first use
