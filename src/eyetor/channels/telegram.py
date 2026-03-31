@@ -299,8 +299,7 @@ class TelegramChannel(BaseChannel):
                     f"Descripción de la imagen (generada por modelo de visión):\n"
                     f"{description}\n\n"
                     f"[La imagen está guardada en: {img_path}]\n\n"
-                    f"Analiza la imagen y responde acorde. Si es un ticket de compra "
-                    f"puedes usar la skill grocery-intel para procesarlo."
+                    f"Responde al usuario sobre el contenido de la imagen."
                 )
 
                 session_id = f"telegram-{msg.chat.id}"
