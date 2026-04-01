@@ -31,7 +31,11 @@ fallback:
 
 skills_dirs:
   - ./skills
-  - ~/.vector/skills
+# - ~/.agents/skills
+
+# Path to a markdown file with agent instructions and behavior rules.
+# Appended to the system prompt. Can define agent roles, skill usage policies, etc.
+agent_instructions: ~/.eyetor/AGENTS.md
 
 memory_db_path: ~/.eyetor/memory.db
 

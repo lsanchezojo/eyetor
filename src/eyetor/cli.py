@@ -112,6 +112,14 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
         if skills_context:
             base_system = f"{base_system}\n\n{skills_context}"
 
+        # Agent instructions (user-managed file with custom behavior rules)
+        instructions_path = Path(cfg.agent_instructions).expanduser()
+        if instructions_path.exists():
+            instructions_text = instructions_path.read_text(encoding="utf-8").strip()
+            if instructions_text:
+                base_system = f"{base_system}\n\n## Agent Instructions\n\n{instructions_text}"
+                logging.getLogger(__name__).info("Loaded agent instructions from %s", instructions_path)
+
         # Shared tool registry
         tool_registry = ToolRegistry()
         if skill_names:

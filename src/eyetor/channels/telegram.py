@@ -301,16 +301,18 @@ class TelegramChannel(BaseChannel):
 
                 # Step 1: Send image to the vision provider to get a description
                 description = await _describe_image(img_b64, caption)
+                logger.debug("Vision description: %s", description[:300])
 
                 # Step 2: Send the description (+ metadata) to the main LLM session
                 user_text = caption.strip() if caption.strip() else ""
                 prompt = (
-                    f"El usuario ha enviado una imagen."
-                    f"{f' Texto del usuario: {user_text}' if user_text else ''}\n\n"
-                    f"Descripción de la imagen (generada por modelo de visión):\n"
+                    f"{f'Mensaje del usuario: {user_text}' if user_text else ''}\n\n"
+                    f"A continuación se muestra el contenido extraído de una imagen "
+                    f"que el usuario ha enviado (analizada por un modelo de visión):\n\n"
                     f"{description}\n\n"
-                    f"[La imagen está guardada en: {img_path}]\n\n"
-                    f"Responde al usuario sobre el contenido de la imagen."
+                    f"La imagen original está guardada en: {img_path}\n\n"
+                    f"Responde al usuario basándote en el contenido descrito. "
+                    f"Si dispones de herramientas relevantes para el contenido, úsalas."
                 )
 
                 session_id = f"telegram-{msg.chat.id}"
@@ -412,8 +414,10 @@ class TelegramChannel(BaseChannel):
 async def _describe_image(img_b64: str, caption: str = "") -> str:
     """Send an image to the configured vision LLM and return a text description.
 
-    Uses VISION_BASE_URL / VISION_API_KEY / VISION_MODEL environment variables
-    (same ones used by the grocery-intel skill).
+    Uses VISION_BASE_URL / VISION_API_KEY / VISION_MODEL environment variables.
+
+    The vision prompt asks the model to classify the image type and, if it is
+    a receipt/ticket, extract structured data (store, items, prices).
     """
     import httpx
 
@@ -421,7 +425,24 @@ async def _describe_image(img_b64: str, caption: str = "") -> str:
     api_key = os.environ.get("VISION_API_KEY", "").strip()
     model = os.environ.get("VISION_MODEL", "default")
 
-    prompt = caption.strip() if caption.strip() else "Describe esta imagen de forma detallada."
+    if caption.strip():
+        prompt = caption.strip()
+    else:
+        prompt = (
+            "Analiza esta imagen. Primero indica qué tipo de imagen es "
+            "(ticket de compra, factura, documento, foto, captura de pantalla, etc.).\n\n"
+            "Si es un ticket o recibo de compra, extrae TODOS los productos y precios "
+            "que puedas leer, incluyendo el nombre de la tienda y la fecha si aparecen. "
+            "Usa este formato:\n"
+            "- Tipo: ticket de compra\n"
+            "- Tienda: [nombre]\n"
+            "- Fecha: [fecha si visible]\n"
+            "- Productos:\n"
+            "  - [nombre producto]: [precio]€\n"
+            "  - ...\n"
+            "- Total: [total]€\n\n"
+            "Si NO es un ticket, describe la imagen de forma detallada."
+        )
 
     headers: dict[str, str] = {
         "Content-Type": "application/json",
@@ -445,8 +466,8 @@ async def _describe_image(img_b64: str, caption: str = "") -> str:
                 ],
             }
         ],
-        "max_tokens": 1024,
-        "temperature": 0.3,
+        "max_tokens": 2048,
+        "temperature": 0.1,
     }
 
     async with httpx.AsyncClient(timeout=120.0, verify=False) as client:

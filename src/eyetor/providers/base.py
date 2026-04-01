@@ -66,9 +66,18 @@ class BaseProvider(ABC):
         temperature: float,
         stream: bool = False,
     ) -> dict[str, Any]:
+        serialized_msgs = []
+        for m in messages:
+            d = m.model_dump(exclude_none=True)
+            # Ensure 'content' is always present — some servers (llama.cpp)
+            # reject messages that omit it (e.g. assistant messages with tool_calls).
+            if "content" not in d:
+                d["content"] = None
+            serialized_msgs.append(d)
+
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [m.model_dump(exclude_none=True) for m in messages],
+            "messages": serialized_msgs,
             "temperature": temperature,
             "stream": stream,
         }

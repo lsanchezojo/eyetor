@@ -35,6 +35,11 @@ class LlamaCppProvider(BaseProvider):
                 json=payload,
                 headers=self._build_headers(),
             )
+            if response.status_code >= 400:
+                body = response.text[:500]
+                logger.error(
+                    "llama.cpp %d error: %s", response.status_code, body,
+                )
             response.raise_for_status()
             data = response.json()
             return _parse_completion_response(data)

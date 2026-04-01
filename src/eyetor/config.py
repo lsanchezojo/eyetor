@@ -133,6 +133,7 @@ class VectorConfig(BaseModel):
     default_provider: str = "ollama"
     fallback: FallbackConfig = FallbackConfig()
     skills_dirs: list[str] = ["./skills"]
+    agent_instructions: str = "~/.eyetor/AGENTS.md"
     memory_db_path: str = "~/.eyetor/memory.db"
     tracking: TrackingConfig = TrackingConfig()
     channels: ChannelsConfig = ChannelsConfig()
