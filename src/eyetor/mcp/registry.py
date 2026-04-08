@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Any
 
 from eyetor.config import McpServerConfig
@@ -11,6 +12,31 @@ from eyetor.mcp.transport import HttpTransport, StdioTransport
 from eyetor.models.tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class McpDegradedReport:
+    """Summary of MCP connection state after connect_all()."""
+
+    connected: list[str] = field(default_factory=list)
+    failed: dict[str, str] = field(default_factory=dict)
+    available_tools: list[str] = field(default_factory=list)
+
+    @property
+    def is_degraded(self) -> bool:
+        return len(self.failed) > 0
+
+    def format_for_prompt(self) -> str:
+        """Return a section suitable for injection into the system prompt."""
+        if not self.is_degraded:
+            return ""
+        lines = ["[MCP Status — Degraded]"]
+        for name, reason in self.failed.items():
+            lines.append(f"- Server '{name}' is OFFLINE: {reason}")
+        if self.available_tools:
+            lines.append(f"Available MCP tools: {', '.join(self.available_tools)}")
+        lines.append("Do not attempt to call tools from offline servers.")
+        return "\n".join(lines)
 
 
 class McpRegistry:
@@ -27,9 +53,11 @@ class McpRegistry:
     def __init__(self, servers_config: dict[str, McpServerConfig]) -> None:
         self._config = servers_config
         self._clients: dict[str, McpClient] = {}
+        self._failed: dict[str, str] = {}
 
     async def connect_all(self) -> None:
         """Connect to all configured MCP servers."""
+        self._failed.clear()
         for name, cfg in self._config.items():
             try:
                 client = _build_client(name, cfg)
@@ -37,6 +65,7 @@ class McpRegistry:
                 self._clients[name] = client
                 logger.info("Connected to MCP server: %s (%d tools)", name, len(client.get_tools()))
             except Exception as exc:
+                self._failed[name] = str(exc)
                 logger.error("Failed to connect to MCP server '%s': %s", name, exc)
 
     def get_tools(self, server_name: str) -> list:
@@ -59,6 +88,17 @@ class McpRegistry:
 
     def is_connected(self, server_name: str) -> bool:
         return server_name in self._clients
+
+    def get_degraded_report(self) -> McpDegradedReport:
+        """Build a report of connection state for all configured servers."""
+        available_tools: list[str] = []
+        for client in self._clients.values():
+            available_tools.extend(t.name for t in client.get_tools())
+        return McpDegradedReport(
+            connected=list(self._clients.keys()),
+            failed=dict(self._failed),
+            available_tools=available_tools,
+        )
 
     async def close_all(self) -> None:
         """Close all MCP server connections."""

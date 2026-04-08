@@ -1,0 +1,13 @@
+{
+  "name": "result-cache",
+  "version": "1.0.0",
+  "description": "Caches expensive tool results in SQLite with configurable TTL",
+  "permissions": ["read_files", "write_files"],
+  "hooks": {
+    "pre_tool_use": "hooks/pre.py",
+    "post_tool_use": "hooks/post.py"
+  },
+  "lifecycle": {
+    "init": "python3 hooks/init_db.py"
+  }
+}

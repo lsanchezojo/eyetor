@@ -58,6 +58,33 @@ scripts/gcalendar.py list-calendars
 ```
 Returns: `{"ok": true, "calendars": [{"id": "primary", "name": "My Calendar", "primary": true}]}`
 
+### Formato de respuesta para eventos de calendario
+
+Cuando respondas con una lista de eventos de calendario, usa SIEMPRE este formato compacto:
+
+```
+⏰ Eventos · próximos N días
+
+📅 Lun 7 abr
+🎲 Partida de Blood on the Clocktower
+⏰ 19:00–22:00  📍 Taberna del Dragon Verde, Sevilla
+
+📅 Mar 8 abr
+💪 Fisio
+⏰ 18:00–19:00  📍 AY360
+
+```
+
+Reglas estrictas:
+- Cabecera de día: `📅 [Lunes|Martes|Miércoles|Jueves|Viernes|Sábado|Domingo] [Nº] [ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic]`
+- Nombre del evento en la siguiente línea con emoji temático (💪 deporte/fisio, 🎲 juego, 🏥 médico, 📞 reunión, ✈️ viaje, 🎉 evento social, 📌 genérico)
+- Hora y lugar en una sola línea: `⏰ HH:MM–HH:MM  📍 Lugar`
+- Si no hay lugar: omite `📍` completamente (nunca pongas "Sin especificar")
+- Si es todo el día: pon `⏰ Todo el día` en lugar de la hora
+- Línea en blanco entre eventos de días distintos; sin línea en blanco entre eventos del mismo día
+- **No uses bullets (•), no repitas "Fecha:", "Hora:", "Lugar:"**
+- Si no hay eventos: responde `📅 Sin eventos en los próximos N días`
+
 ## Gmail
 
 ### List messages

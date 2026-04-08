@@ -135,12 +135,15 @@ class OrchestratorWorkflow:
 
     async def _delegate(self, worker_name: str, subtask: str) -> str:
         """Execute a subtask on the named worker."""
+        from eyetor.workflows.observer import WorkerObserver
+
         worker = self._workers.get(worker_name)
         if not worker:
             available = list(self._workers.keys())
             return json.dumps({"error": f"Unknown worker '{worker_name}'. Available: {available}"})
 
         provider = worker.provider or self._provider
+        observer = WorkerObserver()
         agent = BaseAgent(
             config=AgentConfig(
                 name=worker_name,
@@ -152,7 +155,14 @@ class OrchestratorWorkflow:
             provider=provider,
         )
         result = await agent.run(subtask)
-        delegation = {"worker": worker_name, "task": subtask, "result": result.final_output}
+        observer.on_done(result.final_output)
+        delegation = {
+            "worker": worker_name,
+            "task": subtask,
+            "result": result.final_output,
+            "summary": observer.get_summary(),
+            "events": observer.get_events(),
+        }
         self._delegations.append(delegation)
         logger.info("Delegated to '%s': %d chars result", worker_name, len(result.final_output))
         return result.final_output

@@ -96,7 +96,7 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
         # System prompt
         if use_host_tools:
             base_system = (
-                "Eres Eyetor, un asistente de IA con acceso a herramientas que pueden actuar en el ordenador del usuario. "
+                "Eres Eyetor (suena como Aitor), un asistente de IA con acceso a herramientas que pueden actuar en el ordenador del usuario. "
                 "Puedes ejecutar comandos de shell, gestionar ficheros, abrir URLs y buscar en internet. "
                 "Responde siempre en español de España. "
                 "Explica brevemente lo que vas a hacer antes de hacerlo. "
@@ -104,7 +104,7 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
             )
         else:
             base_system = (
-                "Eres Eyetor, un asistente de IA útil. "
+                "Eres Eyetor (suena como Aitor), un asistente de IA útil. "
                 "Responde siempre en español de España."
             )
 
@@ -120,8 +120,16 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
                 base_system = f"{base_system}\n\n## Agent Instructions\n\n{instructions_text}"
                 logging.getLogger(__name__).info("Loaded agent instructions from %s", instructions_path)
 
+        # Plugin registry
+        plugin_registry = None
+        if cfg.plugins_dirs:
+            from eyetor.plugins.registry import PluginRegistry
+            plugin_registry = PluginRegistry()
+            plugin_registry.load_all(cfg.plugins_dirs)
+            await plugin_registry.run_init()
+
         # Shared tool registry
-        tool_registry = ToolRegistry()
+        tool_registry = ToolRegistry(plugin_registry=plugin_registry)
         if skill_names:
             async def run_skill_script_handler(skill: str, script: str, args: str = "") -> str:
                 scripts = skill_reg.list_scripts(skill)
@@ -244,6 +252,21 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
                 "con el formato [IMAGE:/ruta/al/archivo.png] para que se muestre correctamente al usuario."
             )
 
+        # MCP servers — connect and register tools
+        mcp_registry = None
+        if cfg.mcp_servers:
+            from eyetor.mcp.registry import McpRegistry
+            mcp_registry = McpRegistry(cfg.mcp_servers)
+            await mcp_registry.connect_all()
+            mcp_registry.register_all_into(tool_registry)
+            report = mcp_registry.get_degraded_report()
+            if report.is_degraded:
+                degraded_text = report.format_for_prompt()
+                base_system = f"{base_system}\n\n{degraded_text}"
+                logging.getLogger(__name__).warning(
+                    "MCP degraded — failed servers: %s", list(report.failed.keys())
+                )
+
         agent_cfg = AgentConfig(
             name="eyetor",
             provider=provider or cfg.default_provider,
@@ -261,7 +284,7 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
             sched_store = SchedulerStore(sched_cfg.db_path)
             tg_token = cfg.channels.telegram.bot_token if cfg.channels.telegram.enabled else None
             # Scheduler needs a SessionManager; create a dedicated one (no scheduler to avoid recursion)
-            sched_session_mgr = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory)
+            sched_session_mgr = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory, root_config=cfg, tracker=tracker, cost_estimator=cost_estimator)
             scheduler = SchedulerChannel(
                 store=sched_store,
                 session_manager=sched_session_mgr,
@@ -274,14 +297,14 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
 
         if interactive:
             from eyetor.channels.cli_channel import CliChannel
-            session_mgr_cli = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory, scheduler=scheduler)
+            session_mgr_cli = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory, scheduler=scheduler, root_config=cfg, tracker=tracker, cost_estimator=cost_estimator)
             channels.append(CliChannel(session_mgr_cli, skill_reg=skill_reg))
 
         tg_cfg = cfg.channels.telegram
         if tg_cfg.enabled and tg_cfg.bot_token:
             from eyetor.channels.telegram import TelegramChannel
-            session_mgr_tg = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory, scheduler=scheduler)
-            channels.append(TelegramChannel(session_mgr_tg, tg_cfg, skill_reg=skill_reg, scheduler=scheduler, tracker=tracker))
+            session_mgr_tg = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory, scheduler=scheduler, root_config=cfg, tracker=tracker, cost_estimator=cost_estimator)
+            channels.append(TelegramChannel(session_mgr_tg, tg_cfg, skill_reg=skill_reg, scheduler=scheduler, tracker=tracker, full_config=cfg))
 
         if scheduler:
             channels.append(scheduler)
@@ -290,7 +313,13 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
             console.print("[red]No channels available. Run interactively or configure Telegram.[/red]")
             return
 
-        await asyncio.gather(*[ch.start() for ch in channels])
+        try:
+            await asyncio.gather(*[ch.start() for ch in channels])
+        finally:
+            if mcp_registry:
+                await mcp_registry.close_all()
+            if plugin_registry:
+                await plugin_registry.run_shutdown()
 
     asyncio.run(_run())
 
@@ -515,19 +544,36 @@ def mcp() -> None:
 @mcp.command("list")
 @click.pass_context
 def mcp_list(ctx: click.Context) -> None:
-    """List configured MCP servers."""
+    """List configured MCP servers and their connection status."""
     cfg = ctx.obj["cfg"]
     if not cfg.mcp_servers:
         console.print("[yellow]No MCP servers configured.[/yellow]")
         return
-    table = Table(title="MCP Servers")
-    table.add_column("Name", style="bold cyan")
-    table.add_column("Transport")
-    table.add_column("Command / URL")
-    for name, srv in cfg.mcp_servers.items():
-        endpoint = srv.url or f"{srv.command} {' '.join(srv.args)}"
-        table.add_row(name, srv.transport, endpoint)
-    console.print(table)
+
+    async def _run():
+        from eyetor.mcp.registry import McpRegistry
+        registry = McpRegistry(cfg.mcp_servers)
+        await registry.connect_all()
+        report = registry.get_degraded_report()
+        table = Table(title="MCP Servers")
+        table.add_column("Name", style="bold cyan")
+        table.add_column("Transport")
+        table.add_column("Status")
+        table.add_column("Tools", justify="right")
+        table.add_column("Endpoint")
+        for name, srv in cfg.mcp_servers.items():
+            endpoint = srv.url or f"{srv.command} {' '.join(srv.args)}"
+            if name in report.failed:
+                status = f"[red]✗ Offline[/red]"
+                tools_count = "—"
+            else:
+                status = f"[green]✓ Online[/green]"
+                tools_count = str(len(registry.get_tools(name)))
+            table.add_row(name, srv.transport, status, tools_count, endpoint)
+        console.print(table)
+        await registry.close_all()
+
+    asyncio.run(_run())
 
 
 @mcp.command("tools")

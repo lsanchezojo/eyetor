@@ -98,6 +98,14 @@ class FallbackConfig(BaseModel):
     retry_on: list[str] = ["timeout", "connection_error", "500", "502", "503", "529"]
 
 
+class SessionsConfig(BaseModel):
+    """Configuration for session persistence."""
+
+    persist: bool = False
+    dir: str = "~/.eyetor/sessions"
+    max_messages: int = 200
+
+
 class SchedulerConfig(BaseModel):
     """Configuration for the task scheduler."""
 
@@ -133,15 +141,19 @@ class VectorConfig(BaseModel):
     default_provider: str = "ollama"
     fallback: FallbackConfig = FallbackConfig()
     skills_dirs: list[str] = ["./skills"]
+    plugins_dirs: list[str] = []
     agent_instructions: str = "~/.eyetor/AGENTS.md"
     memory_db_path: str = "~/.eyetor/memory.db"
     tracking: TrackingConfig = TrackingConfig()
     channels: ChannelsConfig = ChannelsConfig()
+    sessions: SessionsConfig = SessionsConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
     orchestrator: OrchestratorConfig = OrchestratorConfig()
     mcp_servers: dict[str, McpServerConfig] = {}
     image_providers: dict[str, ImageProviderConfig] = {}
     default_image_provider: str | None = None
+    vision_provider: str | None = None  # provider name (from providers:) used for image description
+    vision_model: str | None = None     # model override; uses provider's default model if None
     log_level: str = "INFO"
 
 

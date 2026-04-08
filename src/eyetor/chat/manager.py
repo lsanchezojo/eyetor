@@ -11,8 +11,11 @@ from eyetor.models.tools import ToolRegistry
 from eyetor.providers.base import BaseProvider
 
 if TYPE_CHECKING:
+    from eyetor.config import VectorConfig
     from eyetor.memory.manager import MemoryManager
     from eyetor.scheduler.channel import SchedulerChannel
+    from eyetor.tracking.usage import UsageTracker
+    from eyetor.tracking.pricing import CostEstimator
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,9 @@ class SessionManager:
         system_prompt_suffix: str = "",
         memory_manager: "MemoryManager | None" = None,
         scheduler: "SchedulerChannel | None" = None,
+        root_config: "VectorConfig | None" = None,
+        tracker: "UsageTracker | None" = None,
+        cost_estimator: "CostEstimator | None" = None,
     ) -> None:
         self._config = config
         self._provider = provider
@@ -39,6 +45,9 @@ class SessionManager:
         self._system_prompt_suffix = system_prompt_suffix
         self._memory = memory_manager
         self._scheduler = scheduler
+        self._root_config = root_config
+        self._tracker = tracker
+        self._cost_estimator = cost_estimator
         self._sessions: dict[str, ChatSession] = {}
 
     def get_or_create(self, session_id: str) -> ChatSession:
@@ -52,6 +61,9 @@ class SessionManager:
                 system_prompt_suffix=self._system_prompt_suffix,
                 memory_manager=self._memory,
                 scheduler=self._scheduler,
+                root_config=self._root_config,
+                tracker=self._tracker,
+                cost_estimator=self._cost_estimator,
             )
             logger.debug("Created new session: %s", session_id)
         return self._sessions[session_id]
@@ -69,3 +81,9 @@ class SessionManager:
     def list_sessions(self) -> list[str]:
         """Return all active session IDs."""
         return list(self._sessions.keys())
+
+    def list_providers(self) -> dict[str, str]:
+        """Return available providers: name → default model."""
+        if not self._root_config:
+            return {}
+        return {name: cfg.model for name, cfg in self._root_config.providers.items()}

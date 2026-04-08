@@ -1,0 +1,10 @@
+{
+  "name": "telegram-alerts",
+  "version": "1.0.0",
+  "description": "Sends Telegram alerts when tools fail or take too long",
+  "permissions": ["network"],
+  "hooks": {
+    "post_tool_use": "hooks/post.py",
+    "post_tool_use_failure": "hooks/post_fail.py"
+  }
+}

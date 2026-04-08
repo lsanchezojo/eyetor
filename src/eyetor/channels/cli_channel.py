@@ -21,11 +21,13 @@ _IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(.*?)\]")
 
 _HELP = """
 [bold]Eyetor CLI Commands[/bold]
-  /help     — show this help
-  /reset    — clear conversation history
-  /history  — show conversation history
-  /skills   — list available skills with descriptions
-  /exit     — quit
+  /help              — show this help
+  /reset             — clear conversation history
+  /history           — show conversation history
+  /skills            — list available skills with descriptions
+  /tools             — list registered tools
+  /model [name] [m]  — list or change provider (and optionally model)
+  /exit              — quit
 """
 
 
@@ -76,6 +78,33 @@ class CliChannel(BaseChannel):
                 continue
             elif user_input.lower() == "/skills":
                 self._console.print(_format_skills(self._skill_reg))
+                continue
+            elif user_input.lower() == "/tools":
+                self._console.print(_format_tools(session.tool_registry))
+                continue
+            elif user_input.lower().startswith("/model"):
+                parts = user_input.split()
+                if len(parts) == 1:
+                    # List available providers
+                    providers = self._manager.list_providers()
+                    current = session.provider
+                    current_model = getattr(current, "model", "?")
+                    # If wrapped in TrackingProvider, get inner name
+                    provider_name = getattr(current, "_provider_name", None) or "?"
+                    lines = [f"[bold]Proveedor actual:[/bold] [cyan]{provider_name}[/cyan] (modelo: {current_model})\n"]
+                    lines.append("[bold]Proveedores disponibles:[/bold]")
+                    for name, model in providers.items():
+                        lines.append(f"  [cyan]{name}[/cyan] — {model}")
+                    lines.append("\n[dim]Uso: /model <provider> [model][/dim]")
+                    self._console.print("\n".join(lines))
+                else:
+                    provider_name = parts[1]
+                    model_override = parts[2] if len(parts) > 2 else None
+                    try:
+                        msg = session.change_provider(provider_name, model_override)
+                        self._console.print(f"[green]{msg}[/green]")
+                    except Exception as exc:
+                        self._console.print(f"[red]Error: {exc}[/red]")
                 continue
             elif user_input.lower() == "/help":
                 self._console.print(_HELP)
@@ -146,5 +175,18 @@ def _format_skills(skill_reg) -> str:
     lines = ["[bold]Available skills:[/bold]"]
     for m in metadata:
         lines.append(f"  [cyan]{m.name}[/cyan] — {m.description}")
+    return "\n".join(lines)
+
+
+def _format_tools(tool_registry) -> str:
+    """Return a formatted list of registered tools for display."""
+    if tool_registry is None:
+        return "[dim]No tools registered.[/dim]"
+    tools = tool_registry._tools
+    if not tools:
+        return "[dim]No tools registered.[/dim]"
+    lines = [f"[bold]Registered tools ({len(tools)}):[/bold]"]
+    for name, defn in tools.items():
+        lines.append(f"  [cyan]{name}[/cyan] — {defn.description}")
     return "\n".join(lines)
 

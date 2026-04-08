@@ -78,9 +78,20 @@ eyetor providers test
 
 When run from a terminal, `eyetor start` opens an interactive CLI session. If Telegram is enabled in config, the bot starts simultaneously in the same process. When run without a terminal (e.g. as a systemd service), only the configured background channels start.
 
-**CLI commands:** `/reset`, `/history`, `/skills`, `/help`, `/exit`
+**CLI commands:** `/reset`, `/history`, `/skills`, `/tools`, `/model`, `/help`, `/exit`
 
-**Telegram bot commands:** `/start`, `/reset`, `/skills`, `/tasks`, `/usage`, `/help` + any commands declared by skills (see [Skill commands](#skill-commands))
+**Telegram bot commands:** `/start`, `/reset`, `/skills`, `/tools`, `/model`, `/tasks`, `/usage`, `/help` + any commands declared by skills (see [Skill commands](#skill-commands))
+
+### Image descriptions (Telegram)
+
+When a user sends an image to the bot, it can describe its contents automatically. Configure a vision-capable model in `config/default.yaml`:
+
+```yaml
+vision_provider: llamacpp        # provider name (must exist under providers:)
+vision_model: ggml-org/gemma-4-E4B-it-GGUF
+```
+
+Any OpenAI-compatible vision model works (Gemini, llama.cpp with a multimodal model, etc.). The description is injected into the conversation context before the user's message, so the agent can reason about the image normally.
 
 ### Voice messages (Telegram)
 
@@ -196,6 +207,97 @@ scheduler:
   default_timezone: Europe/Madrid
 ```
 
+## Interactive commands
+
+### `/tools`
+
+Lists all registered tools with descriptions — includes skill tools, MCP tools, and built-in tools (memory, scheduler, image generation). Available in both CLI and Telegram.
+
+### `/model`
+
+Switch provider and model on the fly without restarting:
+
+```
+/model                          → lists available providers and current selection
+/model llamacpp                 → switch to llamacpp with its default model
+/model openrouter mistral/...   → switch to openrouter with a specific model
+```
+
+Available in both CLI and Telegram.
+
+## Session persistence
+
+Optional JSONL persistence keeps conversation history across restarts. Enable in config:
+
+```yaml
+sessions:
+  persist: true
+  dir: ~/.eyetor/sessions
+  max_messages: 200
+```
+
+Each session is stored as `<session_id>.jsonl` with one JSON message per line. History is loaded automatically when a session resumes and rotated when it exceeds `max_messages`.
+
+## Plugins
+
+Plugins extend Eyetor's behavior via subprocess hooks that run before/after tool executions. Plugins live in directories listed under `plugins_dirs` (default: `./plugins`, `~/.eyetor/plugins`).
+
+### Plugin format
+
+Each plugin is a directory with a `plugin.json`:
+
+```json
+{
+  "name": "my-plugin",
+  "version": "1.0.0",
+  "description": "What this plugin does",
+  "permissions": ["network"],
+  "hooks": {
+    "pre_tool_use": "hooks/pre.py",
+    "post_tool_use": "hooks/post.py",
+    "post_tool_use_failure": "hooks/post_fail.py"
+  },
+  "lifecycle": {
+    "init": "setup.sh",
+    "shutdown": "cleanup.sh"
+  }
+}
+```
+
+### Hook protocol
+
+Hooks receive context as environment variables:
+
+| Variable | Available in | Description |
+|----------|-------------|-------------|
+| `HOOK_EVENT` | all | `pre_tool_use`, `post_tool_use`, `post_tool_use_failure` |
+| `HOOK_TOOL_NAME` | all | Tool name |
+| `HOOK_TOOL_INPUT` | all | JSON arguments |
+| `HOOK_TOOL_RESULT` | post | Tool result |
+| `HOOK_TOOL_ERROR` | failure | Error message |
+| `HOOK_TOOL_DURATION_MS` | post, failure | Execution time in milliseconds |
+
+**Pre-hook decisions** (stdout JSON):
+- `{"decision": "allow"}` — proceed normally
+- `{"decision": "deny", "reason": "..."}` — block tool execution
+- `{"decision": "modify", "input": {...}}` — modify arguments
+- `{"decision": "provide_result", "result": "..."}` — return cached/synthetic result without executing
+
+### Built-in plugins
+
+| Plugin | Description |
+|--------|-------------|
+| `telegram-alerts` | Sends Telegram notifications when tools fail or exceed a duration threshold. Configure `bot_token`, `chat_id`, and `slow_threshold_ms` in `config.json` |
+| `result-cache` | Caches results of expensive tools (web-search, browser) in SQLite with per-tool TTL. Pre-hook returns cached results; post-hook saves new ones. Configure `cached_tools`, TTLs, and `max_result_size_bytes` in `config.json` |
+
+### Config
+
+```yaml
+plugins_dirs:
+  - ./plugins
+  - ~/.eyetor/plugins
+```
+
 ## Memory
 
 The agent has persistent memory backed by SQLite (`~/.eyetor/memory.db`). It can save facts, preferences, and notes across sessions using the `remember` and `forget` tools. Saved memories are injected into the system prompt at the start of every conversation.
@@ -258,7 +360,7 @@ commands:
 | `prompt` | if prompt | Prompt template; `{args}` is replaced with the user's input after the command |
 | `parse_mode` | no | Telegram parse mode for script output (default: `HTML`) |
 
-Reserved command names (`start`, `reset`, `skills`, `tasks`, `usage`, `help`) cannot be overridden by skills.
+Reserved command names (`start`, `reset`, `skills`, `tools`, `model`, `tasks`, `usage`, `help`) cannot be overridden by skills.
 
 ### google-workspace setup
 
@@ -290,7 +392,7 @@ eyetor usage --detail
 eyetor usage --detail -n 50
 ```
 
-**Telegram:** Use `/usage` to see the last 10 calls and today's summary.
+**Telegram:** Use `/usage` to see the current session stats and last 5 calls per model, plus today's summary.
 
 ### Daily limits
 

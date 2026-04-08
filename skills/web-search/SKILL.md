@@ -17,6 +17,14 @@ Use this skill when:
 - The user provides a URL to fetch content from
 - You need to verify or look up facts
 
+## MANDATORY rules — call format
+- **ALWAYS** pass `--query "<terms>"`. Positional arguments are NOT supported and will cause an error.
+- The value of `--query` must be a single quoted string with all search terms inside.
+- **NEVER** pass search terms without the `--query` flag.
+
+❌ WRONG: `scripts/search.py "Donald Trump" noticias`
+✅ CORRECT: `scripts/search.py --query "Donald Trump noticias" --max-results 5`
+
 ## How to search the web
 1. Run `scripts/search.py --query "<search terms>" --max-results 5`
 2. The script returns JSON: `[{"title": "...", "url": "...", "snippet": "..."}]`
@@ -34,6 +42,15 @@ Use this skill when:
 - News article content (not just the headline)
 - Prices, stock values, exchange rates
 - Any question requiring up-to-date numeric or structured data
+
+## Estrategia de investigación web
+1. **Planifica antes de buscar**: identifica las 1-3 preguntas concretas que necesitas resolver antes de lanzar ninguna query. No improvises búsquedas en cadena.
+2. **Calidad sobre cantidad**: máximo **3-4 queries** de búsqueda y **2-3 fetches** por consulta del usuario. Si con eso no puedes responder, sintetiza lo que tengas y di honestamente qué falta.
+3. **Elige fuentes primarias**: prefiere documentación oficial, páginas de producto del fabricante, papers o HuggingFace model cards. Evita agregadores y blogs secundarios salvo que sean la única fuente.
+4. **No persigas todos los ángulos**: si el usuario pregunta por un modelo, dile que puede haber otros ángulos, pero céntrate en lo que pide.
+5. **Sintetiza pronto**: en cuanto tengas información suficiente para dar una respuesta útil, **para de buscar** y responde. Siempre es mejor una respuesta con 3 datos confirmados que seguir buscando el cuarto.
+6. **Cita fuentes**: incluye las URLs consultadas al final de la respuesta para que el usuario pueda verificar.
+7. **Controla el tamaño de fetch**: si una página es larga y sólo necesitas un dato, usa `--max-chars 3000` para limitar el output.
 
 ## Examples
 

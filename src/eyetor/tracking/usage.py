@@ -90,3 +90,7 @@ class UsageTracker:
     def get_summary(self, period: str = "day", provider: str | None = None) -> list[UsageSummary]:
         """Return aggregated usage summaries."""
         return self._store.get_summary(period=period, provider=provider)
+
+    def get_records(self, period: str = "day", provider: str | None = None) -> list[UsageRecord]:
+        """Return individual usage records for the given period."""
+        return self._store.get_records(period=period, provider=provider)

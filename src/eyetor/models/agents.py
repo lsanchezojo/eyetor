@@ -16,7 +16,7 @@ class AgentConfig(BaseModel):
     system_prompt: str = "You are a helpful assistant."
     tools: list[str] = []  # Tool names to load
     skills: list[str] = []  # Skill names to load
-    max_iterations: int = 10  # Agentic loop safety limit
+    max_iterations: int = 20  # Agentic loop safety limit
     temperature: float = 0.0
 
 

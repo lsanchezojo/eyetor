@@ -36,6 +36,7 @@ class UsageSummary:
     completion_tokens: int
     total_tokens: int
     estimated_cost: float
+    avg_speed_tps: float = 0.0
 
 
 _DDL = """
@@ -118,14 +119,29 @@ class TrackingStore:
         )
         self._conn.commit()
 
+    @staticmethod
+    def _period_since(period: str) -> str:
+        """Return UTC ISO timestamp for the start of the given period.
+
+        "day"   → start of today in local time (midnight local → UTC)
+        "week"  → 7 days ago (UTC)
+        "month" → 30 days ago (UTC)
+        """
+        if period == "day":
+            now_local = datetime.now()
+            midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+            utc_offset = now_local - datetime.utcnow()
+            return (midnight_local - utc_offset).isoformat()
+        delta = {"week": 7, "month": 30}.get(period, 7)
+        return (datetime.utcnow() - timedelta(days=delta)).isoformat()
+
     def get_summary(
         self,
         period: str = "day",
         provider: str | None = None,
     ) -> list[UsageSummary]:
         """Aggregate usage by provider+model for the given period."""
-        delta = {"day": 1, "week": 7, "month": 30}.get(period, 1)
-        since = (datetime.utcnow() - timedelta(days=delta)).isoformat()
+        since = self._period_since(period)
         params: list = [since]
         where_provider = ""
         if provider:
@@ -139,7 +155,8 @@ class TrackingStore:
                    SUM(prompt_tokens) as prompt_tokens,
                    SUM(completion_tokens) as completion_tokens,
                    SUM(prompt_tokens + completion_tokens) as total_tokens,
-                   SUM(estimated_cost) as estimated_cost
+                   SUM(estimated_cost) as estimated_cost,
+                   AVG(NULLIF(speed_tps, 0)) as avg_speed_tps
             FROM usage
             WHERE timestamp >= ? {where_provider}
             GROUP BY provider, model
@@ -156,6 +173,47 @@ class TrackingStore:
                 completion_tokens=r["completion_tokens"] or 0,
                 total_tokens=r["total_tokens"] or 0,
                 estimated_cost=r["estimated_cost"] or 0.0,
+                avg_speed_tps=r["avg_speed_tps"] or 0.0,
+            )
+            for r in rows
+        ]
+
+    def get_records(
+        self,
+        period: str = "day",
+        provider: str | None = None,
+    ) -> list[UsageRecord]:
+        """Return individual usage records for the given period, newest first."""
+        since = self._period_since(period)
+        params: list = [since]
+        where_provider = ""
+        if provider:
+            where_provider = "AND provider = ?"
+            params.append(provider)
+        rows = self._conn.execute(
+            f"""
+            SELECT id, session_id, provider, model, prompt_tokens,
+                   completion_tokens, estimated_cost, timestamp,
+                   duration_ms, speed_tps, finish_reason
+            FROM usage
+            WHERE timestamp >= ? {where_provider}
+            ORDER BY timestamp DESC
+            """,
+            params,
+        ).fetchall()
+        return [
+            UsageRecord(
+                id=r["id"],
+                session_id=r["session_id"],
+                provider=r["provider"],
+                model=r["model"],
+                prompt_tokens=r["prompt_tokens"],
+                completion_tokens=r["completion_tokens"],
+                estimated_cost=r["estimated_cost"] or 0.0,
+                timestamp=r["timestamp"],
+                duration_ms=r["duration_ms"] or 0,
+                speed_tps=r["speed_tps"] or 0.0,
+                finish_reason=r["finish_reason"] or "",
             )
             for r in rows
         ]

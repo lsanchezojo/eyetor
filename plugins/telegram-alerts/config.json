@@ -1,0 +1,8 @@
+{
+  "bot_token": "${TELEGRAM_ALERT_BOT_TOKEN}",
+  "chat_id": "${TELEGRAM_ALERT_CHAT_ID}",
+  "slow_threshold_ms": 10000,
+  "alert_on_failure": true,
+  "alert_on_slow": true,
+  "ignore_tools": []
+}

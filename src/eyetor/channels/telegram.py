@@ -24,6 +24,7 @@ from eyetor.config import TelegramChannelConfig
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from eyetor.config import VectorConfig
     from eyetor.tracking.usage import UsageTracker
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ class TelegramChannel(BaseChannel):
         skill_reg=None,
         scheduler=None,
         tracker: "UsageTracker | None" = None,
+        full_config: "VectorConfig | None" = None,
     ) -> None:
         self._manager = session_manager
         self._config = config
@@ -57,6 +59,23 @@ class TelegramChannel(BaseChannel):
         self._tracker = tracker
         self._dp = None
         self._bot = None
+
+        # Resolve vision provider settings from config (fallback to env vars in _describe_image)
+        self._vision_base_url: str | None = None
+        self._vision_api_key: str | None = None
+        self._vision_model: str | None = None
+        if full_config and full_config.vision_provider:
+            prov_cfg = full_config.providers.get(full_config.vision_provider)
+            if prov_cfg:
+                self._vision_base_url = prov_cfg.base_url
+                self._vision_api_key = prov_cfg.api_key or ""
+                self._vision_model = full_config.vision_model or prov_cfg.model
+                logger.info(
+                    "Vision provider: %s model=%s url=%s",
+                    full_config.vision_provider,
+                    self._vision_model,
+                    self._vision_base_url,
+                )
 
     async def start(self) -> None:
         try:
@@ -104,7 +123,7 @@ class TelegramChannel(BaseChannel):
             session_id = f"telegram-{msg.chat.id}"
             self._manager.get_or_create(session_id)
             await msg.answer(
-                "Hello! I'm Eyetor, a multi-agent AI assistant.\n"
+                "¡Hola! Soy Eyetor, un asistente de IA multi-agente.\n"
                 "Commands: /reset (new conversation), /help"
             )
 
@@ -114,7 +133,7 @@ class TelegramChannel(BaseChannel):
                 return
             session_id = f"telegram-{msg.chat.id}"
             self._manager.reset(session_id)
-            await msg.answer("Conversation reset. How can I help you?")
+            await msg.answer("Conversación reiniciada. Corto y cambio :)")
 
         @dp.message(Command("skills"))
         async def cmd_skills(msg: Message) -> None:
@@ -132,8 +151,46 @@ class TelegramChannel(BaseChannel):
         async def cmd_usage(msg: Message) -> None:
             if not _is_authorized(msg):
                 return
-            text = _format_usage_text(self._tracker)
+            session_id = f"telegram-{msg.chat.id}"
+            text = _format_usage_text(self._tracker, session_id=session_id)
             await _send_long(msg, text, parse_mode="HTML")
+
+        @dp.message(Command("tools"))
+        async def cmd_tools(msg: Message) -> None:
+            if not _is_authorized(msg):
+                return
+            session_id = f"telegram-{msg.chat.id}"
+            session = self._manager.get_or_create(session_id)
+            text = _format_tools_text(session.tool_registry)
+            await _send_long(msg, text, parse_mode="HTML")
+
+        @dp.message(Command("model"))
+        async def cmd_model(msg: Message) -> None:
+            if not _is_authorized(msg):
+                return
+            session_id = f"telegram-{msg.chat.id}"
+            session = self._manager.get_or_create(session_id)
+            parts = (msg.text or "").split()
+            if len(parts) == 1:
+                # List available providers
+                providers = self._manager.list_providers()
+                current = session.provider
+                current_model = getattr(current, "model", "?")
+                prov_name = getattr(current, "_provider_name", None) or "?"
+                lines = [f"<b>Proveedor actual:</b> <code>{prov_name}</code> (modelo: {current_model})\n"]
+                lines.append("<b>Proveedores disponibles:</b>")
+                for name, model in providers.items():
+                    lines.append(f"  <code>{name}</code> — {model}")
+                lines.append("\nUso: /model &lt;provider&gt; [model]")
+                await msg.answer("\n".join(lines), parse_mode="HTML")
+            else:
+                provider_name = parts[1]
+                model_override = parts[2] if len(parts) > 2 else None
+                try:
+                    result = session.change_provider(provider_name, model_override)
+                    await msg.answer(result)
+                except Exception as exc:
+                    await msg.answer(f"Error: {exc}")
 
         # --- Dynamic skill commands ---
         _skill_commands = []
@@ -191,14 +248,7 @@ class TelegramChannel(BaseChannel):
                                         pass
                             if buffer:
                                 html = _md_to_html(buffer)
-                                if len(html) <= _TG_MAX_LEN:
-                                    try:
-                                        await placeholder.edit_text(html, parse_mode="HTML")
-                                    except Exception:
-                                        await msg.answer(html, parse_mode="HTML")
-                                else:
-                                    await placeholder.delete()
-                                    await _send_long(msg, html, parse_mode="HTML")
+                                await _safe_edit_or_send(msg, placeholder, html, buffer)
                         except Exception as exc:
                             logger.error("Skill prompt command error: %s", exc)
                             await placeholder.edit_text(f"Error: {exc}")
@@ -212,6 +262,8 @@ class TelegramChannel(BaseChannel):
                 "Eyetor commands:\n"
                 "/reset — start a new conversation\n"
                 "/skills — list available skills\n"
+                "/tools — list registered tools\n"
+                "/model — list or change LLM provider\n"
                 "/tasks — list scheduled tasks\n"
                 "/usage — show token usage and costs\n"
                 f"{extra}"
@@ -248,14 +300,8 @@ class TelegramChannel(BaseChannel):
                     # Strip [IMAGE:...] markers from text (images sent separately)
                     clean_buffer = _IMAGE_MARKER_RE.sub("", buffer).strip()
                     html = _md_to_html(clean_buffer) if clean_buffer else ""
-                    if html and len(html) <= _TG_MAX_LEN:
-                        try:
-                            await placeholder.edit_text(html, parse_mode="HTML")
-                        except Exception:
-                            await msg.answer(html, parse_mode="HTML")
-                    elif html:
-                        await placeholder.delete()
-                        await _send_long(msg, html, parse_mode="HTML")
+                    if html:
+                        await _safe_edit_or_send(msg, placeholder, html, clean_buffer)
                     else:
                         await placeholder.delete()
 
@@ -300,20 +346,33 @@ class TelegramChannel(BaseChannel):
                 placeholder = await msg.answer("📷 Procesando imagen...")
 
                 # Step 1: Send image to the vision provider to get a description
-                description = await _describe_image(img_b64, caption)
+                description = await _describe_image(
+                    img_b64, caption,
+                    base_url=self._vision_base_url,
+                    api_key=self._vision_api_key,
+                    model=self._vision_model,
+                )
                 logger.debug("Vision description: %s", description[:300])
 
                 # Step 2: Send the description (+ metadata) to the main LLM session
                 user_text = caption.strip() if caption.strip() else ""
-                prompt = (
-                    f"{f'Mensaje del usuario: {user_text}' if user_text else ''}\n\n"
-                    f"A continuación se muestra el contenido extraído de una imagen "
-                    f"que el usuario ha enviado (analizada por un modelo de visión):\n\n"
-                    f"{description}\n\n"
-                    f"La imagen original está guardada en: {img_path}\n\n"
-                    f"Responde al usuario basándote en el contenido descrito. "
-                    f"Si dispones de herramientas relevantes para el contenido, úsalas."
-                )
+                if user_text:
+                    prompt = (
+                        f"El usuario ha enviado una imagen con este mensaje: «{user_text}»\n\n"
+                        f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
+                        f"Imagen guardada en: {img_path}\n\n"
+                        f"Responde a lo que pide el usuario. Usa el análisis de la imagen "
+                        f"como contexto, pero céntrate en la petición del usuario. "
+                        f"Si dispones de herramientas relevantes, úsalas."
+                    )
+                else:
+                    prompt = (
+                        f"El usuario ha enviado una imagen sin mensaje adicional.\n\n"
+                        f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
+                        f"Imagen guardada en: {img_path}\n\n"
+                        f"Responde al usuario basándote en el contenido descrito. "
+                        f"Si dispones de herramientas relevantes para el contenido, úsalas."
+                    )
 
                 session_id = f"telegram-{msg.chat.id}"
                 session = self._manager.get_or_create(session_id)
@@ -331,14 +390,7 @@ class TelegramChannel(BaseChannel):
                                 pass
                     if buffer:
                         html = _md_to_html(buffer)
-                        if len(html) <= _TG_MAX_LEN:
-                            try:
-                                await placeholder.edit_text(html, parse_mode="HTML")
-                            except Exception:
-                                await msg.answer(html, parse_mode="HTML")
-                        else:
-                            await placeholder.delete()
-                            await _send_long(msg, html, parse_mode="HTML")
+                        await _safe_edit_or_send(msg, placeholder, html, buffer)
                 except Exception as exc:
                     logger.error("Telegram photo handler error: %s", exc)
                     await placeholder.edit_text(f"Error: {exc}")
@@ -377,14 +429,8 @@ class TelegramChannel(BaseChannel):
 
                 if buffer:
                     html = f"🎤 <i>{_escape_html(transcription)}</i>\n\n{_md_to_html(buffer)}"
-                    if len(html) <= _TG_MAX_LEN:
-                        try:
-                            await placeholder.edit_text(html, parse_mode="HTML")
-                        except Exception:
-                            await msg.answer(html, parse_mode="HTML")
-                    else:
-                        await placeholder.delete()
-                        await _send_long(msg, html, parse_mode="HTML")
+                    plain = f"🎤 {transcription}\n\n{buffer}"
+                    await _safe_edit_or_send(msg, placeholder, html, plain)
             except Exception as exc:
                 logger.error("Telegram voice handler error: %s", exc)
                 await placeholder.edit_text(f"Error: {exc}")
@@ -395,6 +441,8 @@ class TelegramChannel(BaseChannel):
             BotCommand(command="skills", description="List available skills"),
             BotCommand(command="tasks", description="List scheduled tasks"),
             BotCommand(command="usage", description="Show token usage and costs"),
+            BotCommand(command="tools", description="List registered tools"),
+            BotCommand(command="model", description="List or change LLM provider"),
         ]
         for _sc in _skill_commands:
             commands.append(BotCommand(command=_sc.name, description=_sc.description))
@@ -411,19 +459,27 @@ class TelegramChannel(BaseChannel):
             await self._bot.session.close()
 
 
-async def _describe_image(img_b64: str, caption: str = "") -> str:
+async def _describe_image(
+    img_b64: str,
+    caption: str = "",
+    base_url: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+) -> str:
     """Send an image to the configured vision LLM and return a text description.
 
-    Uses VISION_BASE_URL / VISION_API_KEY / VISION_MODEL environment variables.
+    Connection settings are resolved from config (vision_provider / vision_model in
+    default.yaml). Falls back to VISION_BASE_URL / VISION_API_KEY / VISION_MODEL
+    environment variables when not provided.
 
     The vision prompt asks the model to classify the image type and, if it is
     a receipt/ticket, extract structured data (store, items, prices).
     """
     import httpx
 
-    base_url = os.environ.get("VISION_BASE_URL", "http://localhost:8080/v1").rstrip("/")
-    api_key = os.environ.get("VISION_API_KEY", "").strip()
-    model = os.environ.get("VISION_MODEL", "default")
+    base_url = (base_url or os.environ.get("VISION_BASE_URL", "http://localhost:8080/v1")).rstrip("/")
+    api_key = (api_key if api_key is not None else os.environ.get("VISION_API_KEY", "")).strip()
+    model = model or os.environ.get("VISION_MODEL", "default")
 
     if caption.strip():
         prompt = caption.strip()
@@ -602,6 +658,71 @@ def _split_message(text: str, limit: int = _TG_MAX_LEN) -> list[str]:
     return chunks
 
 
+async def _safe_edit_or_send(msg, placeholder, html: str, plain: str) -> None:
+    """Edit *placeholder* with HTML; on parse failure retry as plain text.
+
+    Protects against malformed HTML that Telegram rejects (e.g. crossed
+    <b>/<i> tags). "Message is not modified" errors are treated as
+    success — the placeholder already shows identical content from the
+    streaming phase, so re-sending would duplicate the message.
+    """
+    try:
+        from aiogram.exceptions import TelegramBadRequest
+    except ImportError:  # pragma: no cover
+        TelegramBadRequest = Exception  # type: ignore
+
+    def _not_modified(exc: BaseException) -> bool:
+        return "not modified" in str(exc).lower()
+
+    # Happy path: HTML.
+    if len(html) <= _TG_MAX_LEN:
+        try:
+            await placeholder.edit_text(html, parse_mode="HTML")
+            return
+        except TelegramBadRequest as exc:
+            if _not_modified(exc):
+                return  # Same content already on screen — nothing to do.
+            logger.warning("Telegram HTML parse failed, retrying as plain text: %s", exc)
+        except Exception as exc:
+            logger.warning("edit_text failed, retrying as plain text: %s", exc)
+    else:
+        try:
+            await placeholder.delete()
+            await _send_long(msg, html, parse_mode="HTML")
+            return
+        except TelegramBadRequest as exc:
+            if _not_modified(exc):
+                return
+            logger.warning("Telegram HTML parse failed on long send: %s", exc)
+        except Exception as exc:
+            logger.warning("Long HTML send failed, retrying as plain text: %s", exc)
+
+    # Fallback: plain text, no parse_mode.
+    plain_body = plain or "..."
+    if len(plain_body) <= _TG_MAX_LEN:
+        try:
+            await placeholder.edit_text(plain_body)
+            return
+        except TelegramBadRequest as exc:
+            if _not_modified(exc):
+                return  # Same content already on screen.
+        except Exception:
+            pass
+        try:
+            await msg.answer(plain_body)
+        except Exception as exc:
+            logger.error("Telegram plain-text fallback also failed: %s", exc)
+    else:
+        try:
+            await placeholder.delete()
+        except Exception:
+            pass
+        try:
+            await _send_long(msg, plain_body)
+        except Exception as exc:
+            logger.error("Telegram long plain-text fallback failed: %s", exc)
+
+
 async def _send_long(msg, text: str, parse_mode: str | None = None) -> None:
     """Send a potentially long message, splitting if it exceeds Telegram's limit."""
     for part in _split_message(text):
@@ -683,17 +804,64 @@ def _md_to_html(text: str) -> str:
             parts.append(content)
         else:
             parts.append(_inline_md_to_html(content))
-    return "".join(parts)
+    result = "".join(parts)
+
+    # Guard: if the conversion produced crossed/unbalanced tags (which
+    # Telegram rejects), fall back to escaped plain text.
+    if not _is_balanced_html(result):
+        return _escape_html(text)
+    return result
+
+
+_TAG_RE = re.compile(r"</?(?:b|i|s|u|code|pre)(?:\s[^>]*)?>")
+
+
+def _is_balanced_html(s: str) -> bool:
+    """Check that b/i/s/u/code/pre tags are strictly nested (no crossing)."""
+    stack: list[str] = []
+    for m in _TAG_RE.finditer(s):
+        tag = m.group(0)
+        name_m = re.match(r"</?([a-z]+)", tag)
+        if not name_m:
+            continue
+        name = name_m.group(1)
+        if tag.startswith("</"):
+            if not stack or stack[-1] != name:
+                return False
+            stack.pop()
+        else:
+            stack.append(name)
+    return not stack
 
 
 def _inline_md_to_html(text: str) -> str:
-    """Apply inline Markdown → HTML transforms on a plain-text segment."""
-    # Escape HTML entities before adding any tags
+    """Apply inline Markdown → HTML transforms on a plain-text segment.
+
+    Inline code spans (`...`) are tokenised first so that their contents
+    are never touched by later bold/italic transforms — otherwise an
+    underscore inside a code span would be matched as italic, producing
+    crossed tags that Telegram rejects.
+    """
+    # Step 1: extract inline code spans as opaque tokens.
+    inline_code_re = re.compile(r"`([^`\n]+)`")
+    code_spans: list[str] = []
+
+    def _stash_code(m: re.Match) -> str:
+        idx = len(code_spans)
+        code_spans.append(f"<code>{_escape_html(m.group(1))}</code>")
+        return f"\x00CODE{idx}\x00"
+
+    text = inline_code_re.sub(_stash_code, text)
+
+    # Step 2: escape HTML entities on the rest.
     text = _escape_html(text)
 
-    # Inline code `...`
-    text = re.sub(r"`([^`\n]+)`", lambda m: f"<code>{m.group(1)}</code>", text)
+    # Step 3: neutralise backslash-escaped markdown specials (\_ \* \` \~)
+    # so they are not interpreted as emphasis markers.
+    escape_map = {"_": "\x00U\x00", "*": "\x00A\x00", "`": "\x00B\x00", "~": "\x00T\x00"}
+    text = re.sub(r"\\([_*`~])", lambda m: escape_map[m.group(1)], text)
 
+    # Step 4: emphasis / headers / lists.
     # Bold: **text** or __text__
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.DOTALL)
@@ -713,6 +881,16 @@ def _inline_md_to_html(text: str) -> str:
 
     # Unordered list items: - / * / + at line start → bullet
     text = re.sub(r"^[ \t]*[-*+] ", "• ", text, flags=re.MULTILINE)
+
+    # Step 5: restore escaped markdown specials as literal characters.
+    for ch, token in escape_map.items():
+        text = text.replace(token, ch)
+
+    # Step 6: restore inline code spans.
+    def _restore_code(m: re.Match) -> str:
+        return code_spans[int(m.group(1))]
+
+    text = re.sub(r"\x00CODE(\d+)\x00", _restore_code, text)
 
     return text
 
@@ -742,53 +920,122 @@ def _format_tasks_text(scheduler) -> str:
 
 
 
-def _format_usage_text(tracker) -> str:
+_LOCAL_PROVIDERS = {"ollama", "llamacpp", "local"}
+_CLOUD_PROVIDERS = {"openrouter", "anthropic", "google", "openai", "azure"}
+
+
+def _fmt_num(n: int) -> str:
+    """Format integer with Spanish thousands separator (dot)."""
+    return f"{n:,}".replace(",", ".")
+
+
+def _provider_emoji(provider: str) -> str:
+    return "🖥" if provider.lower() in _LOCAL_PROVIDERS else "🌐"
+
+
+def _model_short(model: str, max_len: int = 32) -> str:
+    name = model.split("/")[-1] if "/" in model else model
+    return name if len(name) <= max_len else name[: max_len - 1] + "…"
+
+
+def _format_usage_text(tracker, session_id: str | None = None) -> str:
     """Return an HTML-formatted usage report for Telegram."""
     if tracker is None:
-        return "Usage tracking is not configured."
+        return "Tracking de uso no configurado."
 
-    lines: list[str] = []
+    from collections import defaultdict
+    from datetime import datetime
 
-    # Recent individual calls
-    recent = tracker.get_recent(limit=10)
-    if recent:
-        lines.append("<b>Recent calls:</b>")
-        for r in recent:
-            # Parse timestamp for display
-            ts = r.timestamp[:16].replace("T", " ")
-            # Shorten model name
-            model_short = r.model.split("/")[-1] if "/" in r.model else r.model
-            if len(model_short) > 30:
-                model_short = model_short[:27] + "..."
-            speed = f"{r.speed_tps:.1f} tps" if r.speed_tps else "—"
-            cost = f"${r.estimated_cost:.4f}" if r.estimated_cost else "$0"
+    now = datetime.now()
+    utc_offset = now - datetime.utcnow()  # for converting stored UTC → local
+    day_names = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
+    month_names = ["ene", "feb", "mar", "abr", "may", "jun",
+                   "jul", "ago", "sep", "oct", "nov", "dic"]
+    day_label = f"{day_names[now.weekday()]} {now.day} {month_names[now.month - 1]}"
+
+    lines: list[str] = [f"<b>📊 Uso — {day_label}</b>"]
+
+    # --- Session totals (if session_id provided) ---
+    day_records = tracker.get_records(period="day")
+
+    if session_id and day_records:
+        sess_records = [r for r in day_records if r.session_id == session_id]
+        if sess_records:
+            s_prompt = sum(r.prompt_tokens for r in sess_records)
+            s_comp = sum(r.completion_tokens for r in sess_records)
+            s_cost = sum(r.estimated_cost for r in sess_records)
+            cost_str = f"${s_cost:.4f}" if s_cost > 0 else "$0"
+            lines.append(
+                f"\n💬 <b>Esta sesión</b>"
+                f"\n  Tokens: {_fmt_num(s_prompt)} prompt · {_fmt_num(s_comp)} completion"
+                f"\n  Coste: {cost_str}"
+                f"\n  Llamadas: {len(sess_records)}"
+            )
+
+    # --- Individual calls for today, grouped by (provider, model) ---
+    _MAX_CALLS_SHOWN = 5
+
+    if not day_records:
+        lines.append("\nSin actividad registrada.")
+        return "\n".join(lines)
+
+    # Group preserving insertion order; display calls oldest→newest
+    groups: dict[tuple, list] = defaultdict(list)
+    for r in reversed(day_records):
+        groups[(r.provider, r.model)].append(r)
+
+    for (provider, model), calls in groups.items():
+        emoji = _provider_emoji(provider)
+        model_label = _escape_html(_model_short(model))
+        shown = calls[:_MAX_CALLS_SHOWN]
+        hidden = len(calls) - len(shown)
+        label_extra = f" (últimas {_MAX_CALLS_SHOWN})" if hidden > 0 else ""
+        lines.append(f"\n{emoji} <b>{model_label}</b>{label_extra}")
+
+        for r in shown:
+            ts_local = datetime.fromisoformat(r.timestamp) + utc_offset
+            hhmm = ts_local.strftime("%H:%M")
+            tok = f"{_fmt_num(r.prompt_tokens)} → {_fmt_num(r.completion_tokens)} tokens"
+            cost = f"${r.estimated_cost:.4f}" if r.estimated_cost > 0 else "$0"
+            speed = f"{r.speed_tps:.1f} tps".replace(".", ",") if r.speed_tps else "—"
             finish = r.finish_reason or "—"
-            lines.append(
-                f"\n<code>{ts}</code> — <b>{_escape_html(model_short)}</b>\n"
-                f"  {r.prompt_tokens} → {r.completion_tokens} tokens | "
-                f"{cost} | {speed} | {finish}"
-            )
-    else:
-        lines.append("No usage data recorded yet.")
+            lines.append(f"  <code>{hhmm}</code>  {tok} | {cost} | {speed} | {finish}")
 
-    # Daily summary
-    summaries = tracker.get_summary(period="day")
-    if summaries:
-        lines.append("\n<b>Today's summary:</b>")
-        total_tokens = 0
-        total_cost = 0.0
-        for s in summaries:
-            model_short = s.model.split("/")[-1] if "/" in s.model else s.model
-            if len(model_short) > 30:
-                model_short = model_short[:27] + "..."
-            lines.append(
-                f"  {_escape_html(s.provider)} / {_escape_html(model_short)} — "
-                f"{s.calls} calls, {s.total_tokens:,} tokens, ${s.estimated_cost:.4f}"
-            )
-            total_tokens += s.total_tokens
-            total_cost += s.estimated_cost
-        if len(summaries) > 1:
-            lines.append(f"  <b>Total: {total_tokens:,} tokens, ${total_cost:.4f}</b>")
+        total_tok = sum(r.prompt_tokens + r.completion_tokens for r in calls)
+        lines.append(f"  ─ {len(calls)} llamadas · {_fmt_num(total_tok)} tok")
+
+    # --- Footer: day vs week totals ---
+    week_records = tracker.get_records(period="week")
+
+    def _totals_from_records(recs):
+        prompt = sum(r.prompt_tokens for r in recs)
+        completion = sum(r.completion_tokens for r in recs)
+        cost = sum(r.estimated_cost for r in recs)
+        tool = sum(1 for r in recs if r.finish_reason == "tool_calls")
+        return prompt, completion, len(recs), tool, cost
+
+    day_prompt, day_comp, day_calls, day_tool, day_cost = _totals_from_records(day_records)
+    week_prompt, week_comp, week_calls, week_tool, week_cost = _totals_from_records(week_records)
+
+    def _footer_line(label: str, prompt: int, comp: int, calls: int, tool: int, cost: float) -> str:
+        tok_part = f"{_fmt_num(prompt)} → {_fmt_num(comp)} tokens"
+        calls_part = f"{calls} llamadas ({tool} tool_call)"
+        cost_part = f"${cost:.4f}" if cost > 0 else "$0"
+        return f"{label}   {tok_part} · {calls_part} · {cost_part}"
+
+    lines.append("\n──────────────")
+    lines.append(_footer_line("Hoy   ", day_prompt, day_comp, day_calls, day_tool, day_cost))
+    lines.append(_footer_line("Semana", week_prompt, week_comp, week_calls, week_tool, week_cost))
+
+    # Media/día (semana)
+    week_days = 7
+    if week_calls > 0:
+        avg_prompt = week_prompt // week_days
+        avg_comp = week_comp // week_days
+        avg_calls = week_calls // week_days
+        avg_tool = week_tool // week_days
+        avg_cost = week_cost / week_days
+        lines.append(_footer_line("Media ", avg_prompt, avg_comp, avg_calls, avg_tool, avg_cost))
 
     return "\n".join(lines)
 
@@ -803,4 +1050,17 @@ def _format_skills_text(skill_reg) -> str:
     lines = ["<b>Available skills:</b>"]
     for m in metadata:
         lines.append(f"  <code>{m.name}</code> — {m.description}")
+    return "\n".join(lines)
+
+
+def _format_tools_text(tool_registry) -> str:
+    """Return a formatted list of registered tools for Telegram (HTML)."""
+    if tool_registry is None:
+        return "No tools registered."
+    tools = tool_registry._tools
+    if not tools:
+        return "No tools registered."
+    lines = [f"<b>Registered tools ({len(tools)}):</b>"]
+    for name, defn in tools.items():
+        lines.append(f"  <code>{name}</code> — {defn.description}")
     return "\n".join(lines)

@@ -17,7 +17,7 @@ providers:
     type: llamacpp
     base_url: http://localhost:8080/v1
     model: default
-    temperature: 0.6  # Qwen3 recommended (matches --temp 0.6 on server)
+    temperature: 1.0
 
   gemini:
     type: gemini
@@ -31,7 +31,12 @@ fallback:
 
 skills_dirs:
   - ./skills
+  - ~/.eyetor/skills
 # - ~/.agents/skills
+
+plugins_dirs:
+  - ./plugins
+  - ~/.eyetor/plugins
 
 # Path to a markdown file with agent instructions and behavior rules.
 # Appended to the system prompt. Can define agent roles, skill usage policies, etc.
@@ -73,6 +78,12 @@ image_providers:
     model: gemini-3.1-flash-image-preview
 
 default_image_provider: gemini-flash
+
+# Vision provider: used to describe images sent by users (multimodal LLM call).
+# References one of the providers above — inherits its base_url and api_key.
+# The api_key must be set in .env (e.g. OPENROUTER_API_KEY).
+vision_provider: llamacpp # ej. openrouter
+vision_model: ggml-org/gemma-4-E4B-it-GGUF:Q8_0 # ej. nvidia/nemotron-nano-12b-v2-vl:free
 
 mcp_servers: {}
 

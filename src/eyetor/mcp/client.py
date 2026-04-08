@@ -74,13 +74,30 @@ class McpClient:
         logger.debug("MCP tools discovered: %d", len(self._tools))
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
-        """Call a tool on the MCP server and return the result as string."""
-        result = await self._rpc("tools/call", {"name": name, "arguments": arguments})
-        if not result:
-            return ""
-        content = result.get("content", [])
-        texts = [c.get("text", "") for c in content if c.get("type") == "text"]
-        return "\n".join(texts)
+        """Call a tool on the MCP server and return the result as string.
+
+        Retries once on connection failure, attempting to reconnect for stdio
+        transports (the subprocess may have died).
+        """
+        for attempt in range(2):
+            try:
+                result = await self._rpc("tools/call", {"name": name, "arguments": arguments})
+                if not result:
+                    return ""
+                content = result.get("content", [])
+                texts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                return "\n".join(texts)
+            except (EOFError, RuntimeError, OSError) as exc:
+                if attempt == 0:
+                    logger.warning("MCP call_tool '%s' failed (%s), reconnecting...", name, exc)
+                    try:
+                        await self._transport.close()
+                    except Exception:
+                        pass
+                    await self.connect()
+                else:
+                    raise
+        return ""  # unreachable, keeps mypy happy
 
     def get_tools(self) -> list[ToolDefinition]:
         """Return tool definitions for all discovered MCP tools."""

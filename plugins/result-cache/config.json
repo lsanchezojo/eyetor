@@ -1,0 +1,10 @@
+{
+  "db_path": "~/.eyetor/cache.db",
+  "default_ttl_seconds": 3600,
+  "cached_tools": ["web_search", "run_skill_script"],
+  "tool_ttl_overrides": {
+    "web_search": 1800,
+    "run_skill_script": 7200
+  },
+  "max_result_size_bytes": 1048576
+}
