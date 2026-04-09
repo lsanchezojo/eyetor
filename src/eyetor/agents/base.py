@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import logging
-from typing import AsyncIterator
 
 from eyetor.models.agents import AgentConfig, AgentResult
-from eyetor.models.messages import Message
+from eyetor.models.messages import Message, StreamingResponse
 from eyetor.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
@@ -22,7 +21,9 @@ class BaseAgent:
         self.config = config
         self.provider = provider
 
-    async def run(self, user_input: str, history: list[Message] | None = None) -> AgentResult:
+    async def run(
+        self, user_input: str, history: list[Message] | None = None
+    ) -> AgentResult:
         """Run the agent with a single user input.
 
         Args:
@@ -49,14 +50,13 @@ class BaseAgent:
         self,
         user_input: str,
         history: list[Message] | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> StreamingResponse:
         """Stream tokens from a single LLM call."""
         messages = self._build_messages(user_input, history)
-        async for token in self.provider.stream(
+        return await self.provider.stream(
             messages=messages,
             temperature=self.config.temperature,
-        ):
-            yield token
+        )
 
     def _build_messages(
         self, user_input: str, history: list[Message] | None

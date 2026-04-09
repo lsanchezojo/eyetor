@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, AsyncIterator
+from typing import Any
 
-from eyetor.models.messages import CompletionResult, Message
+from eyetor.models.messages import CompletionResult, Message, StreamingResponse
 from eyetor.models.tools import ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -52,8 +52,8 @@ class BaseProvider(ABC):
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
-    ) -> AsyncIterator[str]:
-        """Send messages and yield text tokens as they arrive (streaming)."""
+    ) -> StreamingResponse:
+        """Send messages and return a StreamingResponse with text tokens and usage."""
 
     # ------------------------------------------------------------------
     # Helpers shared by all concrete providers
@@ -94,6 +94,7 @@ class BaseProvider(ABC):
     def _client(self, timeout: float = 120.0) -> "httpx.AsyncClient":
         """Return a configured AsyncClient respecting ssl_verify setting."""
         import httpx
+
         if not self.ssl_verify:
             logger.warning(
                 "SSL verification disabled for %s — insecure, only use behind a trusted proxy.",

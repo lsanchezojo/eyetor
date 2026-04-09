@@ -17,6 +17,7 @@ from eyetor.providers.tracking import current_session_id
 
 if TYPE_CHECKING:
     from eyetor.config import VectorConfig
+    from eyetor.chat.compactor import ConversationCompactor
     from eyetor.memory.manager import MemoryManager
     from eyetor.scheduler.channel import SchedulerChannel
     from eyetor.tracking.usage import UsageTracker
@@ -85,6 +86,17 @@ class ChatSession:
         self._cost_estimator = cost_estimator
         self._observer = observer
 
+        self._compactor: ConversationCompactor | None = None
+        if root_config and root_config.sessions.compaction.enabled:
+            from eyetor.chat.compactor import ConversationCompactor
+
+            self._compactor = ConversationCompactor(root_config.sessions.compaction)
+            logger.info(
+                "Compactor enabled: context_window=%d, trigger_at_percent=%.2f",
+                root_config.sessions.compaction.context_window,
+                root_config.sessions.compaction.trigger_at_percent,
+            )
+
         # Session persistence (JSONL)
         self._persist_path: Path | None = None
         if root_config and root_config.sessions.persist:
@@ -130,8 +142,10 @@ class ChatSession:
         if not self._root_config:
             return "Error: no root config available — cannot change provider."
         from eyetor.providers import get_provider
+
         new_prov = get_provider(
-            self._root_config, name,
+            self._root_config,
+            name,
             tracker=self._tracker,
             cost_estimator=self._cost_estimator,
         )
@@ -156,9 +170,13 @@ class ChatSession:
             for line in lines:
                 data = json.loads(line)
                 self._messages.append(Message(**data))
-            logger.info("Loaded %d messages from %s", len(self._messages), self._persist_path)
+            logger.info(
+                "Loaded %d messages from %s", len(self._messages), self._persist_path
+            )
         except Exception as exc:
-            logger.warning("Failed to load session history from %s: %s", self._persist_path, exc)
+            logger.warning(
+                "Failed to load session history from %s: %s", self._persist_path, exc
+            )
 
     def _persist_message(self, msg: Message) -> None:
         """Append a single message to the JSONL file."""
@@ -196,8 +214,21 @@ class ChatSession:
         user_msg = Message(role="user", content=user_input)
         self._messages.append(user_msg)
         self._persist_message(user_msg)
-        tool_defs = list(self.tool_registry._tools.values()) if self.tool_registry._tools else None
+        tool_defs = (
+            list(self.tool_registry._tools.values())
+            if self.tool_registry._tools
+            else None
+        )
         current_session_id.set(self.session_id)
+
+        if self._compactor:
+            system_content = self._build_system_content()
+            if self._compactor.should_compact(self._messages, system_content):
+                result = await self._compactor.compact(
+                    self._messages, system_content, self.provider, self.session_id
+                )
+                if result.compacted:
+                    self._apply_compaction(result)
 
         full_messages = self._get_full_messages()
         iterations = 0
@@ -220,7 +251,9 @@ class ChatSession:
             self._persist_message(response)
             full_messages.append(response)
             if self._observer:
-                self._observer.on_llm_response(response.content or "", response.tool_calls or [])
+                self._observer.on_llm_response(
+                    response.content or "", response.tool_calls or []
+                )
 
             if not response.tool_calls:
                 content = response.content or ""
@@ -238,14 +271,16 @@ class ChatSession:
                         "Session '%s' — model announced a tool call without emitting it; nudging once",
                         self.session_id,
                     )
-                    full_messages.append(Message(
-                        role="user",
-                        content=(
-                            "Has anunciado que ibas a llamar a una herramienta pero no has emitido "
-                            "la tool_call estructurada. Emítela ahora con los parámetros correctos. "
-                            "Si ya no necesitas más herramientas, responde al usuario directamente."
-                        ),
-                    ))
+                    full_messages.append(
+                        Message(
+                            role="user",
+                            content=(
+                                "Has anunciado que ibas a llamar a una herramienta pero no has emitido "
+                                "la tool_call estructurada. Emítela ahora con los parámetros correctos. "
+                                "Si ya no necesitas más herramientas, responde al usuario directamente."
+                            ),
+                        )
+                    )
                     continue
                 # Final answer — yield it token by token (character-level)
                 if self._observer:
@@ -261,7 +296,9 @@ class ChatSession:
             ]
             logger.info(
                 "Session '%s' iter %d/%d — tool calls: %s",
-                self.session_id, iterations, self.config.max_iterations,
+                self.session_id,
+                iterations,
+                self.config.max_iterations,
                 " | ".join(call_details),
             )
 
@@ -279,17 +316,21 @@ class ChatSession:
                 logger.warning(
                     "Session '%s' — loop detected: same tool call(s) repeated %d times: %s. "
                     "Forcing final answer.",
-                    self.session_id, max_repeat, call_names,
+                    self.session_id,
+                    max_repeat,
+                    call_names,
                 )
                 # Ask the model to answer without tools
-                full_messages.append(Message(
-                    role="user",
-                    content=(
-                        "IMPORTANT: You seem to be stuck in a loop calling the same tools repeatedly. "
-                        "Please provide your final answer now using the information you already have. "
-                        "Do NOT call any more tools."
-                    ),
-                ))
+                full_messages.append(
+                    Message(
+                        role="user",
+                        content=(
+                            "IMPORTANT: You seem to be stuck in a loop calling the same tools repeatedly. "
+                            "Please provide your final answer now using the information you already have. "
+                            "Do NOT call any more tools."
+                        ),
+                    )
+                )
                 result = await self.provider.complete(
                     messages=full_messages,
                     tools=None,  # no tools — force text response
@@ -305,8 +346,12 @@ class ChatSession:
             # Execute tool calls in parallel
             async def _exec_tool(tc: ToolCall) -> tuple[ToolCall, str]:
                 if self._observer:
-                    self._observer.on_tool_start(tc.function.name, tc.function.arguments)
-                r = await self.tool_registry.execute(tc.function.name, tc.function.arguments)
+                    self._observer.on_tool_start(
+                        tc.function.name, tc.function.arguments
+                    )
+                r = await self.tool_registry.execute(
+                    tc.function.name, tc.function.arguments
+                )
                 if self._observer:
                     self._observer.on_tool_end(tc.function.name, r)
                 return tc, r
@@ -317,7 +362,9 @@ class ChatSession:
             )
             for entry in exec_results:
                 if isinstance(entry, BaseException):
-                    logger.error("Session '%s' — tool error: %s", self.session_id, entry)
+                    logger.error(
+                        "Session '%s' — tool error: %s", self.session_id, entry
+                    )
                     if self._observer:
                         self._observer.on_tool_error("?", str(entry))
                     continue
@@ -328,16 +375,24 @@ class ChatSession:
                 full_messages.append(tool_msg)
                 logger.info(
                     "Session '%s' — tool '%s'(%s) → %d chars: %s",
-                    self.session_id, tc.function.name,
+                    self.session_id,
+                    tc.function.name,
                     _truncate(tc.function.arguments, 200),
-                    len(result), _truncate(result, 200),
+                    len(result),
+                    _truncate(result, 200),
                 )
 
         # Max iterations reached
         logger.warning(
             "Session '%s' — max_iterations (%d) reached. Tool calls made: %s",
-            self.session_id, self.config.max_iterations,
-            ", ".join(tc.function.name for m in self._messages if m.tool_calls for tc in m.tool_calls),
+            self.session_id,
+            self.config.max_iterations,
+            ", ".join(
+                tc.function.name
+                for m in self._messages
+                if m.tool_calls
+                for tc in m.tool_calls
+            ),
         )
         msg = "I reached the maximum number of reasoning steps. Please try a simpler question."
         max_msg = Message(role="assistant", content=msg)
@@ -356,8 +411,8 @@ class ChatSession:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_full_messages(self) -> list[Message]:
-        """Build the full messages list including system prompt."""
+    def _build_system_content(self) -> str:
+        """Build system content string from config and memory."""
         system_content = self.config.system_prompt
         if self._system_prompt_suffix:
             system_content = f"{system_content}\n\n{self._system_prompt_suffix}"
@@ -365,11 +420,40 @@ class ChatSession:
             memory_context = self._memory.build_context(self.session_id)
             if memory_context:
                 system_content = f"{system_content}\n\n{memory_context}"
+        return system_content
+
+    def _get_full_messages(self) -> list[Message]:
+        """Build the full messages list including system prompt."""
+        system_content = self._build_system_content()
         messages: list[Message] = []
         if system_content:
             messages.append(Message(role="system", content=system_content))
         messages.extend(self._messages)
         return messages
+
+    def _apply_compaction(self, result) -> None:
+        """Apply compaction result: archive, rewrite JSONL, update messages."""
+        if result.archived_path:
+            logger.info("Archived pre-compaction messages to %s", result.archived_path)
+
+        self._messages = result.new_messages
+
+        if self._persist_path:
+            try:
+                with open(self._persist_path, "w", encoding="utf-8") as f:
+                    for msg in self._messages:
+                        f.write(
+                            json.dumps(
+                                msg.model_dump(exclude_none=True), ensure_ascii=False
+                            )
+                            + "\n"
+                        )
+                logger.info(
+                    "Rewrote session JSONL after compaction (%d messages)",
+                    len(self._messages),
+                )
+            except Exception as e:
+                logger.warning("Failed to rewrite JSONL after compaction: %s", e)
 
     def _register_memory_tools(self, memory_manager: "MemoryManager") -> None:
         """Register remember/forget tools backed by persistent memory."""
@@ -383,38 +467,59 @@ class ChatSession:
             memory_manager.forget(session_id, key, type)
             return json.dumps({"status": "ok", "key": key})
 
-        self.tool_registry.register(ToolDefinition(
-            name="remember",
-            description=(
-                "Save a fact, preference or note to persistent memory so it is available "
-                "in future conversations. Use whenever the user shares something important "
-                "about themselves, their preferences, or context you should not forget."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string", "description": "Short identifier (e.g. 'user_name', 'preferred_language', 'project')"},
-                    "value": {"type": "string", "description": "The value to remember"},
-                    "type": {"type": "string", "enum": ["fact", "preference", "note"], "default": "fact"},
+        self.tool_registry.register(
+            ToolDefinition(
+                name="remember",
+                description=(
+                    "Save a fact, preference or note to persistent memory so it is available "
+                    "in future conversations. Use whenever the user shares something important "
+                    "about themselves, their preferences, or context you should not forget."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "description": "Short identifier (e.g. 'user_name', 'preferred_language', 'project')",
+                        },
+                        "value": {
+                            "type": "string",
+                            "description": "The value to remember",
+                        },
+                        "type": {
+                            "type": "string",
+                            "enum": ["fact", "preference", "note"],
+                            "default": "fact",
+                        },
+                    },
+                    "required": ["key", "value"],
                 },
-                "required": ["key", "value"],
-            },
-            handler=remember_handler,
-        ))
+                handler=remember_handler,
+            )
+        )
 
-        self.tool_registry.register(ToolDefinition(
-            name="forget",
-            description="Delete a previously saved memory entry by key.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string", "description": "The key of the memory to delete"},
-                    "type": {"type": "string", "enum": ["fact", "preference", "note"], "default": "fact"},
+        self.tool_registry.register(
+            ToolDefinition(
+                name="forget",
+                description="Delete a previously saved memory entry by key.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "description": "The key of the memory to delete",
+                        },
+                        "type": {
+                            "type": "string",
+                            "enum": ["fact", "preference", "note"],
+                            "default": "fact",
+                        },
+                    },
+                    "required": ["key"],
                 },
-                "required": ["key"],
-            },
-            handler=forget_handler,
-        ))
+                handler=forget_handler,
+            )
+        )
 
     def _register_scheduler_tools(self, scheduler: "SchedulerChannel") -> None:
         """Register schedule_task / list_tasks / cancel_task tools."""
@@ -422,7 +527,9 @@ class ChatSession:
 
         session_id = self.session_id
         # Auto-derive Telegram chat_id from session_id (e.g. "telegram-123456" → "123456")
-        notify_target = session_id.split("-", 1)[1] if session_id.startswith("telegram-") else None
+        notify_target = (
+            session_id.split("-", 1)[1] if session_id.startswith("telegram-") else None
+        )
 
         async def handle_schedule_task(
             name: str,
@@ -432,7 +539,9 @@ class ChatSession:
             timezone: str = "Europe/Madrid",
             notify_target_override: str | None = None,
         ) -> str:
-            target = notify_target_override or (notify_target if notify == "telegram" else None)
+            target = notify_target_override or (
+                notify_target if notify == "telegram" else None
+            )
             task = ScheduledTask(
                 name=name,
                 prompt=prompt,
@@ -445,14 +554,16 @@ class ChatSession:
             added = scheduler.add_task(task)
             tasks = scheduler.list_tasks()
             next_run = next((t["next_run"] for t in tasks if t["id"] == added.id), None)
-            return json.dumps({
-                "ok": True,
-                "task_id": added.id,
-                "name": added.name,
-                "schedule": added.schedule,
-                "notify": added.notify,
-                "next_run": next_run,
-            })
+            return json.dumps(
+                {
+                    "ok": True,
+                    "task_id": added.id,
+                    "name": added.name,
+                    "schedule": added.schedule,
+                    "notify": added.notify,
+                    "next_run": next_run,
+                }
+            )
 
         async def handle_list_tasks() -> str:
             return json.dumps({"ok": True, "tasks": scheduler.list_tasks()})
@@ -463,60 +574,75 @@ class ChatSession:
                 return json.dumps({"ok": True, "cancelled": task_id})
             return json.dumps({"ok": False, "error": f"Task '{task_id}' not found."})
 
-        self.tool_registry.register(ToolDefinition(
-            name="schedule_task",
-            description=(
-                "Create a scheduled task that runs automatically at a given time or interval. "
-                "The task sends a prompt to the agent and optionally delivers the response. "
-                "Notify options: 'telegram' (send to this chat), 'log' (write to file), 'none' (silent)."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Short descriptive name for the task"},
-                    "prompt": {"type": "string", "description": "The message to send to the agent when the task fires"},
-                    "schedule": {
-                        "type": "string",
-                        "description": (
-                            "When to run. Cron (5 fields): '0 9 * * *' (daily at 9am), '0 8 * * 1' (Mondays at 8am). "
-                            "Interval: 'every 30m', 'every 2h', 'every 1d'."
-                        ),
+        self.tool_registry.register(
+            ToolDefinition(
+                name="schedule_task",
+                description=(
+                    "Create a scheduled task that runs automatically at a given time or interval. "
+                    "The task sends a prompt to the agent and optionally delivers the response. "
+                    "Notify options: 'telegram' (send to this chat), 'log' (write to file), 'none' (silent)."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Short descriptive name for the task",
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "The message to send to the agent when the task fires",
+                        },
+                        "schedule": {
+                            "type": "string",
+                            "description": (
+                                "When to run. Cron (5 fields): '0 9 * * *' (daily at 9am), '0 8 * * 1' (Mondays at 8am). "
+                                "Interval: 'every 30m', 'every 2h', 'every 1d'."
+                            ),
+                        },
+                        "notify": {
+                            "type": "string",
+                            "enum": ["telegram", "log", "none"],
+                            "description": "Where to deliver the result. Default: 'telegram'",
+                        },
+                        "timezone": {
+                            "type": "string",
+                            "description": "Timezone for cron schedules (e.g. 'Europe/Madrid'). Default: 'Europe/Madrid'",
+                        },
+                        "notify_target_override": {
+                            "type": "string",
+                            "description": "Override log file path (only for notify='log'). Leave empty for default.",
+                        },
                     },
-                    "notify": {
-                        "type": "string",
-                        "enum": ["telegram", "log", "none"],
-                        "description": "Where to deliver the result. Default: 'telegram'",
-                    },
-                    "timezone": {
-                        "type": "string",
-                        "description": "Timezone for cron schedules (e.g. 'Europe/Madrid'). Default: 'Europe/Madrid'",
-                    },
-                    "notify_target_override": {
-                        "type": "string",
-                        "description": "Override log file path (only for notify='log'). Leave empty for default.",
-                    },
+                    "required": ["name", "prompt", "schedule"],
                 },
-                "required": ["name", "prompt", "schedule"],
-            },
-            handler=handle_schedule_task,
-        ))
+                handler=handle_schedule_task,
+            )
+        )
 
-        self.tool_registry.register(ToolDefinition(
-            name="list_tasks",
-            description="List all scheduled tasks with their next run time and status.",
-            parameters={"type": "object", "properties": {}, "required": []},
-            handler=handle_list_tasks,
-        ))
+        self.tool_registry.register(
+            ToolDefinition(
+                name="list_tasks",
+                description="List all scheduled tasks with their next run time and status.",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=handle_list_tasks,
+            )
+        )
 
-        self.tool_registry.register(ToolDefinition(
-            name="cancel_task",
-            description="Cancel and delete a scheduled task by its ID.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string", "description": "The task ID to cancel (from list_tasks)"},
+        self.tool_registry.register(
+            ToolDefinition(
+                name="cancel_task",
+                description="Cancel and delete a scheduled task by its ID.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The task ID to cancel (from list_tasks)",
+                        },
+                    },
+                    "required": ["task_id"],
                 },
-                "required": ["task_id"],
-            },
-            handler=handle_cancel_task,
-        ))
+                handler=handle_cancel_task,
+            )
+        )

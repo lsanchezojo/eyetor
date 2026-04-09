@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, AsyncIterator
 
-import httpx
-
-from eyetor.models.messages import CompletionResult, FunctionCall, Message, TokenUsage, ToolCall
+from eyetor.models.messages import (
+    CompletionResult,
+    FunctionCall,
+    Message,
+    StreamingResponse,
+    TokenUsage,
+    ToolCall,
+)
 from eyetor.models.tools import ToolDefinition
 from eyetor.providers.base import BaseProvider
-from eyetor.streaming.parsers import extract_delta_content, extract_delta_tool_calls, parse_sse
+from eyetor.streaming.parsers import extract_delta_content, extract_usage, parse_sse
 
 logger = logging.getLogger(__name__)
 
@@ -50,20 +54,31 @@ class OpenRouterProvider(BaseProvider):
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
-    ) -> AsyncIterator[str]:
+    ) -> StreamingResponse:
         payload = self._build_payload(messages, tools, temperature, stream=True)
-        async with self._client(timeout=120.0) as client:
-            async with client.stream(
-                "POST",
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers=self._build_headers(),
-            ) as response:
-                response.raise_for_status()
-                async for chunk in parse_sse(response):
-                    text = extract_delta_content(chunk)
-                    if text:
-                        yield text
+        chunks: list[str] = []
+        usage: TokenUsage | None = None
+
+        async def _stream_tokens() -> AsyncIterator[str]:
+            nonlocal usage
+            async with self._client(timeout=120.0) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers=self._build_headers(),
+                ) as response:
+                    response.raise_for_status()
+                    async for chunk in parse_sse(response):
+                        text = extract_delta_content(chunk)
+                        if text:
+                            chunks.append(text)
+                            yield text
+                        extracted = extract_usage(chunk)
+                        if extracted:
+                            usage = extracted
+
+        return StreamingResponse(_stream_tokens(), usage)
 
 
 def _parse_completion_response(data: dict[str, Any]) -> CompletionResult:
@@ -96,6 +111,7 @@ def _parse_completion_response(data: dict[str, Any]) -> CompletionResult:
             prompt_tokens=raw_usage.get("prompt_tokens", 0),
             completion_tokens=raw_usage.get("completion_tokens", 0),
             total_tokens=raw_usage.get("total_tokens", 0),
+            cost=raw_usage.get("cost", 0.0),
         )
 
     return CompletionResult(

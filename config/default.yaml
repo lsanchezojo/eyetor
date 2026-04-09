@@ -46,6 +46,8 @@ memory_db_path: ~/.eyetor/memory.db
 
 tracking:
   db_path: ~/.eyetor/tracking.db
+  month_start_day: 1        # Day of the month when billing period starts (1-31)
+  month_start_hour: 0       # Hour of the day when billing period starts (0-23)
   limits:
     openrouter:
       daily_cost_usd: 10.0
@@ -86,5 +88,17 @@ vision_provider: llamacpp # ej. openrouter
 vision_model: ggml-org/gemma-4-E4B-it-GGUF:Q8_0 # ej. nvidia/nemotron-nano-12b-v2-vl:free
 
 mcp_servers: {}
+
+# Session persistence and compaction settings
+sessions:
+  persist: true
+  compaction:
+    enabled: true
+    context_window: 128000
+    trigger_at_percent: 0.80
+    tool_output_max_chars: 2000
+    keep_last_n_user_turns: 2
+    summary_max_percent: 0.05
+    archive_dir: ~/.eyetor/sessions/archive
 
 log_level: INFO

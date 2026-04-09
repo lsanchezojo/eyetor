@@ -90,10 +90,13 @@ class TelegramChannel(BaseChannel):
 
         bot_token = self._config.bot_token
         if not bot_token:
-            raise ValueError("Telegram bot_token is not configured. Set TELEGRAM_BOT_TOKEN env var.")
+            raise ValueError(
+                "Telegram bot_token is not configured. Set TELEGRAM_BOT_TOKEN env var."
+            )
 
         if not self._config.ssl_verify:
             import ssl
+
             ssl._create_default_https_context = ssl._create_unverified_context
 
         bot = Bot(token=bot_token)
@@ -110,9 +113,8 @@ class TelegramChannel(BaseChannel):
             user = msg.from_user
             if not user:
                 return False
-            return (
-                str(user.id) in allowed_users
-                or (user.username and user.username in allowed_users)
+            return str(user.id) in allowed_users or (
+                user.username and user.username in allowed_users
             )
 
         @dp.message(Command("start"))
@@ -177,7 +179,9 @@ class TelegramChannel(BaseChannel):
                 current = session.provider
                 current_model = getattr(current, "model", "?")
                 prov_name = getattr(current, "_provider_name", None) or "?"
-                lines = [f"<b>Proveedor actual:</b> <code>{prov_name}</code> (modelo: {current_model})\n"]
+                lines = [
+                    f"<b>Proveedor actual:</b> <code>{prov_name}</code> (modelo: {current_model})\n"
+                ]
                 lines.append("<b>Proveedores disponibles:</b>")
                 for name, model in providers.items():
                     lines.append(f"  <code>{name}</code> — {model}")
@@ -340,6 +344,7 @@ class TelegramChannel(BaseChannel):
                 images_dir = Path.home() / ".eyetor" / "images"
                 images_dir.mkdir(parents=True, exist_ok=True)
                 import time as _time
+
                 img_path = images_dir / f"{msg.chat.id}_{int(_time.time())}.jpg"
                 img_path.write_bytes(img_bytes)
 
@@ -347,7 +352,8 @@ class TelegramChannel(BaseChannel):
 
                 # Step 1: Send image to the vision provider to get a description
                 description = await _describe_image(
-                    img_b64, caption,
+                    img_b64,
+                    caption,
                     base_url=self._vision_base_url,
                     api_key=self._vision_api_key,
                     model=self._vision_model,
@@ -412,7 +418,9 @@ class TelegramChannel(BaseChannel):
             session_id = f"telegram-{msg.chat.id}"
             session = self._manager.get_or_create(session_id)
 
-            placeholder = await msg.answer(f"🎤 <i>{_escape_html(transcription)}</i>\n\n...", parse_mode="HTML")
+            placeholder = await msg.answer(
+                f"🎤 <i>{_escape_html(transcription)}</i>\n\n...", parse_mode="HTML"
+            )
             buffer = ""
             last_edit = ""
             try:
@@ -477,8 +485,12 @@ async def _describe_image(
     """
     import httpx
 
-    base_url = (base_url or os.environ.get("VISION_BASE_URL", "http://localhost:8080/v1")).rstrip("/")
-    api_key = (api_key if api_key is not None else os.environ.get("VISION_API_KEY", "")).strip()
+    base_url = (
+        base_url or os.environ.get("VISION_BASE_URL", "http://localhost:8080/v1")
+    ).rstrip("/")
+    api_key = (
+        api_key if api_key is not None else os.environ.get("VISION_API_KEY", "")
+    ).strip()
     model = model or os.environ.get("VISION_MODEL", "default")
 
     if caption.strip():
@@ -527,7 +539,9 @@ async def _describe_image(
     }
 
     async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
-        resp = await client.post(f"{base_url}/chat/completions", json=payload, headers=headers)
+        resp = await client.post(
+            f"{base_url}/chat/completions", json=payload, headers=headers
+        )
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"]
@@ -568,7 +582,9 @@ async def _transcribe_voice(bot, msg) -> str | None:
         openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
 
         if whisper_url or openai_key:
-            return await _transcribe_via_api(tmp_path, whisper_url or None, openai_key or None, suffix)
+            return await _transcribe_via_api(
+                tmp_path, whisper_url or None, openai_key or None, suffix
+            )
 
         return await _transcribe_local(msg, tmp_path)
 
@@ -584,10 +600,17 @@ async def _transcribe_voice(bot, msg) -> str | None:
                 pass
 
 
-async def _transcribe_via_api(path: str, base_url: str | None, api_key: str | None, suffix: str) -> str:
+async def _transcribe_via_api(
+    path: str, base_url: str | None, api_key: str | None, suffix: str
+) -> str:
     """Transcribe using an OpenAI-compatible /v1/audio/transcriptions endpoint."""
     import httpx
-    url = f"{base_url.rstrip('/')}/v1/audio/transcriptions" if base_url else "https://api.openai.com/v1/audio/transcriptions"
+
+    url = (
+        f"{base_url.rstrip('/')}/v1/audio/transcriptions"
+        if base_url
+        else "https://api.openai.com/v1/audio/transcriptions"
+    )
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -682,7 +705,9 @@ async def _safe_edit_or_send(msg, placeholder, html: str, plain: str) -> None:
         except TelegramBadRequest as exc:
             if _not_modified(exc):
                 return  # Same content already on screen — nothing to do.
-            logger.warning("Telegram HTML parse failed, retrying as plain text: %s", exc)
+            logger.warning(
+                "Telegram HTML parse failed, retrying as plain text: %s", exc
+            )
         except Exception as exc:
             logger.warning("edit_text failed, retrying as plain text: %s", exc)
     else:
@@ -748,7 +773,11 @@ def _collect_image_paths(buffer: str, session) -> list[str]:
         if msg.role == "tool" and msg.content:
             try:
                 data = json.loads(msg.content)
-                if isinstance(data, dict) and data.get("status") == "ok" and "image_path" in data:
+                if (
+                    isinstance(data, dict)
+                    and data.get("status") == "ok"
+                    and "image_path" in data
+                ):
                     paths.add(data["image_path"])
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -790,7 +819,7 @@ def _md_to_html(text: str) -> str:
     segments = []
     last = 0
     for m in code_block_re.finditer(text):
-        segments.append(("text", text[last:m.start()]))
+        segments.append(("text", text[last : m.start()]))
         lang = m.group(1).strip()
         code = _escape_html(m.group(2).strip())
         tag = f'<code class="language-{lang}">' if lang else "<code>"
@@ -858,7 +887,12 @@ def _inline_md_to_html(text: str) -> str:
 
     # Step 3: neutralise backslash-escaped markdown specials (\_ \* \` \~)
     # so they are not interpreted as emphasis markers.
-    escape_map = {"_": "\x00U\x00", "*": "\x00A\x00", "`": "\x00B\x00", "~": "\x00T\x00"}
+    escape_map = {
+        "_": "\x00U\x00",
+        "*": "\x00A\x00",
+        "`": "\x00B\x00",
+        "~": "\x00T\x00",
+    }
     text = re.sub(r"\\([_*`~])", lambda m: escape_map[m.group(1)], text)
 
     # Step 4: emphasis / headers / lists.
@@ -919,7 +953,6 @@ def _format_tasks_text(scheduler) -> str:
     return "\n\n".join(lines)
 
 
-
 _LOCAL_PROVIDERS = {"ollama", "llamacpp", "local"}
 _CLOUD_PROVIDERS = {"openrouter", "anthropic", "google", "openai", "azure"}
 
@@ -949,8 +982,20 @@ def _format_usage_text(tracker, session_id: str | None = None) -> str:
     now = datetime.now()
     utc_offset = now - datetime.utcnow()  # for converting stored UTC → local
     day_names = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
-    month_names = ["ene", "feb", "mar", "abr", "may", "jun",
-                   "jul", "ago", "sep", "oct", "nov", "dic"]
+    month_names = [
+        "ene",
+        "feb",
+        "mar",
+        "abr",
+        "may",
+        "jun",
+        "jul",
+        "ago",
+        "sep",
+        "oct",
+        "nov",
+        "dic",
+    ]
     day_label = f"{day_names[now.weekday()]} {now.day} {month_names[now.month - 1]}"
 
     lines: list[str] = [f"<b>📊 Uso — {day_label}</b>"]
@@ -987,15 +1032,17 @@ def _format_usage_text(tracker, session_id: str | None = None) -> str:
     for (provider, model), calls in groups.items():
         emoji = _provider_emoji(provider)
         model_label = _escape_html(_model_short(model))
-        shown = calls[:_MAX_CALLS_SHOWN]
-        hidden = len(calls) - len(shown)
+        shown = list(reversed(calls[-_MAX_CALLS_SHOWN:]))
+        hidden = len(calls) - _MAX_CALLS_SHOWN
         label_extra = f" (últimas {_MAX_CALLS_SHOWN})" if hidden > 0 else ""
         lines.append(f"\n{emoji} <b>{model_label}</b>{label_extra}")
 
         for r in shown:
             ts_local = datetime.fromisoformat(r.timestamp) + utc_offset
             hhmm = ts_local.strftime("%H:%M")
-            tok = f"{_fmt_num(r.prompt_tokens)} → {_fmt_num(r.completion_tokens)} tokens"
+            tok = (
+                f"{_fmt_num(r.prompt_tokens)} → {_fmt_num(r.completion_tokens)} tokens"
+            )
             cost = f"${r.estimated_cost:.4f}" if r.estimated_cost > 0 else "$0"
             speed = f"{r.speed_tps:.1f} tps".replace(".", ",") if r.speed_tps else "—"
             finish = r.finish_reason or "—"
@@ -1014,18 +1061,28 @@ def _format_usage_text(tracker, session_id: str | None = None) -> str:
         tool = sum(1 for r in recs if r.finish_reason == "tool_calls")
         return prompt, completion, len(recs), tool, cost
 
-    day_prompt, day_comp, day_calls, day_tool, day_cost = _totals_from_records(day_records)
-    week_prompt, week_comp, week_calls, week_tool, week_cost = _totals_from_records(week_records)
+    day_prompt, day_comp, day_calls, day_tool, day_cost = _totals_from_records(
+        day_records
+    )
+    week_prompt, week_comp, week_calls, week_tool, week_cost = _totals_from_records(
+        week_records
+    )
 
-    def _footer_line(label: str, prompt: int, comp: int, calls: int, tool: int, cost: float) -> str:
+    def _footer_line(
+        label: str, prompt: int, comp: int, calls: int, tool: int, cost: float
+    ) -> str:
         tok_part = f"{_fmt_num(prompt)} → {_fmt_num(comp)} tokens"
         calls_part = f"{calls} llamadas ({tool} tool_call)"
         cost_part = f"${cost:.4f}" if cost > 0 else "$0"
         return f"{label}   {tok_part} · {calls_part} · {cost_part}"
 
     lines.append("\n──────────────")
-    lines.append(_footer_line("Hoy   ", day_prompt, day_comp, day_calls, day_tool, day_cost))
-    lines.append(_footer_line("Semana", week_prompt, week_comp, week_calls, week_tool, week_cost))
+    lines.append(
+        _footer_line("Hoy   ", day_prompt, day_comp, day_calls, day_tool, day_cost)
+    )
+    lines.append(
+        _footer_line("Semana", week_prompt, week_comp, week_calls, week_tool, week_cost)
+    )
 
     # Media/día (semana)
     week_days = 7
@@ -1035,7 +1092,9 @@ def _format_usage_text(tracker, session_id: str | None = None) -> str:
         avg_calls = week_calls // week_days
         avg_tool = week_tool // week_days
         avg_cost = week_cost / week_days
-        lines.append(_footer_line("Media ", avg_prompt, avg_comp, avg_calls, avg_tool, avg_cost))
+        lines.append(
+            _footer_line("Media ", avg_prompt, avg_comp, avg_calls, avg_tool, avg_cost)
+        )
 
     return "\n".join(lines)
 

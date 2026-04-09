@@ -8,6 +8,8 @@ from typing import AsyncIterator
 
 import httpx
 
+from eyetor.models.messages import TokenUsage
+
 logger = logging.getLogger(__name__)
 
 
@@ -73,3 +75,19 @@ def extract_delta_tool_calls(chunk: dict) -> list[dict]:
         return delta.get("tool_calls") or []
     except (KeyError, IndexError, TypeError):
         return []
+
+
+def extract_usage(chunk: dict) -> TokenUsage | None:
+    """Extract usage data from an SSE chunk (last chunk has usage in streaming).
+
+    OpenRouter and other providers include usage in the final SSE chunk.
+    """
+    raw = chunk.get("usage")
+    if not raw:
+        return None
+    return TokenUsage(
+        prompt_tokens=raw.get("prompt_tokens", 0),
+        completion_tokens=raw.get("completion_tokens", 0),
+        total_tokens=raw.get("total_tokens", 0),
+        cost=raw.get("cost", 0.0),
+    )

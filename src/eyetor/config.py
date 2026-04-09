@@ -34,6 +34,8 @@ class TrackingConfig(BaseModel):
 
     db_path: str = "~/.eyetor/tracking.db"
     limits: dict[str, TrackingLimits] = {}
+    month_start_day: int = 1
+    month_start_hour: int = 0
 
 
 class TelegramAuthConfig(BaseModel):
@@ -98,12 +100,27 @@ class FallbackConfig(BaseModel):
     retry_on: list[str] = ["timeout", "connection_error", "500", "502", "503", "529"]
 
 
+class CompactionConfig(BaseModel):
+    """Configuration for conversation compaction."""
+
+    enabled: bool = False
+    context_window: int = 128_000
+    trigger_at_percent: float = 0.80
+    tool_output_max_chars: int = 2000
+    keep_last_n_user_turns: int = 2
+    summary_max_percent: float = 0.05  # 5% of context_window (≈16k chars for 128k)
+    archive_dir: str | None = None
+    summary_model: str | None = None
+    summary_provider: str | None = None
+
+
 class SessionsConfig(BaseModel):
     """Configuration for session persistence."""
 
     persist: bool = False
     dir: str = "~/.eyetor/sessions"
     max_messages: int = 200
+    compaction: CompactionConfig = CompactionConfig()
 
 
 class SchedulerConfig(BaseModel):
@@ -152,8 +169,12 @@ class VectorConfig(BaseModel):
     mcp_servers: dict[str, McpServerConfig] = {}
     image_providers: dict[str, ImageProviderConfig] = {}
     default_image_provider: str | None = None
-    vision_provider: str | None = None  # provider name (from providers:) used for image description
-    vision_model: str | None = None     # model override; uses provider's default model if None
+    vision_provider: str | None = (
+        None  # provider name (from providers:) used for image description
+    )
+    vision_model: str | None = (
+        None  # model override; uses provider's default model if None
+    )
     log_level: str = "INFO"
 
 
@@ -163,9 +184,7 @@ _ENV_VAR_PATTERN = re.compile(r"\$\{(\w+)\}")
 def _resolve_env_vars(value: Any) -> Any:
     """Recursively resolve ${ENV_VAR} patterns in config values."""
     if isinstance(value, str):
-        return _ENV_VAR_PATTERN.sub(
-            lambda m: os.environ.get(m.group(1), ""), value
-        )
+        return _ENV_VAR_PATTERN.sub(lambda m: os.environ.get(m.group(1), ""), value)
     if isinstance(value, dict):
         return {k: _resolve_env_vars(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -202,10 +221,12 @@ def load_config(path: Path | None = None) -> VectorConfig:
     search_paths = []
     if path:
         search_paths.append(path)
-    search_paths.extend([
-        Path("config/default.yaml"),
-        Path.home() / ".eyetor" / "config.yaml",
-    ])
+    search_paths.extend(
+        [
+            Path("config/default.yaml"),
+            Path.home() / ".eyetor" / "config.yaml",
+        ]
+    )
 
     for config_path in search_paths:
         if config_path.exists():

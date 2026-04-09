@@ -5,9 +5,7 @@ from __future__ import annotations
 import logging
 from typing import AsyncIterator
 
-import httpx
-
-from eyetor.models.messages import CompletionResult, Message
+from eyetor.models.messages import CompletionResult, Message, StreamingResponse
 from eyetor.models.tools import ToolDefinition
 from eyetor.providers.base import BaseProvider
 from eyetor.providers.openrouter import _parse_completion_response
@@ -38,7 +36,9 @@ class LlamaCppProvider(BaseProvider):
             if response.status_code >= 400:
                 body = response.text[:500]
                 logger.error(
-                    "llama.cpp %d error: %s", response.status_code, body,
+                    "llama.cpp %d error: %s",
+                    response.status_code,
+                    body,
                 )
             response.raise_for_status()
             data = response.json()
@@ -49,17 +49,21 @@ class LlamaCppProvider(BaseProvider):
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
-    ) -> AsyncIterator[str]:
+    ) -> StreamingResponse:
         payload = self._build_payload(messages, tools, temperature, stream=True)
-        async with self._client(timeout=300.0) as client:
-            async with client.stream(
-                "POST",
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers=self._build_headers(),
-            ) as response:
-                response.raise_for_status()
-                async for chunk in parse_sse(response):
-                    text = extract_delta_content(chunk)
-                    if text:
-                        yield text
+
+        async def _stream_tokens() -> AsyncIterator[str]:
+            async with self._client(timeout=300.0) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers=self._build_headers(),
+                ) as response:
+                    response.raise_for_status()
+                    async for chunk in parse_sse(response):
+                        text = extract_delta_content(chunk)
+                        if text:
+                            yield text
+
+        return StreamingResponse(_stream_tokens(), None)

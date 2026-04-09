@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import logging
-from typing import AsyncIterator
 
 import httpx
 
-from eyetor.models.messages import CompletionResult, Message
+from eyetor.models.messages import CompletionResult, Message, StreamingResponse
 from eyetor.models.tools import ToolDefinition
 from eyetor.providers.base import BaseProvider
 
@@ -32,14 +31,19 @@ class FallbackProvider(BaseProvider):
         retry_on: set[str] | None = None,
     ) -> None:
         first = providers[0]
-        super().__init__(base_url=first.base_url, model=first.model, api_key=first.api_key)
+        super().__init__(
+            base_url=first.base_url, model=first.model, api_key=first.api_key
+        )
         self._providers = providers
         self._retry_on = retry_on or (_RETRYABLE_ERRORS | _RETRYABLE_STATUS)
 
     def _should_retry(self, exc: Exception) -> bool:
         if isinstance(exc, httpx.TimeoutException) and "timeout" in self._retry_on:
             return True
-        if isinstance(exc, (httpx.ConnectError, httpx.RemoteProtocolError)) and "connection_error" in self._retry_on:
+        if (
+            isinstance(exc, (httpx.ConnectError, httpx.RemoteProtocolError))
+            and "connection_error" in self._retry_on
+        ):
             return True
         if isinstance(exc, httpx.HTTPStatusError):
             return str(exc.response.status_code) in self._retry_on
@@ -72,13 +76,11 @@ class FallbackProvider(BaseProvider):
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
-    ) -> AsyncIterator[str]:
+    ) -> StreamingResponse:
         last_exc: Exception | None = None
         for provider in self._providers:
             try:
-                async for token in provider.stream(messages, tools, temperature):
-                    yield token
-                return
+                return await provider.stream(messages, tools, temperature)
             except Exception as exc:
                 if self._should_retry(exc):
                     logger.warning(

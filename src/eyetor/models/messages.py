@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Literal
 
 from pydantic import BaseModel
 
@@ -51,6 +51,30 @@ class TokenUsage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    cost: float = 0.0
+
+
+@dataclass
+class StreamingResponse:
+    """Wrapper around an async text stream with attached usage metadata.
+
+    Allows callers to consume tokens via `async for` while also accessing
+    usage data after the stream is exhausted via the `.usage` property.
+    """
+
+    _iterator: AsyncIterator[str] = field(repr=False)
+    _usage: TokenUsage | None = None
+
+    def __aiter__(self) -> AsyncIterator[str]:
+        return self
+
+    async def __anext__(self) -> str:
+        return await self._iterator.__anext__()
+
+    @property
+    def usage(self) -> TokenUsage | None:
+        """Usage metadata extracted from the final SSE chunk (if available)."""
+        return self._usage
 
 
 @dataclass

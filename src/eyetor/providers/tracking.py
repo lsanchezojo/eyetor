@@ -7,7 +7,7 @@ import logging
 import time
 from typing import AsyncIterator
 
-from eyetor.models.messages import CompletionResult, Message
+from eyetor.models.messages import CompletionResult, Message, StreamingResponse
 from eyetor.models.tools import ToolDefinition
 from eyetor.providers.base import BaseProvider
 
@@ -71,7 +71,9 @@ class TrackingProvider(BaseProvider):
         speed_tps = completion_tokens / duration_s if duration_s > 0 else 0.0
 
         cost = 0.0
-        if self._cost_estimator:
+        if result.usage and result.usage.cost > 0:
+            cost = result.usage.cost
+        elif self._cost_estimator:
             cost = self._cost_estimator.estimate(
                 result.model or self._inner.model,
                 prompt_tokens,
@@ -98,13 +100,58 @@ class TrackingProvider(BaseProvider):
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
-    ) -> AsyncIterator[str]:
+    ) -> StreamingResponse:
         if not self._tracker.check_limits(self._provider_name):
             raise UsageLimitExceeded(
                 f"Daily usage limit reached for provider '{self._provider_name}'."
             )
-        async for token in self._inner.stream(messages, tools, temperature):
-            yield token
+
+        t0 = time.monotonic()
+        resp = await self._inner.stream(messages, tools, temperature)
+        tokens: list[str] = []
+        recorded = False
+
+        async def _stream_and_track() -> AsyncIterator[str]:
+            nonlocal recorded
+            try:
+                async for token in resp:
+                    tokens.append(token)
+                    yield token
+            finally:
+                if not recorded:
+                    recorded = True
+                    duration_s = time.monotonic() - t0
+                    duration_ms = int(duration_s * 1000)
+                    prompt_tokens = resp.usage.prompt_tokens if resp.usage else 0
+                    completion_tokens = len("".join(tokens))
+                    speed_tps = (
+                        completion_tokens / duration_s if duration_s > 0 else 0.0
+                    )
+
+                    cost = 0.0
+                    if resp.usage and resp.usage.cost > 0:
+                        cost = resp.usage.cost
+                    elif self._cost_estimator:
+                        cost = self._cost_estimator.estimate(
+                            self._inner.model,
+                            prompt_tokens,
+                            completion_tokens,
+                            provider=self._provider_name,
+                        )
+
+                    self._tracker.record(
+                        session_id=current_session_id.get(),
+                        provider=self._provider_name,
+                        model=self._inner.model,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        estimated_cost=cost,
+                        duration_ms=duration_ms,
+                        speed_tps=round(speed_tps, 1),
+                        finish_reason="",
+                    )
+
+        return StreamingResponse(_stream_and_track(), resp.usage)
 
     def __repr__(self) -> str:
         return f"TrackingProvider({self._inner!r})"

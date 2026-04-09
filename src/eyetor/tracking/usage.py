@@ -83,14 +83,35 @@ class UsageTracker:
             return False
         return True
 
-    def get_recent(self, limit: int = 10, provider: str | None = None) -> list[UsageRecord]:
+    def get_recent(
+        self, limit: int = 10, provider: str | None = None
+    ) -> list[UsageRecord]:
         """Return the most recent individual usage records."""
         return self._store.get_recent(limit=limit, provider=provider)
 
-    def get_summary(self, period: str = "day", provider: str | None = None) -> list[UsageSummary]:
+    def get_summary(
+        self, period: str = "day", provider: str | None = None
+    ) -> list[UsageSummary]:
         """Return aggregated usage summaries."""
-        return self._store.get_summary(period=period, provider=provider)
+        return self._store.get_summary(
+            period=period,
+            provider=provider,
+            month_start_day=self._config.month_start_day,
+            month_start_hour=self._config.month_start_hour,
+        )
 
-    def get_records(self, period: str = "day", provider: str | None = None) -> list[UsageRecord]:
+    def get_records(
+        self, period: str = "day", provider: str | None = None
+    ) -> list[UsageRecord]:
         """Return individual usage records for the given period."""
-        return self._store.get_records(period=period, provider=provider)
+        return self._store.get_records(
+            period=period,
+            provider=provider,
+            month_start_day=self._config.month_start_day,
+            month_start_hour=self._config.month_start_hour,
+        )
+
+    def clear_session(self, session_id: str) -> None:
+        """Clear all tracking data for a session (called on /reset)."""
+        deleted = self._store.delete_session(session_id)
+        logger.debug("Cleared %d usage records for session '%s'", deleted, session_id)

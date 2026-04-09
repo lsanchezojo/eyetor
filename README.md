@@ -10,12 +10,35 @@ Multi-agent AI system based on Anthropic's agent patterns. Runs as a background 
 ## Installation
 
 ```bash
+# Clone and enter the repo
 git clone <repo>
 cd eyetor
 
-# With Telegram support
+# Copy and configure environment
+cp .env.example .env
+
+# Install core dependencies + Telegram support
 pip install -e ".[telegram]"
 ```
+
+**Dependencies:**
+- Core: `httpx`, `pyyaml`, `pydantic`, `rich`, `click`, `apscheduler`
+- Optional (telegram): `aiogram`
+
+## Development
+
+After modifying source code in `src/eyetor/`, reinstall to apply changes:
+
+```bash
+pip install -e .
+```
+
+The `-e` flag (editable mode) means changes to the source are reflected immediately without reinstall — useful during development.
+
+Reinstall when:
+- You create new modules
+- You change module structure
+- You pull updates via git
 
 ## Configuration
 
@@ -238,6 +261,33 @@ sessions:
 
 Each session is stored as `<session_id>.jsonl` with one JSON message per line. History is loaded automatically when a session resumes and rotated when it exceeds `max_messages`.
 
+## Conversation compaction
+
+When using session persistence with long conversations, the context window can fill up. Eyetor supports **two-phase compaction** to summarize old messages:
+
+```yaml
+sessions:
+  persist: true
+  compaction:
+    enabled: true
+    context_window: 128000      # tokens in your model's context window
+    trigger_at_percent: 0.80   # trigger at 80% of context (102.4K tokens)
+    tool_output_max_chars: 2000  # Phase 1: truncate long tool outputs
+    keep_last_n_user_turns: 2    # Preserve last N user turns verbatim
+    summary_max_percent: 0.05   # Max summary = 5% of context (≈16k chars)
+    archive_dir: ~/.eyetor/sessions/archive  # optional: save pre-compacted history
+```
+
+### How it works
+
+1. **Phase 1 (cheap)**: Truncate tool outputs exceeding `tool_output_max_chars`
+2. **Phase 2 (LLM)**: If still over threshold, summarize old messages via LLM
+3. **Verbatim tail**: Last `keep_last_n_user_turns` are always kept intact
+
+The summary uses a structured prompt that preserves file paths, commands, errors, and exact values.
+
+**Note**: Compaction calls use `provider._inner` to bypass usage tracking (they don't count against daily limits).
+
 ## Plugins
 
 Plugins extend Eyetor's behavior via subprocess hooks that run before/after tool executions. Plugins live in directories listed under `plugins_dirs` (default: `./plugins`, `~/.eyetor/plugins`).
@@ -376,7 +426,11 @@ Requires a Google Cloud project with the Calendar, Gmail, and Tasks APIs enabled
 
 ## Usage tracking
 
-Every LLM call is automatically tracked in SQLite (`~/.eyetor/tracking.db`). Recorded fields per call: timestamp, provider, model, prompt/completion tokens, estimated cost, speed (tokens/second), finish reason, and session ID.
+Every LLM call is automatically tracked in SQLite (`~/.eyetor/tracking.db`). Recorded fields per call: timestamp, provider, model, prompt/completion tokens, cost, speed (tokens/second), finish reason, and session ID.
+
+### Real cost from OpenRouter
+
+When using OpenRouter, the agent records the **actual cost** reported by the API in each response (`usage.cost`). This is more accurate than the estimated pricing table. For providers that don't report costs (ollama, llamacpp), the built-in pricing table is used as a fallback.
 
 ### Viewing usage
 
@@ -398,14 +452,25 @@ eyetor usage --detail -n 50
 
 Set per-provider limits in `config/default.yaml`. Requests are blocked when a limit is reached, and the fallback chain tries the next available provider.
 
+### Billing period
+
+By default, the month period starts on day 1 at midnight. You can customize this to align with your billing cycle:
+
 ```yaml
 tracking:
   db_path: ~/.eyetor/tracking.db
+  month_start_day: 15    # Billing period starts on the 15th
+  month_start_hour: 9    # at 9:00 AM
   limits:
     openrouter:
       daily_cost_usd: 10.0
       daily_tokens: 1000000
 ```
+
+Period definitions:
+- **day**: start of today (midnight)
+- **week**: start of current week (Monday midnight)
+- **month**: configurable (default: day 1 at midnight)
 
 ### Cost estimation
 

@@ -119,29 +119,69 @@ class TrackingStore:
         )
         self._conn.commit()
 
-    @staticmethod
-    def _period_since(period: str) -> str:
+    def _period_since(
+        self,
+        period: str,
+        month_start_day: int = 1,
+        month_start_hour: int = 0,
+    ) -> str:
         """Return UTC ISO timestamp for the start of the given period.
 
         "day"   → start of today in local time (midnight local → UTC)
-        "week"  → 7 days ago (UTC)
-        "month" → 30 days ago (UTC)
+        "week"  → start of current week (Monday, midnight local → UTC)
+        "month" → start of current month (day X at hour Y, local → UTC)
         """
+        now_local = datetime.now()
+        utc_offset = now_local - datetime.utcnow()
+
         if period == "day":
-            now_local = datetime.now()
-            midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-            utc_offset = now_local - datetime.utcnow()
+            midnight_local = now_local.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
             return (midnight_local - utc_offset).isoformat()
-        delta = {"week": 7, "month": 30}.get(period, 7)
-        return (datetime.utcnow() - timedelta(days=delta)).isoformat()
+        if period == "week":
+            days_since_monday = now_local.weekday()
+            start_of_week_local = now_local.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ) - timedelta(days=days_since_monday)
+            return (start_of_week_local - utc_offset).isoformat()
+        if period == "month":
+            current_day = now_local.day
+            if current_day >= month_start_day:
+                start_of_month_local = now_local.replace(
+                    day=month_start_day,
+                    hour=month_start_hour,
+                    minute=0,
+                    second=0,
+                    microsecond=0,
+                )
+            else:
+                prev_month = now_local.month - 1 if now_local.month > 1 else 12
+                prev_year = (
+                    now_local.year if now_local.month > 1 else now_local.year - 1
+                )
+                last_day_prev_month = (
+                    (datetime(prev_year, prev_month + 1, 1) - timedelta(days=1)).day
+                    if prev_month < 12
+                    else 31
+                )
+                day = min(month_start_day, last_day_prev_month)
+                start_of_month_local = datetime(
+                    prev_year, prev_month, day, month_start_hour, 0, 0
+                )
+            return (start_of_month_local - utc_offset).isoformat()
+
+        return (datetime.utcnow() - timedelta(days=7)).isoformat()
 
     def get_summary(
         self,
         period: str = "day",
         provider: str | None = None,
+        month_start_day: int = 1,
+        month_start_hour: int = 0,
     ) -> list[UsageSummary]:
         """Aggregate usage by provider+model for the given period."""
-        since = self._period_since(period)
+        since = self._period_since(period, month_start_day, month_start_hour)
         params: list = [since]
         where_provider = ""
         if provider:
@@ -182,9 +222,11 @@ class TrackingStore:
         self,
         period: str = "day",
         provider: str | None = None,
+        month_start_day: int = 1,
+        month_start_hour: int = 0,
     ) -> list[UsageRecord]:
         """Return individual usage records for the given period, newest first."""
-        since = self._period_since(period)
+        since = self._period_since(period, month_start_day, month_start_hour)
         params: list = [since]
         where_provider = ""
         if provider:
@@ -273,6 +315,15 @@ class TrackingStore:
             "total_tokens": row["total_tokens"] or 0,
             "total_cost": row["total_cost"] or 0.0,
         }
+
+    def delete_session(self, session_id: str) -> int:
+        """Delete all usage records for a session. Returns count deleted."""
+        cursor = self._conn.execute(
+            "DELETE FROM usage WHERE session_id = ?",
+            (session_id,),
+        )
+        self._conn.commit()
+        return cursor.rowcount
 
     def close(self) -> None:
         self._conn.close()

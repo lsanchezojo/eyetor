@@ -77,6 +77,8 @@ class SessionManager:
         """Reset the history of an existing session (or create empty one)."""
         session = self.get_or_create(session_id)
         session.reset()
+        if self._tracker:
+            self._tracker.clear_session(session_id)
 
     def list_sessions(self) -> list[str]:
         """Return all active session IDs."""
