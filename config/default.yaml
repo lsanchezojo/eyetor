@@ -6,7 +6,7 @@ providers:
     ssl_verify: false
     base_url: https://openrouter.ai/api/v1
     api_key: ${OPENROUTER_API_KEY}
-    model: stepfun/step-3.5-flash:free
+    model: stepfun/step-3.5-flash
 
   ollama:
     type: ollama

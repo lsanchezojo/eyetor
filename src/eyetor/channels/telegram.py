@@ -1093,7 +1093,9 @@ def _format_usage_text(tracker, session_id: str | None = None) -> str:
         avg_tool = week_tool // week_days
         avg_cost = week_cost / week_days
         lines.append(
-            _footer_line("Media ", avg_prompt, avg_comp, avg_calls, avg_tool, avg_cost)
+            _footer_line(
+                "Promedio diario ", avg_prompt, avg_comp, avg_calls, avg_tool, avg_cost
+            )
         )
 
     return "\n".join(lines)

@@ -32,15 +32,25 @@ logger = logging.getLogger(__name__)
 # to nudge it once before accepting the text as the final answer.
 _TOOL_INTENT_RE = re.compile(
     r"(voy a (intent\w*|llamar|ejecutar|probar|reintent\w*|usar|lanzar)"
+    r"|procedo a (ejecutar|llamar|usar|lanzar|invocar|probar)"
+    r"|paso a (ejecutar|llamar|usar|lanzar|invocar|probar)"
+    r"|(ejecutar|llamar|usar|lanzar|invocar)(é| ahora| la herramienta)"
     r"|intentar(é| de nuevo| otra vez| nuevamente)"
     r"|reintent\w+"
     r"|probar(é)? (de nuevo|otra vez)"
-    r"|let me (try|call|retry|invoke|use)"
-    r"|i'?ll (try|call|retry|invoke|use)"
-    r"|i will (try|retry|call|invoke)"
-    r"|retrying|trying again)",
+    r"|let me (try|call|retry|invoke|use|run|execute)"
+    r"|i'?ll (try|call|retry|invoke|use|run|execute)"
+    r"|i will (try|retry|call|invoke|run|execute)"
+    r"|retrying|trying again"
+    r"|now (i'?ll|let me|i will) (call|use|run|execute|invoke))",
     re.IGNORECASE,
 )
+
+
+def _mentions_tool_name(text: str, tool_defs: list) -> bool:
+    """Check if the text mentions any available tool name."""
+    text_lower = text.lower()
+    return any(td.name.lower() in text_lower for td in tool_defs)
 
 
 def _truncate(s: str, max_len: int) -> str:
@@ -264,7 +274,10 @@ class ChatSession:
                     not nudged
                     and content
                     and tool_defs
-                    and _TOOL_INTENT_RE.search(content)
+                    and (
+                        _TOOL_INTENT_RE.search(content)
+                        or _mentions_tool_name(content, tool_defs)
+                    )
                 ):
                     nudged = True
                     logger.info(

@@ -15,15 +15,27 @@ from rich.table import Table
 console = Console()
 
 
-def _setup_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
+def _setup_logging(level: str, *, interactive: bool = False) -> None:
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    if interactive:
+        # In interactive CLI mode, suppress INFO logs to avoid polluting the
+        # Rich console.  Only WARNING+ go to stderr.
+        log_level = max(log_level, logging.WARNING)
+
+    root = logging.getLogger()
+    root.setLevel(log_level)
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+        root.addHandler(handler)
+    else:
+        for h in root.handlers:
+            h.setLevel(log_level)
 
 
 def _load_cfg(config_path: str | None):
     from eyetor.config import load_config
+
     path = Path(config_path) if config_path else None
     return load_config(path)
 
@@ -31,6 +43,7 @@ def _load_cfg(config_path: str | None):
 # ---------------------------------------------------------------------------
 # Root group
 # ---------------------------------------------------------------------------
+
 
 @click.group()
 @click.option("--config", "-c", default=None, help="Path to config YAML file.")
@@ -50,22 +63,35 @@ def cli(ctx: click.Context, config: str | None, log_level: str | None) -> None:
 # eyetor start  (unified entry point)
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
-@click.option("--provider", "-p", default=None, help="Provider name (default from config).")
+@click.option(
+    "--provider", "-p", default=None, help="Provider name (default from config)."
+)
 @click.option("--model", "-m", default=None, help="Model override.")
 @click.option(
-    "--host-tools/--no-host-tools", default=None,
-    help="Enable/disable host skills (shell, filesystem, browser). Default from config."
+    "--host-tools/--no-host-tools",
+    default=None,
+    help="Enable/disable host skills (shell, filesystem, browser). Default from config.",
 )
 @click.pass_context
-def start(ctx: click.Context, provider: str | None, model: str | None, host_tools: bool | None) -> None:
+def start(
+    ctx: click.Context, provider: str | None, model: str | None, host_tools: bool | None
+) -> None:
     """Start the agent — launches all configured channels (CLI and/or Telegram)."""
     import sys
+
     cfg = ctx.obj["cfg"]
 
     # --host-tools flag overrides config; config default is True
-    use_host_tools = host_tools if host_tools is not None else cfg.channels.cli.host_tools
+    use_host_tools = (
+        host_tools if host_tools is not None else cfg.channels.cli.host_tools
+    )
     interactive = sys.stdin.isatty()
+
+    if interactive:
+        # Reconfigure logging: suppress INFO noise in interactive CLI mode
+        _setup_logging(cfg.log_level, interactive=True)
 
     async def _run():
         from eyetor.providers import get_provider
@@ -80,10 +106,12 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
 
         tracker = UsageTracker.from_config(cfg.tracking)
         cost_estimator = CostEstimator()
-        prov = get_provider(cfg, provider, tracker=tracker, cost_estimator=cost_estimator)
+        prov = get_provider(
+            cfg, provider, tracker=tracker, cost_estimator=cost_estimator
+        )
         if model:
             prov.model = model
-            if hasattr(prov, '_inner'):
+            if hasattr(prov, "_inner"):
                 prov._inner.model = model
 
         memory = MemoryManager.from_path(cfg.memory_db_path)
@@ -117,13 +145,18 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
         if instructions_path.exists():
             instructions_text = instructions_path.read_text(encoding="utf-8").strip()
             if instructions_text:
-                base_system = f"{base_system}\n\n## Agent Instructions\n\n{instructions_text}"
-                logging.getLogger(__name__).info("Loaded agent instructions from %s", instructions_path)
+                base_system = (
+                    f"{base_system}\n\n## Agent Instructions\n\n{instructions_text}"
+                )
+                logging.getLogger(__name__).info(
+                    "Loaded agent instructions from %s", instructions_path
+                )
 
         # Plugin registry
         plugin_registry = None
         if cfg.plugins_dirs:
             from eyetor.plugins.registry import PluginRegistry
+
             plugin_registry = PluginRegistry()
             plugin_registry.load_all(cfg.plugins_dirs)
             await plugin_registry.run_init()
@@ -131,11 +164,16 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
         # Shared tool registry
         tool_registry = ToolRegistry(plugin_registry=plugin_registry)
         if skill_names:
-            async def run_skill_script_handler(skill: str, script: str, args: str = "") -> str:
+
+            async def run_skill_script_handler(
+                skill: str, script: str, args: str = ""
+            ) -> str:
                 scripts = skill_reg.list_scripts(skill)
                 script_path = next((s for s in scripts if s.name == script), None)
                 if not script_path:
-                    return json.dumps({"error": f"Script '{script}' not found in skill '{skill}'"})
+                    return json.dumps(
+                        {"error": f"Script '{script}' not found in skill '{skill}'"}
+                    )
                 arg_list = _split_args(args)
                 if use_host_tools and _is_dangerous(skill, script, args):
                     confirmed = await _ask_confirm(skill, script, args)
@@ -153,23 +191,34 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
                     _skill_summaries.append(f"{_sm.name} ({_sm.description[:80]})")
             _skills_desc = ", ".join(_skill_summaries) if _skill_summaries else "none"
 
-            tool_registry.register(ToolDefinition(
-                name="run_skill_script",
-                description=(
-                    "Execute a script from an available skill. "
-                    f"Available skills: {_skills_desc}"
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "skill": {"type": "string", "description": f"Skill name. One of: {', '.join(skill_names)}"},
-                        "script": {"type": "string", "description": "Script filename (e.g. run.py, fs.py, browser.py, search.py)"},
-                        "args": {"type": "string", "description": "CLI arguments as a single string (e.g. '--cmd \"ls -la\"')"},
+            tool_registry.register(
+                ToolDefinition(
+                    name="run_skill_script",
+                    description=(
+                        "Execute a script from an available skill. "
+                        f"Available skills: {_skills_desc}"
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "skill": {
+                                "type": "string",
+                                "description": f"Skill name. One of: {', '.join(skill_names)}",
+                            },
+                            "script": {
+                                "type": "string",
+                                "description": "Script filename (e.g. run.py, fs.py, browser.py, search.py)",
+                            },
+                            "args": {
+                                "type": "string",
+                                "description": "CLI arguments as a single string (e.g. '--cmd \"ls -la\"')",
+                            },
+                        },
+                        "required": ["skill", "script"],
                     },
-                    "required": ["skill", "script"],
-                },
-                handler=run_skill_script_handler,
-            ))
+                    handler=run_skill_script_handler,
+                )
+            )
 
         # Image generation tool
         if cfg.default_image_provider and cfg.image_providers:
@@ -188,6 +237,7 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
                 provider: str | None = None,
             ) -> str:
                 from eyetor.providers.tracking import current_session_id
+
                 img_prov = get_image_provider(cfg, provider)
                 request = ImageGenerationRequest(
                     prompt=prompt,
@@ -216,36 +266,61 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
                     finish_reason="image_generated",
                 )
 
-                return json.dumps({
-                    "status": "ok",
-                    "image_path": str(img.path),
-                    "width": img.width,
-                    "height": img.height,
-                    "provider": result.provider,
-                    "model": result.model,
-                })
+                return json.dumps(
+                    {
+                        "status": "ok",
+                        "image_path": str(img.path),
+                        "width": img.width,
+                        "height": img.height,
+                        "provider": result.provider,
+                        "model": result.model,
+                    }
+                )
 
-            tool_registry.register(ToolDefinition(
-                name="generate_image",
-                description=(
-                    "Generate an image from a text prompt. Returns local file path. "
-                    f"Available image providers: {', '.join(_img_provider_names)}"
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "prompt": {"type": "string", "description": "Text description of the image to generate"},
-                        "negative_prompt": {"type": "string", "description": "What to avoid in the image (optional)"},
-                        "width": {"type": "integer", "description": "Image width in pixels (default 1024)"},
-                        "height": {"type": "integer", "description": "Image height in pixels (default 1024)"},
-                        "steps": {"type": "integer", "description": "Number of generation steps (optional, provider default)"},
-                        "seed": {"type": "integer", "description": "Random seed for reproducibility (optional)"},
-                        "provider": {"type": "string", "description": f"Image provider name. One of: {', '.join(_img_provider_names)} (optional, uses default)"},
+            tool_registry.register(
+                ToolDefinition(
+                    name="generate_image",
+                    description=(
+                        "Generate an image from a text prompt. Returns local file path. "
+                        f"Available image providers: {', '.join(_img_provider_names)}"
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "prompt": {
+                                "type": "string",
+                                "description": "Text description of the image to generate",
+                            },
+                            "negative_prompt": {
+                                "type": "string",
+                                "description": "What to avoid in the image (optional)",
+                            },
+                            "width": {
+                                "type": "integer",
+                                "description": "Image width in pixels (default 1024)",
+                            },
+                            "height": {
+                                "type": "integer",
+                                "description": "Image height in pixels (default 1024)",
+                            },
+                            "steps": {
+                                "type": "integer",
+                                "description": "Number of generation steps (optional, provider default)",
+                            },
+                            "seed": {
+                                "type": "integer",
+                                "description": "Random seed for reproducibility (optional)",
+                            },
+                            "provider": {
+                                "type": "string",
+                                "description": f"Image provider name. One of: {', '.join(_img_provider_names)} (optional, uses default)",
+                            },
+                        },
+                        "required": ["prompt"],
                     },
-                    "required": ["prompt"],
-                },
-                handler=generate_image_handler,
-            ))
+                    handler=generate_image_handler,
+                )
+            )
 
             base_system += (
                 "\n\nCuando generes una imagen con generate_image, incluye la ruta en tu respuesta "
@@ -256,6 +331,7 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
         mcp_registry = None
         if cfg.mcp_servers:
             from eyetor.mcp.registry import McpRegistry
+
             mcp_registry = McpRegistry(cfg.mcp_servers)
             await mcp_registry.connect_all()
             mcp_registry.register_all_into(tool_registry)
@@ -281,10 +357,23 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
         if sched_cfg.enabled:
             from eyetor.scheduler.store import SchedulerStore
             from eyetor.scheduler.channel import SchedulerChannel
+
             sched_store = SchedulerStore(sched_cfg.db_path)
-            tg_token = cfg.channels.telegram.bot_token if cfg.channels.telegram.enabled else None
+            tg_token = (
+                cfg.channels.telegram.bot_token
+                if cfg.channels.telegram.enabled
+                else None
+            )
             # Scheduler needs a SessionManager; create a dedicated one (no scheduler to avoid recursion)
-            sched_session_mgr = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory, root_config=cfg, tracker=tracker, cost_estimator=cost_estimator)
+            sched_session_mgr = SessionManager(
+                agent_cfg,
+                prov,
+                tool_registry=tool_registry,
+                memory_manager=memory,
+                root_config=cfg,
+                tracker=tracker,
+                cost_estimator=cost_estimator,
+            )
             scheduler = SchedulerChannel(
                 store=sched_store,
                 session_manager=sched_session_mgr,
@@ -297,24 +386,75 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
 
         if interactive:
             from eyetor.channels.cli_channel import CliChannel
-            session_mgr_cli = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory, scheduler=scheduler, root_config=cfg, tracker=tracker, cost_estimator=cost_estimator)
+
+            session_mgr_cli = SessionManager(
+                agent_cfg,
+                prov,
+                tool_registry=tool_registry,
+                memory_manager=memory,
+                scheduler=scheduler,
+                root_config=cfg,
+                tracker=tracker,
+                cost_estimator=cost_estimator,
+            )
             channels.append(CliChannel(session_mgr_cli, skill_reg=skill_reg))
 
         tg_cfg = cfg.channels.telegram
-        if tg_cfg.enabled and tg_cfg.bot_token:
+        if tg_cfg.enabled and tg_cfg.bot_token and not interactive:
             from eyetor.channels.telegram import TelegramChannel
-            session_mgr_tg = SessionManager(agent_cfg, prov, tool_registry=tool_registry, memory_manager=memory, scheduler=scheduler, root_config=cfg, tracker=tracker, cost_estimator=cost_estimator)
-            channels.append(TelegramChannel(session_mgr_tg, tg_cfg, skill_reg=skill_reg, scheduler=scheduler, tracker=tracker, full_config=cfg))
+
+            session_mgr_tg = SessionManager(
+                agent_cfg,
+                prov,
+                tool_registry=tool_registry,
+                memory_manager=memory,
+                scheduler=scheduler,
+                root_config=cfg,
+                tracker=tracker,
+                cost_estimator=cost_estimator,
+            )
+            channels.append(
+                TelegramChannel(
+                    session_mgr_tg,
+                    tg_cfg,
+                    skill_reg=skill_reg,
+                    scheduler=scheduler,
+                    tracker=tracker,
+                    full_config=cfg,
+                )
+            )
 
         if scheduler:
             channels.append(scheduler)
 
         if not channels or (len(channels) == 1 and scheduler in channels):
-            console.print("[red]No channels available. Run interactively or configure Telegram.[/red]")
+            console.print(
+                "[red]No channels available. Run interactively or configure Telegram.[/red]"
+            )
             return
 
         try:
-            await asyncio.gather(*[ch.start() for ch in channels])
+            if interactive:
+                # In interactive mode the CLI channel is the "primary" — when
+                # it finishes (user typed /exit or EOF) we must tear down all
+                # background channels (Telegram, scheduler) so the process
+                # exits cleanly.
+                cli_channel = next(
+                    ch for ch in channels
+                    if type(ch).__name__ == "CliChannel"
+                )
+                background = [ch for ch in channels if ch is not cli_channel]
+                bg_tasks = [asyncio.create_task(ch.start()) for ch in background]
+                try:
+                    await cli_channel.start()
+                finally:
+                    for t in bg_tasks:
+                        t.cancel()
+                    await asyncio.gather(*bg_tasks, return_exceptions=True)
+                    for ch in background:
+                        await ch.stop()
+            else:
+                await asyncio.gather(*[ch.start() for ch in channels])
         finally:
             if mcp_registry:
                 await mcp_registry.close_all()
@@ -329,8 +469,23 @@ def start(ctx: click.Context, provider: str | None, model: str | None, host_tool
 # ---------------------------------------------------------------------------
 
 _DANGEROUS_PATTERNS = [
-    ("shell", "run.py", ["rm -rf", "rmdir /s", "format", "del /f", "dd if=", "mkfs",
-                          "drop table", "drop database", "> /dev/", "shutdown", "reboot"]),
+    (
+        "shell",
+        "run.py",
+        [
+            "rm -rf",
+            "rmdir /s",
+            "format",
+            "del /f",
+            "dd if=",
+            "mkfs",
+            "drop table",
+            "drop database",
+            "> /dev/",
+            "shutdown",
+            "reboot",
+        ],
+    ),
     ("filesystem", "fs.py", ["delete --recursive", "delete"]),
 ]
 
@@ -353,14 +508,14 @@ async def _ask_confirm(skill: str, script: str, args: str) -> bool:
     )
     loop = asyncio.get_event_loop()
     answer = await loop.run_in_executor(
-        None,
-        lambda: input("  Confirm? [y/N] ").strip().lower()
+        None, lambda: input("  Confirm? [y/N] ").strip().lower()
     )
     return answer in {"y", "yes"}
 
 
 def _split_args(args: str) -> list[str]:
     import shlex
+
     try:
         return shlex.split(args)
     except ValueError:
@@ -371,6 +526,7 @@ def _split_args(args: str) -> list[str]:
 # eyetor run
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
 @click.argument("input_text")
 @click.option("--provider", "-p", default=None)
@@ -378,7 +534,14 @@ def _split_args(args: str) -> list[str]:
 @click.option("--system", "-s", default=None)
 @click.option("--stream", is_flag=True, default=False, help="Stream the response.")
 @click.pass_context
-def run(ctx: click.Context, input_text: str, provider: str | None, model: str | None, system: str | None, stream: bool) -> None:
+def run(
+    ctx: click.Context,
+    input_text: str,
+    provider: str | None,
+    model: str | None,
+    system: str | None,
+    stream: bool,
+) -> None:
     """Run a single agent call (one-shot)."""
     cfg = ctx.obj["cfg"]
 
@@ -391,10 +554,12 @@ def run(ctx: click.Context, input_text: str, provider: str | None, model: str | 
 
         tracker = UsageTracker.from_config(cfg.tracking)
         cost_estimator = CostEstimator()
-        prov = get_provider(cfg, provider, tracker=tracker, cost_estimator=cost_estimator)
+        prov = get_provider(
+            cfg, provider, tracker=tracker, cost_estimator=cost_estimator
+        )
         if model:
             prov.model = model
-            if hasattr(prov, '_inner'):
+            if hasattr(prov, "_inner"):
                 prov._inner.model = model
 
         agent = BaseAgent(
@@ -422,6 +587,7 @@ def run(ctx: click.Context, input_text: str, provider: str | None, model: str | 
 # eyetor skills
 # ---------------------------------------------------------------------------
 
+
 @cli.group()
 def skills() -> None:
     """Manage and inspect available skills."""
@@ -433,6 +599,7 @@ def skills_list(ctx: click.Context) -> None:
     """List all discovered skills."""
     cfg = ctx.obj["cfg"]
     from eyetor.skills.registry import SkillRegistry
+
     reg = SkillRegistry()
     reg.discover(cfg.skills_dirs)
     names = reg.list_names()
@@ -457,6 +624,7 @@ def skills_info(ctx: click.Context, name: str) -> None:
     """Show full info for a skill."""
     cfg = ctx.obj["cfg"]
     from eyetor.skills.registry import SkillRegistry
+
     reg = SkillRegistry()
     reg.discover(cfg.skills_dirs)
     try:
@@ -472,12 +640,14 @@ def skills_info(ctx: click.Context, name: str) -> None:
         console.print(f"Scripts: {', '.join(s.name for s in info.scripts)}")
     console.print("\n[bold]Instructions:[/bold]")
     from rich.markdown import Markdown
+
     console.print(Markdown(info.instructions))
 
 
 # ---------------------------------------------------------------------------
 # eyetor providers
 # ---------------------------------------------------------------------------
+
 
 @cli.group()
 def providers() -> None:
@@ -536,6 +706,7 @@ def providers_test(ctx: click.Context, name: str | None) -> None:
 # eyetor mcp
 # ---------------------------------------------------------------------------
 
+
 @cli.group()
 def mcp() -> None:
     """Manage MCP (Model Context Protocol) servers."""
@@ -552,6 +723,7 @@ def mcp_list(ctx: click.Context) -> None:
 
     async def _run():
         from eyetor.mcp.registry import McpRegistry
+
         registry = McpRegistry(cfg.mcp_servers)
         await registry.connect_all()
         report = registry.get_degraded_report()
@@ -585,6 +757,7 @@ def mcp_tools(ctx: click.Context, server_name: str) -> None:
 
     async def _run():
         from eyetor.mcp.registry import McpRegistry
+
         if server_name not in cfg.mcp_servers:
             console.print(f"[red]MCP server '{server_name}' not found.[/red]")
             sys.exit(1)
@@ -614,6 +787,7 @@ def mcp_test(ctx: click.Context, server_name: str) -> None:
 
     async def _run():
         from eyetor.mcp.registry import McpRegistry
+
         if server_name not in cfg.mcp_servers:
             console.print(f"[red]MCP server '{server_name}' not found.[/red]")
             sys.exit(1)
@@ -635,16 +809,27 @@ def mcp_test(ctx: click.Context, server_name: str) -> None:
 # eyetor usage
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
 @click.option("--period", default="day", type=click.Choice(["day", "week", "month"]))
 @click.option("--provider", default=None)
-@click.option("--detail", is_flag=True, default=False, help="Show individual calls instead of summary.")
-@click.option("--limit", "-n", default=20, help="Number of recent calls (with --detail).")
+@click.option(
+    "--detail",
+    is_flag=True,
+    default=False,
+    help="Show individual calls instead of summary.",
+)
+@click.option(
+    "--limit", "-n", default=20, help="Number of recent calls (with --detail)."
+)
 @click.pass_context
-def usage(ctx: click.Context, period: str, provider: str | None, detail: bool, limit: int) -> None:
+def usage(
+    ctx: click.Context, period: str, provider: str | None, detail: bool, limit: int
+) -> None:
     """Show LLM usage and cost statistics."""
     cfg = ctx.obj["cfg"]
     from eyetor.tracking.usage import UsageTracker
+
     tracker = UsageTracker.from_config(cfg.tracking)
 
     if detail:
@@ -667,8 +852,14 @@ def usage(ctx: click.Context, period: str, provider: str | None, detail: bool, l
             speed = f"{r.speed_tps:.1f} tps" if r.speed_tps else "—"
             cost = f"{r.estimated_cost:.4f}" if r.estimated_cost else "0"
             table.add_row(
-                ts, r.provider, r.model, tokens, cost, speed,
-                r.finish_reason or "—", r.session_id,
+                ts,
+                r.provider,
+                r.model,
+                tokens,
+                cost,
+                speed,
+                r.finish_reason or "—",
+                r.session_id,
             )
         console.print(table)
         return
@@ -687,9 +878,13 @@ def usage(ctx: click.Context, period: str, provider: str | None, detail: bool, l
     table.add_column("Est. Cost ($)", justify="right")
     for s in summaries:
         table.add_row(
-            s.provider, s.model, str(s.calls),
-            str(s.prompt_tokens), str(s.completion_tokens),
-            str(s.total_tokens), f"{s.estimated_cost:.4f}",
+            s.provider,
+            s.model,
+            str(s.calls),
+            str(s.prompt_tokens),
+            str(s.completion_tokens),
+            str(s.total_tokens),
+            f"{s.estimated_cost:.4f}",
         )
     console.print(table)
 
@@ -697,6 +892,7 @@ def usage(ctx: click.Context, period: str, provider: str | None, detail: bool, l
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def main_sync() -> None:
     """Synchronous entry point for the 'eyetor' command."""

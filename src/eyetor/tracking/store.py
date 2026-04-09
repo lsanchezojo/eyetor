@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -68,19 +71,43 @@ class TrackingStore:
     """Persistent storage for LLM usage records."""
 
     def __init__(self, db_path: Path) -> None:
+        self._db_path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_DDL)
-        self._conn.commit()
-        self._migrate()
+        self._conn = self._open()
 
-    def _migrate(self) -> None:
+    def _open(self) -> sqlite3.Connection:
+        """Open (or reopen) the database and ensure the schema exists."""
+        conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.executescript(_DDL)
+        conn.commit()
+        self._apply_migrations(conn)
+        return conn
+
+    def _ensure_db(self) -> None:
+        """Reconnect and recreate the schema if the database is corrupt."""
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+        logger.warning("Tracking database corrupt or missing — recreating schema")
+        self._conn = self._open()
+
+    def _exec(self, sql: str, params: tuple | list = ()) -> sqlite3.Cursor:
+        """Execute SQL with automatic recovery on corrupt/missing schema."""
+        try:
+            return self._conn.execute(sql, params)
+        except sqlite3.OperationalError:
+            self._ensure_db()
+            return self._conn.execute(sql, params)
+
+    @staticmethod
+    def _apply_migrations(conn: sqlite3.Connection) -> None:
         """Apply schema migrations (safe to run multiple times)."""
         for sql in _MIGRATIONS:
             try:
-                self._conn.execute(sql)
-                self._conn.commit()
+                conn.execute(sql)
+                conn.commit()
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
@@ -97,26 +124,25 @@ class TrackingStore:
         finish_reason: str = "",
     ) -> None:
         """Insert a usage record."""
-        self._conn.execute(
-            """
+        params = (
+            session_id,
+            provider,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            estimated_cost,
+            datetime.utcnow().isoformat(),
+            duration_ms,
+            speed_tps,
+            finish_reason,
+        )
+        sql = """
             INSERT INTO usage (session_id, provider, model, prompt_tokens,
                                completion_tokens, estimated_cost, timestamp,
                                duration_ms, speed_tps, finish_reason)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                session_id,
-                provider,
-                model,
-                prompt_tokens,
-                completion_tokens,
-                estimated_cost,
-                datetime.utcnow().isoformat(),
-                duration_ms,
-                speed_tps,
-                finish_reason,
-            ),
-        )
+        """
+        self._exec(sql, params)
         self._conn.commit()
 
     def _period_since(
@@ -188,7 +214,7 @@ class TrackingStore:
             where_provider = "AND provider = ?"
             params.append(provider)
 
-        rows = self._conn.execute(
+        rows = self._exec(
             f"""
             SELECT provider, model,
                    COUNT(*) as calls,
@@ -232,7 +258,7 @@ class TrackingStore:
         if provider:
             where_provider = "AND provider = ?"
             params.append(provider)
-        rows = self._conn.execute(
+        rows = self._exec(
             f"""
             SELECT id, session_id, provider, model, prompt_tokens,
                    completion_tokens, estimated_cost, timestamp,
@@ -272,7 +298,7 @@ class TrackingStore:
             where = "WHERE provider = ?"
             params.append(provider)
         params.append(limit)
-        rows = self._conn.execute(
+        rows = self._exec(
             f"""
             SELECT id, session_id, provider, model, prompt_tokens,
                    completion_tokens, estimated_cost, timestamp,
@@ -303,7 +329,7 @@ class TrackingStore:
     def get_daily_totals(self, provider: str) -> dict:
         """Daily totals for a specific provider (for limit checks)."""
         since = (datetime.utcnow() - timedelta(days=1)).isoformat()
-        row = self._conn.execute(
+        row = self._exec(
             """
             SELECT SUM(prompt_tokens + completion_tokens) as total_tokens,
                    SUM(estimated_cost) as total_cost
@@ -318,7 +344,7 @@ class TrackingStore:
 
     def delete_session(self, session_id: str) -> int:
         """Delete all usage records for a session. Returns count deleted."""
-        cursor = self._conn.execute(
+        cursor = self._exec(
             "DELETE FROM usage WHERE session_id = ?",
             (session_id,),
         )
