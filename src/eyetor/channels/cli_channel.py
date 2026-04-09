@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import getpass
 import json
 import logging
 import re
@@ -16,7 +17,12 @@ from eyetor.chat.manager import SessionManager
 
 logger = logging.getLogger(__name__)
 
-_SESSION_ID = "cli-local"
+
+def _get_cli_session_id() -> str:
+    username = getpass.getuser()
+    return f"cli-{username}"
+
+
 _IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(.*?)\]")
 
 _HELP = """
@@ -48,9 +54,11 @@ class CliChannel(BaseChannel):
         """Start the interactive chat loop."""
         self._running = True
         self._console.print("[bold green]Eyetor[/bold green] — Multi-agent AI system")
-        self._console.print("Type [bold]/help[/bold] for commands, [bold]/exit[/bold] to quit.\n")
+        self._console.print(
+            "Type [bold]/help[/bold] for commands, [bold]/exit[/bold] to quit.\n"
+        )
 
-        session = self._manager.get_or_create(_SESSION_ID)
+        session = self._manager.get_or_create(_get_cli_session_id())
 
         while self._running:
             try:
@@ -91,7 +99,9 @@ class CliChannel(BaseChannel):
                     current_model = getattr(current, "model", "?")
                     # If wrapped in TrackingProvider, get inner name
                     provider_name = getattr(current, "_provider_name", None) or "?"
-                    lines = [f"[bold]Proveedor actual:[/bold] [cyan]{provider_name}[/cyan] (modelo: {current_model})\n"]
+                    lines = [
+                        f"[bold]Proveedor actual:[/bold] [cyan]{provider_name}[/cyan] (modelo: {current_model})\n"
+                    ]
                     lines.append("[bold]Proveedores disponibles:[/bold]")
                     for name, model in providers.items():
                         lines.append(f"  [cyan]{name}[/cyan] — {model}")
@@ -138,8 +148,12 @@ class CliChannel(BaseChannel):
             self._console.print("[dim]No conversation history.[/dim]")
             return
         for msg in history:
-            role_color = {"user": "blue", "assistant": "green", "tool": "yellow"}.get(msg.role, "white")
-            self._console.print(f"[{role_color}]{msg.role}[/{role_color}]: {msg.content or '[tool call]'}")
+            role_color = {"user": "blue", "assistant": "green", "tool": "yellow"}.get(
+                msg.role, "white"
+            )
+            self._console.print(
+                f"[{role_color}]{msg.role}[/{role_color}]: {msg.content or '[tool call]'}"
+            )
 
 
 def _collect_image_paths(buffer: str, session) -> list[str]:
@@ -158,7 +172,11 @@ def _collect_image_paths(buffer: str, session) -> list[str]:
         if msg.role == "tool" and msg.content:
             try:
                 data = json.loads(msg.content)
-                if isinstance(data, dict) and data.get("status") == "ok" and "image_path" in data:
+                if (
+                    isinstance(data, dict)
+                    and data.get("status") == "ok"
+                    and "image_path" in data
+                ):
                     paths.add(data["image_path"])
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -189,4 +207,3 @@ def _format_tools(tool_registry) -> str:
     for name, defn in tools.items():
         lines.append(f"  [cyan]{name}[/cyan] — {defn.description}")
     return "\n".join(lines)
-
