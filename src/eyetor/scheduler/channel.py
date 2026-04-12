@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from eyetor.channels.base import BaseChannel
 from eyetor.scheduler.store import ScheduledTask, SchedulerStore
@@ -15,13 +16,98 @@ logger = logging.getLogger(__name__)
 
 _INTERVAL_RE = re.compile(r"^every\s+(\d+)\s*(m|min|minutes?|h|hours?|d|days?)$", re.IGNORECASE)
 
+# Absolute datetime: '2026-04-16 09:00', '2026-04-16T09:00:00', optionally prefixed by 'at '
+_ABS_DATE_RE = re.compile(
+    r"^(?:at\s+)?(\d{4}-\d{2}-\d{2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$",
+    re.IGNORECASE,
+)
+
+# Relative weekday: 'next thursday at 9', 'next monday at 09:30'
+_REL_WEEKDAY_RE = re.compile(
+    r"^next\s+"
+    r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)"
+    r"(?:\s+at\s+(\d{1,2})(?::(\d{2}))?)?$",
+    re.IGNORECASE,
+)
+
+# Tomorrow: 'tomorrow at 18:00'
+_TOMORROW_RE = re.compile(
+    r"^tomorrow(?:\s+at\s+(\d{1,2})(?::(\d{2}))?)?$",
+    re.IGNORECASE,
+)
+
+_WEEKDAY_INDEX = {
+    "monday": 0, "lunes": 0,
+    "tuesday": 1, "martes": 1,
+    "wednesday": 2, "miercoles": 2, "miércoles": 2,
+    "thursday": 3, "jueves": 3,
+    "friday": 4, "viernes": 4,
+    "saturday": 5, "sabado": 5, "sábado": 5,
+    "sunday": 6, "domingo": 6,
+}
+
+
+def _resolve_relative_date(expr: str, tz: str) -> datetime | None:
+    """Resolve relative date expressions ('next thursday at 9', 'tomorrow at 18:00')
+    into an absolute timezone-aware datetime. Returns None if not recognized."""
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:
+        zone = ZoneInfo("UTC")
+    now = datetime.now(zone)
+
+    m = _REL_WEEKDAY_RE.match(expr.strip())
+    if m:
+        weekday_name = m.group(1).lower()
+        target_weekday = _WEEKDAY_INDEX.get(weekday_name)
+        if target_weekday is None:
+            return None
+        hour = int(m.group(2)) if m.group(2) else None
+        minute = int(m.group(3)) if m.group(3) else 0
+        if hour is None:
+            return None  # caller should refuse: hour required
+        days_ahead = (target_weekday - now.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7  # 'next' implies the upcoming occurrence, not today
+        target_date = (now + timedelta(days=days_ahead)).date()
+        return datetime(
+            target_date.year, target_date.month, target_date.day,
+            hour, minute, tzinfo=zone,
+        )
+
+    m = _TOMORROW_RE.match(expr.strip())
+    if m:
+        hour = int(m.group(1)) if m.group(1) else None
+        minute = int(m.group(2)) if m.group(2) else 0
+        if hour is None:
+            return None
+        target_date = (now + timedelta(days=1)).date()
+        return datetime(
+            target_date.year, target_date.month, target_date.day,
+            hour, minute, tzinfo=zone,
+        )
+
+    return None
+
 
 def _parse_trigger(schedule: str, tz: str):
-    """Parse a schedule string into an APScheduler trigger."""
+    """Parse a schedule string into an APScheduler trigger.
+
+    Supports, in order:
+      1. Interval: 'every 30m', 'every 2h', 'every 1d'
+      2. Absolute datetime (one-shot): '2026-04-16 09:00', 'at 2026-04-16T09:00:00'
+      3. Relative date (one-shot): 'next thursday at 9', 'tomorrow at 18:00'
+      4. Cron (5 fields, recurring): '0 9 * * *'
+    """
     from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.date import DateTrigger
     from apscheduler.triggers.interval import IntervalTrigger
 
-    m = _INTERVAL_RE.match(schedule.strip())
+    expr = schedule.strip()
+
+    # 1. Interval
+    m = _INTERVAL_RE.match(expr)
     if m:
         value = int(m.group(1))
         unit = m.group(2).lower()
@@ -32,8 +118,26 @@ def _parse_trigger(schedule: str, tz: str):
         elif unit.startswith("d"):
             return IntervalTrigger(days=value)
 
-    # Assume cron expression
-    return CronTrigger.from_crontab(schedule, timezone=tz)
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:
+        zone = ZoneInfo("UTC")
+
+    # 2. Absolute datetime
+    m = _ABS_DATE_RE.match(expr)
+    if m:
+        date_str, hh, mm, ss = m.group(1), m.group(2), m.group(3), m.group(4) or "0"
+        y, mo, d = (int(x) for x in date_str.split("-"))
+        run_date = datetime(y, mo, d, int(hh), int(mm), int(ss), tzinfo=zone)
+        return DateTrigger(run_date=run_date, timezone=zone)
+
+    # 3. Relative date
+    rel = _resolve_relative_date(expr, tz)
+    if rel is not None:
+        return DateTrigger(run_date=rel, timezone=zone)
+
+    # 4. Cron fallback
+    return CronTrigger.from_crontab(expr, timezone=tz)
 
 
 def _write_task_log(task: ScheduledTask, response: str, log_path: str) -> None:

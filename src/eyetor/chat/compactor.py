@@ -130,12 +130,18 @@ class ConversationCompactor:
 
                 if tokens >= threshold:
                     logger.warning(
-                        "Compaction insufficient after fallback, using tail only"
+                        "Compaction insufficient after fallback, using emergency summary + tail"
+                    )
+                    archive_path = self._archive(messages, session_id)
+                    emergency = Message(
+                        role="system",
+                        content=self._emergency_summary(history),
                     )
                     return CompactionResult(
                         compacted=True,
-                        new_messages=tail,
+                        new_messages=[emergency] + tail,
                         phase=2,
+                        archived_path=archive_path,
                     )
 
             max_summary_chars = int(
@@ -151,12 +157,16 @@ class ConversationCompactor:
             final_tokens = self.estimate_tokens(new_messages, system_content)
             if final_tokens >= threshold:
                 logger.warning(
-                    "Compaction still exceeds threshold after summarization, using tail only"
+                    "Compaction still exceeds threshold after summarization, using emergency summary + tail"
                 )
                 archive_path = self._archive(messages, session_id)
+                emergency = Message(
+                    role="system",
+                    content=self._emergency_summary(history),
+                )
                 return CompactionResult(
                     compacted=True,
-                    new_messages=tail,
+                    new_messages=[emergency] + tail,
                     phase=2,
                     archived_path=archive_path,
                 )
@@ -227,6 +237,36 @@ class ConversationCompactor:
         )
 
         return result.message.content or ""
+
+    def _emergency_summary(self, history: list[Message]) -> str:
+        """Build a structural, non-LLM fallback summary describing the discarded history.
+
+        Used when LLM summarization fails or the produced summary still exceeds the
+        token threshold. It does NOT preserve content, but at least informs the model
+        that there was prior context — preventing it from confidently fabricating
+        answers based on the bare tail.
+        """
+        user_msgs = [m for m in history if m.role == "user"]
+        tool_names: list[str] = []
+        for m in history:
+            if m.tool_calls:
+                for tc in m.tool_calls:
+                    tool_names.append(tc.function.name)
+        unique_tools = sorted(set(tool_names))
+        last_user_excerpt = ""
+        if user_msgs:
+            last = user_msgs[-1].content or ""
+            last_user_excerpt = last[:200].replace("\n", " ")
+            if len(last) > 200:
+                last_user_excerpt += "…"
+        return (
+            f"[Compaction fallback — prior history was discarded. "
+            f"Original: {len(history)} messages, {len(user_msgs)} user turns, "
+            f"tools used: {', '.join(unique_tools) or 'none'}. "
+            f"Last user message before compaction (excerpt): \"{last_user_excerpt}\". "
+            f"If the user references earlier topics you don't recognize, ASK them to "
+            f"clarify instead of guessing.]"
+        )
 
     def _serialize_for_summary(self, messages: list[Message]) -> str:
         """Serialize messages to plain text for summarization prompt."""

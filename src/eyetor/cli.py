@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import signal
 import sys
 from pathlib import Path
 
@@ -116,6 +117,15 @@ def start(
 
         memory = MemoryManager.from_path(cfg.memory_db_path)
 
+        # Knowledge base (optional, hybrid BM25 + semantic retrieval)
+        knowledge = None
+        if cfg.knowledge and cfg.knowledge.enabled and cfg.knowledge.workspaces:
+            from eyetor.knowledge.manager import KnowledgeManager
+
+            knowledge = KnowledgeManager.from_config(cfg.knowledge)
+            if interactive and cfg.knowledge.auto_cwd_workspace:
+                knowledge.register_cwd_workspace(Path.cwd())
+
         # Shared skill registry
         skill_reg = SkillRegistry()
         skill_reg.discover(cfg.skills_dirs)
@@ -128,12 +138,22 @@ def start(
                 "Puedes ejecutar comandos de shell, gestionar ficheros, abrir URLs y buscar en internet. "
                 "Responde siempre en español de España. "
                 "Explica brevemente lo que vas a hacer antes de hacerlo. "
-                "Pide confirmación antes de operaciones destructivas (borrar, sobreescribir, formatear)."
+                "Pide confirmación antes de operaciones destructivas (borrar, sobreescribir, formatear).\n\n"
+                "## Uso de herramientas\n\n"
+                "Cuando el usuario pida información que requiera varias llamadas a herramientas, encadénalas tú mismo sin pedir aclaraciones innecesarias. "
+                "No le pidas al usuario que elija qué comando ejecutar ni le muestres la sintaxis de los scripts: ejecútalos directamente. "
+                "Si necesitas varios pasos (por ejemplo, listar tiendas y luego consultar precios de cada una), hazlos todos seguidos. "
+                "Solo pregunta al usuario cuando haya una ambigüedad real que no puedas resolver con los datos disponibles."
             )
         else:
             base_system = (
                 "Eres Eyetor (suena como Aitor), un asistente de IA útil. "
-                "Responde siempre en español de España."
+                "Responde siempre en español de España.\n\n"
+                "## Uso de herramientas\n\n"
+                "Cuando el usuario pida información que requiera varias llamadas a herramientas, encadénalas tú mismo sin pedir aclaraciones innecesarias. "
+                "No le pidas al usuario que elija qué comando ejecutar ni le muestres la sintaxis de los scripts: ejecútalos directamente. "
+                "Si necesitas varios pasos (por ejemplo, listar tiendas y luego consultar precios de cada una), hazlos todos seguidos. "
+                "Solo pregunta al usuario cuando haya una ambigüedad real que no puedas resolver con los datos disponibles."
             )
 
         skills_context = skill_reg.build_skills_context(skill_names)
@@ -327,6 +347,158 @@ def start(
                 "con el formato [IMAGE:/ruta/al/archivo.png] para que se muestre correctamente al usuario."
             )
 
+        # Knowledge base tools
+        if knowledge is not None:
+            _kb_ws_names = knowledge.list_workspaces()
+            _kb_ws_desc = ", ".join(_kb_ws_names) if _kb_ws_names else "none"
+
+            async def kb_search_handler(
+                query: str, top_k: int = 5, workspace: str | None = None
+            ) -> str:
+                top_k = max(1, min(int(top_k or 5), 20))
+                hits = await knowledge.search(query, workspace=workspace, top_k=top_k)
+                return json.dumps(
+                    {
+                        "query": query,
+                        "count": len(hits),
+                        "results": [
+                            {
+                                "doc_id": h.doc_id,
+                                "chunk_id": h.chunk_id,
+                                "workspace": h.workspace,
+                                "path": h.path,
+                                "title": h.title,
+                                "heading": h.heading,
+                                "snippet": h.snippet,
+                                "score": round(h.score, 4),
+                                "sources": h.sources,
+                            }
+                            for h in hits
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+
+            async def kb_read_handler(
+                doc_id: int, section: str | None = None, max_chars: int = 1800
+            ) -> str:
+                result = knowledge.read_doc(
+                    int(doc_id), section=section, max_chars=int(max_chars or 1800)
+                )
+                if result is None:
+                    return json.dumps(
+                        {"error": f"Document {doc_id} not found"}, ensure_ascii=False
+                    )
+                return json.dumps(
+                    {
+                        "doc_id": result.doc_id,
+                        "path": result.path,
+                        "title": result.title,
+                        "section": result.section,
+                        "content": result.content,
+                        "truncated": result.truncated,
+                        "total_chars": result.total_chars,
+                    },
+                    ensure_ascii=False,
+                )
+
+            async def kb_list_sources_handler(
+                workspace: str | None = None, limit: int = 50
+            ) -> str:
+                sources = knowledge.list_sources(
+                    workspace=workspace, limit=int(limit or 50)
+                )
+                return json.dumps(sources, ensure_ascii=False)
+
+            tool_registry.register(
+                ToolDefinition(
+                    name="kb_search",
+                    description=(
+                        "Search the workspace knowledge base for documentation, guides, "
+                        "specs and notes. Returns ranked snippets. Use this for conceptual "
+                        "or factual questions about project docs. For literal string matching "
+                        "in code, prefer the filesystem grep skill. "
+                        f"Available workspaces: {_kb_ws_desc}."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": (
+                                    "Query string. Supports FTS5 syntax: AND, OR, NEAR, "
+                                    '"quoted phrase".'
+                                ),
+                            },
+                            "top_k": {
+                                "type": "integer",
+                                "description": "Number of results to return (1-20, default 5).",
+                            },
+                            "workspace": {
+                                "type": "string",
+                                "description": f"Optional workspace filter. One of: {_kb_ws_desc}.",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                    handler=kb_search_handler,
+                )
+            )
+
+            tool_registry.register(
+                ToolDefinition(
+                    name="kb_read",
+                    description=(
+                        "Read a specific document or section by id from the knowledge "
+                        "base. Use after kb_search to get more context around a match."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "doc_id": {
+                                "type": "integer",
+                                "description": "Document id (from kb_search results).",
+                            },
+                            "section": {
+                                "type": "string",
+                                "description": "Optional heading-path prefix to narrow the read.",
+                            },
+                            "max_chars": {
+                                "type": "integer",
+                                "description": "Maximum characters to return (default 1800).",
+                            },
+                        },
+                        "required": ["doc_id"],
+                    },
+                    handler=kb_read_handler,
+                )
+            )
+
+            tool_registry.register(
+                ToolDefinition(
+                    name="kb_list_sources",
+                    description=(
+                        "List indexed documents in the knowledge base. Use to discover "
+                        "what documentation is available before searching."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "workspace": {
+                                "type": "string",
+                                "description": f"Optional workspace filter. One of: {_kb_ws_desc}.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of documents (default 50).",
+                            },
+                        },
+                        "required": [],
+                    },
+                    handler=kb_list_sources_handler,
+                )
+            )
+
         # MCP servers — connect and register tools
         mcp_registry = None
         if cfg.mcp_servers:
@@ -370,6 +542,7 @@ def start(
                 prov,
                 tool_registry=tool_registry,
                 memory_manager=memory,
+                knowledge=knowledge,
                 root_config=cfg,
                 tracker=tracker,
                 cost_estimator=cost_estimator,
@@ -393,6 +566,7 @@ def start(
                 tool_registry=tool_registry,
                 memory_manager=memory,
                 scheduler=scheduler,
+                knowledge=knowledge,
                 root_config=cfg,
                 tracker=tracker,
                 cost_estimator=cost_estimator,
@@ -409,6 +583,7 @@ def start(
                 tool_registry=tool_registry,
                 memory_manager=memory,
                 scheduler=scheduler,
+                knowledge=knowledge,
                 root_config=cfg,
                 tracker=tracker,
                 cost_estimator=cost_estimator,
@@ -433,6 +608,33 @@ def start(
             )
             return
 
+        # Kick off knowledge-base reindex in the background (fire-and-forget).
+        kb_reindex_task = None
+        if knowledge is not None and cfg.knowledge.auto_reindex_on_start:
+            log = logging.getLogger("eyetor.knowledge")
+
+            async def _kb_reindex_bg():
+                try:
+                    reports = await knowledge.index_all()
+                except Exception as exc:
+                    log.warning("kb auto-reindex failed: %s", exc)
+                    return
+                for name, r in reports.items():
+                    log.info(
+                        "kb auto-reindex [%s]: scanned=%d indexed=%d updated=%d skipped=%d pruned=%d errors=%d chunks=%d in %.2fs",
+                        name,
+                        r.scanned,
+                        r.indexed,
+                        r.updated,
+                        r.skipped,
+                        r.pruned,
+                        r.errors,
+                        r.chunks_written,
+                        r.duration_s,
+                    )
+
+            kb_reindex_task = asyncio.create_task(_kb_reindex_bg())
+
         try:
             if interactive:
                 # In interactive mode the CLI channel is the "primary" — when
@@ -454,8 +656,32 @@ def start(
                     for ch in background:
                         await ch.stop()
             else:
-                await asyncio.gather(*[ch.start() for ch in channels])
+                # Register signal handlers so systemd SIGTERM triggers
+                # graceful shutdown instead of hanging until SIGABRT.
+                loop = asyncio.get_running_loop()
+                stop_event = asyncio.Event()
+
+                def _signal_handler():
+                    if not stop_event.is_set():
+                        stop_event.set()
+
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    loop.add_signal_handler(sig, _signal_handler)
+
+                tasks = [asyncio.create_task(ch.start()) for ch in channels]
+                await stop_event.wait()
+                for ch in channels:
+                    await ch.stop()
+                for t in tasks:
+                    t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
         finally:
+            if kb_reindex_task and not kb_reindex_task.done():
+                kb_reindex_task.cancel()
+                try:
+                    await kb_reindex_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             if mcp_registry:
                 await mcp_registry.close_all()
             if plugin_registry:
@@ -887,6 +1113,225 @@ def usage(
             f"{s.estimated_cost:.4f}",
         )
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# eyetor kb
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def kb() -> None:
+    """Manage the workspace knowledge base (hybrid BM25 + semantic retrieval)."""
+
+
+def _require_kb(ctx: click.Context):
+    cfg = ctx.obj["cfg"]
+    if not cfg.knowledge or not cfg.knowledge.enabled:
+        console.print(
+            "[yellow]Knowledge base disabled. Set knowledge.enabled=true in config.[/yellow]"
+        )
+        sys.exit(1)
+    if not cfg.knowledge.workspaces:
+        console.print(
+            "[yellow]No knowledge workspaces configured. Add entries under knowledge.workspaces.[/yellow]"
+        )
+        sys.exit(1)
+    return cfg
+
+
+@kb.command("index")
+@click.option("--workspace", "-w", default=None, help="Workspace name (default: all).")
+@click.option("--force", is_flag=True, default=False, help="Ignore sha1 skip and reindex all files.")
+@click.option("--prune/--no-prune", default=True, help="Delete docs that no longer match globs.")
+@click.pass_context
+def kb_index(ctx: click.Context, workspace: str | None, force: bool, prune: bool) -> None:
+    """Index (or reindex) one or all workspaces."""
+    cfg = _require_kb(ctx)
+    from eyetor.knowledge.manager import KnowledgeManager
+
+    async def _run():
+        km = KnowledgeManager.from_config(cfg.knowledge)
+        if workspace:
+            report = await km.index_workspace(workspace, force=force, prune=prune)
+            reports = {workspace: report}
+        else:
+            reports = await km.index_all(force=force, prune=prune)
+        table = Table(title="Indexing results")
+        table.add_column("Workspace", style="bold cyan")
+        table.add_column("Scanned", justify="right")
+        table.add_column("Indexed", justify="right", style="green")
+        table.add_column("Updated", justify="right", style="yellow")
+        table.add_column("Skipped", justify="right", style="dim")
+        table.add_column("Pruned", justify="right")
+        table.add_column("Errors", justify="right", style="red")
+        table.add_column("Chunks", justify="right")
+        table.add_column("Time (s)", justify="right")
+        for name, r in reports.items():
+            table.add_row(
+                name,
+                str(r.scanned),
+                str(r.indexed),
+                str(r.updated),
+                str(r.skipped),
+                str(r.pruned),
+                str(r.errors),
+                str(r.chunks_written),
+                f"{r.duration_s:.2f}",
+            )
+        console.print(table)
+
+    asyncio.run(_run())
+
+
+@kb.command("search")
+@click.argument("query")
+@click.option("--workspace", "-w", default=None, help="Filter by workspace.")
+@click.option("--top-k", "-k", default=5, help="Number of results.")
+@click.option(
+    "--bench",
+    default=0,
+    type=int,
+    help="Run the query N times and report p50/p95/p99 latency (skips result table).",
+)
+@click.pass_context
+def kb_search(
+    ctx: click.Context, query: str, workspace: str | None, top_k: int, bench: int
+) -> None:
+    """Run a hybrid retrieval query against the knowledge base."""
+    cfg = _require_kb(ctx)
+    from eyetor.knowledge.manager import KnowledgeManager
+
+    async def _run():
+        km = KnowledgeManager.from_config(cfg.knowledge)
+        if bench > 0:
+            import time
+
+            # Warm-up so the first call's import/open cost doesn't skew stats.
+            await km.search(query, workspace=workspace, top_k=top_k)
+            samples: list[float] = []
+            for _ in range(bench):
+                t0 = time.perf_counter()
+                await km.search(query, workspace=workspace, top_k=top_k)
+                samples.append((time.perf_counter() - t0) * 1000.0)
+            samples.sort()
+            n = len(samples)
+            p50 = samples[int(n * 0.50)]
+            p95 = samples[min(int(n * 0.95), n - 1)]
+            p99 = samples[min(int(n * 0.99), n - 1)]
+            table = Table(title=f"kb_search benchmark ({n} runs)")
+            table.add_column("Metric", style="bold cyan")
+            table.add_column("ms", justify="right")
+            table.add_row("min", f"{samples[0]:.2f}")
+            table.add_row("p50", f"{p50:.2f}")
+            table.add_row("p95", f"{p95:.2f}")
+            table.add_row("p99", f"{p99:.2f}")
+            table.add_row("max", f"{samples[-1]:.2f}")
+            table.add_row("mean", f"{sum(samples) / n:.2f}")
+            console.print(table)
+            return
+        hits = await km.search(query, workspace=workspace, top_k=top_k)
+        if not hits:
+            console.print(f"[yellow]No results for '{query}'.[/yellow]")
+            return
+        table = Table(title=f"Search: {query}")
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("Workspace", style="cyan")
+        table.add_column("Path")
+        table.add_column("Heading", style="dim")
+        table.add_column("Sources", style="magenta")
+        table.add_column("Snippet")
+        for i, h in enumerate(hits, start=1):
+            table.add_row(
+                str(i),
+                h.workspace,
+                h.path,
+                (h.heading or "")[:40],
+                "+".join(h.sources) or "-",
+                h.snippet[:120].replace("\n", " "),
+            )
+        console.print(table)
+        console.print(
+            "[dim]Use 'eyetor kb read DOC_ID' to read a full document (doc_ids: "
+            + ", ".join(str(h.doc_id) for h in hits)
+            + ")[/dim]"
+        )
+
+    asyncio.run(_run())
+
+
+@kb.command("read")
+@click.argument("doc_id", type=int)
+@click.option("--section", "-s", default=None, help="Section heading prefix filter.")
+@click.option("--max-chars", default=1800, help="Maximum characters to return.")
+@click.pass_context
+def kb_read(ctx: click.Context, doc_id: int, section: str | None, max_chars: int) -> None:
+    """Read a document (or a section) from the knowledge base."""
+    cfg = _require_kb(ctx)
+    from eyetor.knowledge.manager import KnowledgeManager
+
+    km = KnowledgeManager.from_config(cfg.knowledge)
+    result = km.read_doc(doc_id, section=section, max_chars=max_chars)
+    if not result:
+        console.print(f"[red]Document {doc_id} not found.[/red]")
+        sys.exit(1)
+    console.print(f"[bold]{result.title or result.path}[/bold] ({result.path})")
+    if result.section:
+        console.print(f"[dim]Section: {result.section}[/dim]")
+    console.print()
+    console.print(result.content)
+    if result.truncated:
+        console.print(
+            f"\n[yellow]…truncated (total {result.total_chars} chars)[/yellow]"
+        )
+
+
+@kb.command("list")
+@click.option("--workspace", "-w", default=None, help="Filter by workspace.")
+@click.option("--limit", default=50, help="Maximum rows to show.")
+@click.pass_context
+def kb_list(ctx: click.Context, workspace: str | None, limit: int) -> None:
+    """List indexed documents in the knowledge base."""
+    cfg = _require_kb(ctx)
+    from eyetor.knowledge.manager import KnowledgeManager
+
+    km = KnowledgeManager.from_config(cfg.knowledge)
+    sources = km.list_sources(workspace=workspace, limit=limit)
+    if not sources["docs"]:
+        console.print("[yellow]No documents indexed.[/yellow]")
+        return
+    table = Table(title="Indexed documents")
+    table.add_column("doc_id", justify="right", style="dim")
+    table.add_column("Workspace", style="cyan")
+    table.add_column("Path")
+    table.add_column("Title")
+    for d in sources["docs"]:
+        table.add_row(
+            str(d["doc_id"]),
+            d["workspace"],
+            d["path"],
+            (d["title"] or "")[:50],
+        )
+    console.print(table)
+    console.print(f"[dim]Workspaces: {', '.join(sources['workspaces'])}[/dim]")
+
+
+@kb.command("status")
+@click.pass_context
+def kb_status(ctx: click.Context) -> None:
+    """Show knowledge base statistics."""
+    cfg = _require_kb(ctx)
+    from eyetor.knowledge.manager import KnowledgeManager
+
+    km = KnowledgeManager.from_config(cfg.knowledge)
+    stats = km.stats()
+    table = Table(title="Knowledge base status")
+    table.add_column("Key", style="bold cyan")
+    table.add_column("Value")
+    for k, v in stats.items():
+        table.add_row(k, str(v))
+    console.print(table)
+    console.print(f"[dim]Workspaces: {', '.join(km.list_workspaces()) or '-'}[/dim]")
 
 
 # ---------------------------------------------------------------------------

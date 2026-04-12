@@ -12,6 +12,7 @@ from eyetor.providers.base import BaseProvider
 
 if TYPE_CHECKING:
     from eyetor.config import VectorConfig
+    from eyetor.knowledge.manager import KnowledgeManager
     from eyetor.memory.manager import MemoryManager
     from eyetor.scheduler.channel import SchedulerChannel
     from eyetor.tracking.usage import UsageTracker
@@ -35,6 +36,7 @@ class SessionManager:
         system_prompt_suffix: str = "",
         memory_manager: "MemoryManager | None" = None,
         scheduler: "SchedulerChannel | None" = None,
+        knowledge: "KnowledgeManager | None" = None,
         root_config: "VectorConfig | None" = None,
         tracker: "UsageTracker | None" = None,
         cost_estimator: "CostEstimator | None" = None,
@@ -45,6 +47,7 @@ class SessionManager:
         self._system_prompt_suffix = system_prompt_suffix
         self._memory = memory_manager
         self._scheduler = scheduler
+        self._knowledge = knowledge
         self._root_config = root_config
         self._tracker = tracker
         self._cost_estimator = cost_estimator
@@ -61,6 +64,7 @@ class SessionManager:
                 system_prompt_suffix=self._system_prompt_suffix,
                 memory_manager=self._memory,
                 scheduler=self._scheduler,
+                knowledge=self._knowledge,
                 root_config=self._root_config,
                 tracker=self._tracker,
                 cost_estimator=self._cost_estimator,

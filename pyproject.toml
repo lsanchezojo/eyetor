@@ -14,6 +14,27 @@ dependencies = [
 
 [project.optional-dependencies]
 telegram = ["aiogram>=3.0"]
+# Knowledge base — binary document extractors (PDF/DOCX/XLSX/PPTX)
+knowledge = [
+    "pypdf>=4.0",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "python-pptx>=0.6",
+]
+# Knowledge base — semantic retrieval (local embeddings + vector store)
+knowledge-vector = [
+    "fastembed>=0.3",
+    "sqlite-vec>=0.1",
+]
+# Convenience: everything the knowledge base can use
+knowledge-full = [
+    "pypdf>=4.0",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "python-pptx>=0.6",
+    "fastembed>=0.3",
+    "sqlite-vec>=0.1",
+]
 
 [build-system]
 requires = ["hatchling"]

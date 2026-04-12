@@ -151,6 +151,55 @@ class ImageProviderConfig(BaseModel):
     extra_params: dict[str, Any] = {}
 
 
+class KnowledgeChunkConfig(BaseModel):
+    """Chunker settings."""
+
+    max_chars: int = 1500
+    overlap_chars: int = 150
+
+
+class KnowledgeRetrievalConfig(BaseModel):
+    """Hybrid retrieval settings (BM25 + vector fused via RRF)."""
+
+    top_k_default: int = 5
+    snippet_chars: int = 400
+    rrf_k: int = 60
+    candidate_multiplier: int = 3
+
+
+class KnowledgeEmbeddingConfig(BaseModel):
+    """Local embedding model settings (fastembed + sqlite-vec)."""
+
+    enabled: bool = True
+    model: str = "intfloat/multilingual-e5-small"
+    model_dir: str = "~/.eyetor/models/fastembed"
+    dim: int = 384
+    batch_size: int = 64
+
+
+class KnowledgeWorkspaceConfig(BaseModel):
+    """A single indexable workspace (named source of documents)."""
+
+    name: str
+    path: str
+    include: list[str] = []
+    exclude: list[str] = []
+
+
+class KnowledgeConfig(BaseModel):
+    """Root config for the knowledge base / RAG subsystem."""
+
+    enabled: bool = False
+    db_path: str = "~/.eyetor/knowledge.db"
+    auto_reindex_on_start: bool = True
+    auto_cwd_workspace: bool = True
+    max_file_size_bytes: int = 5 * 1024 * 1024
+    workspaces: list[KnowledgeWorkspaceConfig] = []
+    chunk: KnowledgeChunkConfig = KnowledgeChunkConfig()
+    retrieval: KnowledgeRetrievalConfig = KnowledgeRetrievalConfig()
+    embedding: KnowledgeEmbeddingConfig = KnowledgeEmbeddingConfig()
+
+
 class VectorConfig(BaseModel):
     """Root configuration for Eyetor."""
 
@@ -169,6 +218,7 @@ class VectorConfig(BaseModel):
     mcp_servers: dict[str, McpServerConfig] = {}
     image_providers: dict[str, ImageProviderConfig] = {}
     default_image_provider: str | None = None
+    knowledge: KnowledgeConfig | None = None
     vision_provider: str | None = (
         None  # provider name (from providers:) used for image description
     )

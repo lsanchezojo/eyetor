@@ -18,6 +18,7 @@ from eyetor.providers.tracking import current_session_id
 if TYPE_CHECKING:
     from eyetor.config import VectorConfig
     from eyetor.chat.compactor import ConversationCompactor
+    from eyetor.knowledge.manager import KnowledgeManager
     from eyetor.memory.manager import MemoryManager
     from eyetor.scheduler.channel import SchedulerChannel
     from eyetor.tracking.usage import UsageTracker
@@ -53,6 +54,41 @@ def _mentions_tool_name(text: str, tool_defs: list) -> bool:
     return any(td.name.lower() in text_lower for td in tool_defs)
 
 
+# Markers that indicate the model is requesting information from the user
+# rather than forgetting to emit a tool_call. A message with any of these
+# should NOT trigger the announce-without-call nudge: the model is legitimately
+# blocked on missing parameters and correctly chose not to emit a call.
+_ASK_USER_MARKERS = (
+    "indícame",
+    "indicame",
+    "dime la",
+    "dime el",
+    "dime dónde",
+    "dime donde",
+    "proporcióname",
+    "proporcioname",
+    "necesito que me",
+    "por favor indica",
+    "por favor dime",
+    "por favor proporciona",
+    "please provide",
+    "please tell me",
+    "could you tell",
+    "could you provide",
+    "let me know",
+)
+
+
+def _is_asking_user(text: str) -> bool:
+    """True if the model's message is a request for user input."""
+    if not text:
+        return False
+    if "?" in text or "¿" in text:
+        return True
+    lowered = text.lower()
+    return any(m in lowered for m in _ASK_USER_MARKERS)
+
+
 def _truncate(s: str, max_len: int) -> str:
     """Truncate a string for log output, collapsing whitespace."""
     if s is None:
@@ -79,6 +115,7 @@ class ChatSession:
         system_prompt_suffix: str = "",
         memory_manager: "MemoryManager | None" = None,
         scheduler: "SchedulerChannel | None" = None,
+        knowledge: "KnowledgeManager | None" = None,
         root_config: "VectorConfig | None" = None,
         tracker: "UsageTracker | None" = None,
         cost_estimator: "CostEstimator | None" = None,
@@ -91,6 +128,7 @@ class ChatSession:
         self._system_prompt_suffix = system_prompt_suffix
         self._memory = memory_manager
         self._scheduler = scheduler
+        self._knowledge = knowledge
         self._root_config = root_config
         self._tracker = tracker
         self._cost_estimator = cost_estimator
@@ -274,6 +312,7 @@ class ChatSession:
                     not nudged
                     and content
                     and tool_defs
+                    and not _is_asking_user(content)
                     and (
                         _TOOL_INTENT_RE.search(content)
                         or _mentions_tool_name(content, tool_defs)
@@ -433,6 +472,10 @@ class ChatSession:
             memory_context = self._memory.build_context(self.session_id)
             if memory_context:
                 system_content = f"{system_content}\n\n{memory_context}"
+        if self._knowledge:
+            kb_context = self._knowledge.build_context()
+            if kb_context:
+                system_content = f"{system_content}\n\n{kb_context}"
         return system_content
 
     def _get_full_messages(self) -> list[Message]:
@@ -551,20 +594,53 @@ class ChatSession:
             notify: str = "telegram",
             timezone: str = "Europe/Madrid",
             notify_target_override: str | None = None,
+            user_confirmed_midnight: bool = False,
         ) -> str:
+            # Defensive validation: refuse cron with hour=0 unless explicitly confirmed.
+            # Cron has 5 fields: 'minute hour day month dow'. If hour field is exactly '0'
+            # and the user has not confirmed midnight, ask for clarification instead of
+            # silently scheduling at 00:00 (a common LLM failure mode).
+            schedule_clean = schedule.strip()
+            cron_parts = schedule_clean.split()
+            if (
+                len(cron_parts) == 5
+                and cron_parts[1] == "0"
+                and not user_confirmed_midnight
+            ):
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": (
+                            "El cron tiene hora 00:00. ¿El usuario ha pedido medianoche "
+                            "explícitamente? Si no, pregúntale a qué hora quiere el "
+                            "recordatorio antes de volver a llamar a esta herramienta. "
+                            "Si realmente quiere medianoche, vuelve a llamar con "
+                            "user_confirmed_midnight=true."
+                        ),
+                    }
+                )
+
             target = notify_target_override or (
                 notify_target if notify == "telegram" else None
             )
-            task = ScheduledTask(
-                name=name,
-                prompt=prompt,
-                schedule=schedule,
-                timezone=timezone,
-                session_id=f"scheduler-{session_id}",
-                notify=notify,
-                notify_target=target,
-            )
-            added = scheduler.add_task(task)
+            try:
+                task = ScheduledTask(
+                    name=name,
+                    prompt=prompt,
+                    schedule=schedule,
+                    timezone=timezone,
+                    session_id=f"scheduler-{session_id}",
+                    notify=notify,
+                    notify_target=target,
+                )
+                added = scheduler.add_task(task)
+            except Exception as exc:
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": f"No se pudo crear la tarea: {exc}",
+                    }
+                )
             tasks = scheduler.list_tasks()
             next_run = next((t["next_run"] for t in tasks if t["id"] == added.id), None)
             return json.dumps(
@@ -581,7 +657,50 @@ class ChatSession:
         async def handle_list_tasks() -> str:
             return json.dumps({"ok": True, "tasks": scheduler.list_tasks()})
 
-        async def handle_cancel_task(task_id: str) -> str:
+        async def handle_cancel_task(
+            task_id: str | None = None,
+            name: str | None = None,
+        ) -> str:
+            if not task_id and not name:
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": (
+                            "Indica task_id o name. Si no conoces el ID, llama "
+                            "primero a list_tasks o pasa name con el nombre de la tarea."
+                        ),
+                    }
+                )
+            if name and not task_id:
+                needle = name.lower().strip()
+                all_tasks = scheduler.list_tasks()
+                matches = [t for t in all_tasks if needle in t["name"].lower()]
+                if not matches:
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": f"Ninguna tarea coincide con '{name}'.",
+                            "available": [
+                                {"id": t["id"], "name": t["name"]} for t in all_tasks
+                            ],
+                        }
+                    )
+                if len(matches) > 1:
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "ambiguous",
+                            "message": (
+                                f"Varias tareas coinciden con '{name}'. "
+                                "Pide al usuario cuál cancelar y vuelve a llamar con task_id."
+                            ),
+                            "matches": [
+                                {"id": t["id"], "name": t["name"], "schedule": t["schedule"]}
+                                for t in matches
+                            ],
+                        }
+                    )
+                task_id = matches[0]["id"]
             deleted = scheduler.cancel_task(task_id)
             if deleted:
                 return json.dumps({"ok": True, "cancelled": task_id})
@@ -591,40 +710,73 @@ class ChatSession:
             ToolDefinition(
                 name="schedule_task",
                 description=(
-                    "Create a scheduled task that runs automatically at a given time or interval. "
-                    "The task sends a prompt to the agent and optionally delivers the response. "
-                    "Notify options: 'telegram' (send to this chat), 'log' (write to file), 'none' (silent)."
+                    "Programa una tarea que se ejecuta automáticamente. Tres modos:\n"
+                    "\n"
+                    "1) ONE-SHOT (un solo disparo) — usa una fecha-hora absoluta o relativa:\n"
+                    "   - Absoluta: '2026-04-16 09:00' o 'at 2026-04-16T09:00:00'\n"
+                    "   - Relativa: 'next thursday at 9', 'next monday at 18:30', 'tomorrow at 8'\n"
+                    "\n"
+                    "2) RECURRENTE por cron de 5 campos ('m h dom mon dow'):\n"
+                    "   - '0 9 * * *' = cada día a las 9:00\n"
+                    "   - '0 9 * * 4' = todos los jueves a las 9:00 (dow: 0=domingo, 4=jueves)\n"
+                    "   - '30 18 * * 1-5' = lunes a viernes a las 18:30\n"
+                    "\n"
+                    "3) INTERVALO: 'every 30m', 'every 2h', 'every 1d'.\n"
+                    "\n"
+                    "REGLAS OBLIGATORIAS — léelas antes de llamar:\n"
+                    "- Si el usuario dice 'el jueves', 'el lunes', 'el día X' (singular, sin "
+                    "  'cada' ni 'todos los'), interprétalo como ONE-SHOT del próximo jueves/"
+                    "  lunes/etc. NO crees un cron recurrente.\n"
+                    "- Si el usuario dice 'los jueves', 'cada lunes', 'todos los días', es "
+                    "  RECURRENTE (cron o intervalo).\n"
+                    "- Si el usuario NO especifica hora, NO inventes una. PREGÚNTASELA "
+                    "  primero y vuelve a llamar a esta herramienta cuando la sepas. "
+                    "  Nunca uses 00:00 ni 09:00 por defecto.\n"
+                    "- Si la hora es 00:00 (medianoche), debe ser porque el usuario lo pidió "
+                    "  explícitamente. En ese caso pasa user_confirmed_midnight=true.\n"
+                    "- Tras crear la tarea, confirma al usuario el modo (one-shot o "
+                    "  recurrente) y la próxima ejecución exacta que devuelve la herramienta "
+                    "  en el campo 'next_run'.\n"
+                    "\n"
+                    "Notify: 'telegram' (envía a este chat), 'log' (escribe a fichero), "
+                    "'none' (silencioso)."
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
                         "name": {
                             "type": "string",
-                            "description": "Short descriptive name for the task",
+                            "description": "Nombre corto y descriptivo (p. ej. 'Comprar pan')",
                         },
                         "prompt": {
                             "type": "string",
-                            "description": "The message to send to the agent when the task fires",
+                            "description": "El mensaje que se enviará al agente cuando la tarea se dispare",
                         },
                         "schedule": {
                             "type": "string",
                             "description": (
-                                "When to run. Cron (5 fields): '0 9 * * *' (daily at 9am), '0 8 * * 1' (Mondays at 8am). "
-                                "Interval: 'every 30m', 'every 2h', 'every 1d'."
+                                "Cuándo ejecutar. One-shot: '2026-04-16 09:00', "
+                                "'next thursday at 9', 'tomorrow at 18:00'. "
+                                "Recurrente: cron 5 campos '0 9 * * 4'. "
+                                "Intervalo: 'every 30m', 'every 2h', 'every 1d'."
                             ),
                         },
                         "notify": {
                             "type": "string",
                             "enum": ["telegram", "log", "none"],
-                            "description": "Where to deliver the result. Default: 'telegram'",
+                            "description": "Dónde entregar el resultado. Default: 'telegram'",
                         },
                         "timezone": {
                             "type": "string",
-                            "description": "Timezone for cron schedules (e.g. 'Europe/Madrid'). Default: 'Europe/Madrid'",
+                            "description": "Zona horaria para crons y fechas relativas (p. ej. 'Europe/Madrid'). Default: 'Europe/Madrid'",
                         },
                         "notify_target_override": {
                             "type": "string",
-                            "description": "Override log file path (only for notify='log'). Leave empty for default.",
+                            "description": "Sobrescribe la ruta del log (solo si notify='log'). Déjalo vacío para el default.",
+                        },
+                        "user_confirmed_midnight": {
+                            "type": "boolean",
+                            "description": "Pasa true SOLO si el usuario ha pedido medianoche explícitamente. Por defecto false.",
                         },
                     },
                     "required": ["name", "prompt", "schedule"],
@@ -645,16 +797,28 @@ class ChatSession:
         self.tool_registry.register(
             ToolDefinition(
                 name="cancel_task",
-                description="Cancel and delete a scheduled task by its ID.",
+                description=(
+                    "Cancela y elimina una tarea programada. Puedes pasar task_id "
+                    "(preferido, exacto) o name (búsqueda por subcadena, case-insensitive). "
+                    "Si pasas name y hay múltiples coincidencias, la herramienta devuelve "
+                    "'ambiguous' con la lista de candidatos para que pidas confirmación al "
+                    "usuario antes de volver a llamar con el task_id correcto. Cuando el "
+                    "usuario te diga 'borra esa tarea', 'cancela el recordatorio del pan' "
+                    "o similar, llama primero a list_tasks o usa directamente name."
+                ),
                 parameters={
                     "type": "object",
                     "properties": {
                         "task_id": {
                             "type": "string",
-                            "description": "The task ID to cancel (from list_tasks)",
+                            "description": "El ID exacto de la tarea (devuelto por list_tasks o schedule_task).",
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Nombre o fragmento del nombre de la tarea (búsqueda por subcadena).",
                         },
                     },
-                    "required": ["task_id"],
+                    "required": [],
                 },
                 handler=handle_cancel_task,
             )

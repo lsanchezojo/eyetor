@@ -84,10 +84,67 @@ default_image_provider: gemini-flash
 # Vision provider: used to describe images sent by users (multimodal LLM call).
 # References one of the providers above — inherits its base_url and api_key.
 # The api_key must be set in .env (e.g. OPENROUTER_API_KEY).
-vision_provider: llamacpp # ej. openrouter
+vision_provider: llamacpp # ej. llamacpp
 vision_model: ggml-org/gemma-4-E4B-it-GGUF:Q8_0 # ej. nvidia/nemotron-nano-12b-v2-vl:free
 
 mcp_servers: {}
+
+# Knowledge base — hybrid BM25 + semantic retrieval over workspace docs.
+# Requires extras: pip install -e ".[knowledge-full]" for PDF/DOCX/XLSX/PPTX
+# extractors and semantic embeddings. Without the extras the KB degrades
+# gracefully to BM25-only over text/markdown/code files.
+knowledge:
+  enabled: true
+  db_path: ~/.eyetor/knowledge.db
+  auto_reindex_on_start: true
+  auto_cwd_workspace: true
+  max_file_size_bytes: 5242880    # 5 MB (fits typical PDFs/DOCX/XLSX)
+  workspaces:
+    - name: default
+      path: ~/Dev/workspace/eyetor
+      include:
+        - "**/*.md"
+        - "**/*.mdx"
+        - "**/*.rst"
+        - "**/*.txt"
+        - "**/*.py"
+        - "**/*.js"
+        - "**/*.ts"
+        - "**/*.go"
+        - "**/*.rs"
+        - "**/*.yaml"
+        - "**/*.yml"
+        - "**/*.toml"
+        - "**/*.json"
+        - "**/*.ini"
+        - "**/*.pdf"
+        - "**/*.docx"
+        - "**/*.xlsx"
+        - "**/*.pptx"
+      exclude:
+        - "**/node_modules/**"
+        - "**/.git/**"
+        - "**/.venv/**"
+        - "**/venv/**"
+        - "**/__pycache__/**"
+        - "**/build/**"
+        - "**/dist/**"
+        - "**/.next/**"
+        - "**/target/**"
+  chunk:
+    max_chars: 1500
+    overlap_chars: 150
+  retrieval:
+    top_k_default: 5
+    snippet_chars: 400
+    rrf_k: 60
+    candidate_multiplier: 3
+  embedding:
+    enabled: true
+    model: intfloat/multilingual-e5-small
+    model_dir: ~/.eyetor/models/fastembed
+    dim: 384
+    batch_size: 64
 
 # Session persistence and compaction settings
 sessions:
