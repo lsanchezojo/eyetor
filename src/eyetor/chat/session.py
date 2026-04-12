@@ -258,7 +258,15 @@ class ChatSession:
         """Send a user message; yield streaming tokens from the assistant.
 
         Tool calls are executed silently. The final response is streamed.
+        When chain mode is active and the query is complex, delegates to
+        send_chained() automatically.
         """
+        # Check if chain mode should be used for this query
+        if self._is_complex_query(user_input):
+            async for chunk in self.send_chained(user_input):
+                yield chunk
+            return
+
         user_msg = Message(role="user", content=user_input)
         self._messages.append(user_msg)
         self._persist_message(user_msg)
@@ -458,6 +466,162 @@ class ChatSession:
         async for chunk in self.send(user_input):
             result += chunk
         return result
+
+    # ------------------------------------------------------------------
+    # Chain mode — decompose complex queries into plan → execute → synthesize
+    # ------------------------------------------------------------------
+
+    # Patterns that suggest a message contains multiple instructions
+    _MULTI_INSTRUCTION_RE = re.compile(
+        r"(\d+[\.\)]\s)"  # numbered list: "1. ... 2. ..."
+        r"|(\by\s+(luego|después|además|también)\b)"  # conjunctions
+        r"|(\band\s+(then|also|additionally)\b)"
+        r"|(\bprimero\b.*\bdespu[eé]s\b)"  # "primero...después"
+        r"|(\bfirst\b.*\bthen\b)",
+        re.IGNORECASE,
+    )
+
+    def _is_complex_query(self, user_input: str) -> bool:
+        """Heuristic: decide if a query should use chain mode.
+
+        A query is considered complex if:
+        - It exceeds the character threshold AND
+        - It contains patterns suggesting multiple instructions/steps
+        """
+        if not self._root_config:
+            return False
+        chain_cfg = self._root_config.sessions.chain
+        if chain_cfg.mode == "always":
+            return True
+        if chain_cfg.mode == "never":
+            return False
+        # auto mode
+        if len(user_input) < chain_cfg.complexity_threshold:
+            return False
+        return bool(self._MULTI_INSTRUCTION_RE.search(user_input))
+
+    async def send_chained(self, user_input: str) -> AsyncIterator[str]:
+        """Decompose a complex query into plan → execute → synthesize.
+
+        Phase 1 (Plan): Ask the LLM to analyze the query and produce a step-by-step
+                        plan of which tools to use and in what order. No tools available.
+        Phase 2 (Execute): Send the plan + original query with tools enabled.
+                          The LLM follows its own plan.
+        Phase 3 (Synthesize): Ask the LLM to summarize results for the user. No tools.
+        """
+        logger.info(
+            "Session '%s' — using chain mode for complex query (%d chars)",
+            self.session_id, len(user_input),
+        )
+
+        tool_defs = (
+            list(self.tool_registry._tools.values())
+            if self.tool_registry._tools
+            else None
+        )
+        tool_names = (
+            ", ".join(t.name for t in tool_defs) if tool_defs else "none"
+        )
+
+        # --- Phase 1: Plan (no tools) ---
+        plan_prompt = (
+            f"Analiza la siguiente petición del usuario y crea un plan paso a paso "
+            f"para resolverla. Indica qué herramientas usar y en qué orden.\n\n"
+            f"Herramientas disponibles: {tool_names}\n\n"
+            f"Petición del usuario:\n{user_input}\n\n"
+            f"Responde SOLO con el plan, sin ejecutar nada."
+        )
+
+        plan_messages = self._get_full_messages()
+        plan_messages.append(Message(role="user", content=plan_prompt))
+
+        plan_result = await self.provider.complete(
+            messages=plan_messages,
+            tools=None,  # no tools in planning phase
+            temperature=self.config.temperature,
+        )
+        plan_text = plan_result.message.content or ""
+        logger.info(
+            "Session '%s' — chain plan: %s", self.session_id, plan_text[:200]
+        )
+
+        # --- Phase 2: Execute (with tools, plan as context) ---
+        execute_prompt = (
+            f"Ejecuta el siguiente plan para responder al usuario. "
+            f"Usa las herramientas según el plan.\n\n"
+            f"Plan:\n{plan_text}\n\n"
+            f"Petición original del usuario:\n{user_input}"
+        )
+
+        # Use the normal send() flow which handles tool-calling loops
+        # We inject the execute prompt as the user message
+        user_msg = Message(role="user", content=execute_prompt)
+        self._messages.append(user_msg)
+        self._persist_message(user_msg)
+
+        current_session_id.set(self.session_id)
+        full_messages = self._get_full_messages()
+        execution_output = ""
+        iterations = 0
+
+        while iterations < self.config.max_iterations:
+            iterations += 1
+            result = await self.provider.complete(
+                messages=full_messages,
+                tools=tool_defs,
+                temperature=self.config.temperature,
+            )
+            response = result.message
+            self._messages.append(response)
+            self._persist_message(response)
+            full_messages.append(response)
+
+            if not response.tool_calls:
+                execution_output = response.content or ""
+                break
+
+            # Execute tool calls (same logic as send())
+            async def _exec_tool(tc: ToolCall) -> tuple[ToolCall, str]:
+                return tc, await self.tool_registry.execute(
+                    tc.function.name, tc.function.arguments
+                )
+
+            exec_results = await asyncio.gather(
+                *[_exec_tool(tc) for tc in response.tool_calls],
+                return_exceptions=True,
+            )
+            for entry in exec_results:
+                if isinstance(entry, BaseException):
+                    logger.error("Session '%s' chain exec error: %s", self.session_id, entry)
+                    continue
+                tc, tool_result = entry
+                tool_msg = Message(role="tool", tool_call_id=tc.id, content=tool_result)
+                self._messages.append(tool_msg)
+                self._persist_message(tool_msg)
+                full_messages.append(tool_msg)
+
+        # --- Phase 3: Synthesize (no tools) ---
+        synth_prompt = (
+            f"Resume de forma clara y útil los resultados obtenidos para el usuario. "
+            f"Responde directamente a su petición original:\n{user_input}\n\n"
+            f"Resultados de la ejecución:\n{execution_output[:3000]}"
+        )
+        synth_messages = self._get_full_messages()
+        synth_messages.append(Message(role="user", content=synth_prompt))
+
+        synth_result = await self.provider.complete(
+            messages=synth_messages,
+            tools=None,
+            temperature=self.config.temperature,
+        )
+        final_output = synth_result.message.content or execution_output
+
+        # Store the synthesis as the final assistant message
+        synth_msg = Message(role="assistant", content=final_output)
+        self._messages.append(synth_msg)
+        self._persist_message(synth_msg)
+
+        yield final_output
 
     # ------------------------------------------------------------------
     # Internal helpers

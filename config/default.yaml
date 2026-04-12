@@ -17,7 +17,7 @@ providers:
     type: llamacpp
     base_url: http://localhost:8080/v1
     model: default
-    temperature: 1.0
+    temperature: 0.5
 
   gemini:
     type: gemini
@@ -69,8 +69,25 @@ scheduler:
   db_path: ~/.eyetor/scheduler.db
   default_timezone: Europe/Madrid
 
+# Routing: classify incoming messages and apply specialized system prompts.
+# Improves SLM performance by reducing prompt complexity per route.
+# routing:
+#   enabled: true
+#   classifier_votes: 3        # voting rounds for reliable classification (1 = no voting)
+#   routes:
+#     coding:
+#       description: "Programming, code generation, debugging, and technical tasks"
+#       system_prompt: "You are an expert programmer. Focus on writing clean, correct code."
+#     research:
+#       description: "Information lookup, analysis, and summarization tasks"
+#       system_prompt: "You are a research specialist. Be thorough and cite your sources."
+#     conversation:
+#       description: "General chat, greetings, and casual conversation"
+#       system_prompt: "You are a friendly conversational assistant. Be concise."
+
 orchestrator:
   auto_delegate: false
+  protocol: auto        # tool_calling | text | auto (tries tool_calling, falls back to text)
   workers: {}
 
 image_providers:
@@ -149,6 +166,10 @@ knowledge:
 # Session persistence and compaction settings
 sessions:
   persist: true
+  chain:
+    mode: auto           # auto | always | never — decompose complex queries into plan→execute→synthesize
+    complexity_threshold: 300  # min chars to consider a message complex (auto mode)
+    plan_votes: 1         # voting rounds for planning step (1 = no voting)
   compaction:
     enabled: true
     context_window: 128000

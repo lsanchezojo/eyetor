@@ -80,7 +80,23 @@ class OrchestratorConfig(BaseModel):
     """Configuration for orchestrator auto-delegation."""
 
     auto_delegate: bool = False
+    protocol: Literal["tool_calling", "text", "auto"] = "auto"
     workers: dict[str, OrchestratorWorkerConfig] = {}
+
+
+class RouteConfig(BaseModel):
+    """Configuration for a single route in the routing system."""
+
+    description: str
+    system_prompt: str
+
+
+class RoutingConfig(BaseModel):
+    """Configuration for message routing — classify input and apply a specialized prompt."""
+
+    enabled: bool = False
+    classifier_votes: int = 3  # number of voting rounds for reliable classification
+    routes: dict[str, RouteConfig] = {}
 
 
 class McpServerConfig(BaseModel):
@@ -114,12 +130,21 @@ class CompactionConfig(BaseModel):
     summary_provider: str | None = None
 
 
+class ChainConfig(BaseModel):
+    """Configuration for chain mode — decompose complex queries into steps."""
+
+    mode: Literal["auto", "always", "never"] = "never"
+    complexity_threshold: int = 200  # min chars to consider a message complex
+    plan_votes: int = 1  # voting rounds for the planning step (1 = no voting)
+
+
 class SessionsConfig(BaseModel):
     """Configuration for session persistence."""
 
     persist: bool = False
     dir: str = "~/.eyetor/sessions"
     max_messages: int = 200
+    chain: ChainConfig = ChainConfig()
     compaction: CompactionConfig = CompactionConfig()
 
 
@@ -215,6 +240,7 @@ class VectorConfig(BaseModel):
     sessions: SessionsConfig = SessionsConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
     orchestrator: OrchestratorConfig = OrchestratorConfig()
+    routing: RoutingConfig = RoutingConfig()
     mcp_servers: dict[str, McpServerConfig] = {}
     image_providers: dict[str, ImageProviderConfig] = {}
     default_image_provider: str | None = None

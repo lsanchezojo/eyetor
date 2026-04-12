@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import AsyncIterator, TYPE_CHECKING
 
 from eyetor.chat.session import ChatSession
 from eyetor.models.agents import AgentConfig
@@ -26,6 +26,10 @@ class SessionManager:
 
     Each session represents an independent conversation (e.g., one per
     Telegram chat_id or CLI user).
+
+    When routing is configured, incoming messages are classified before
+    being sent to the session, and the session's system prompt is overridden
+    with a route-specific prompt for that turn.
     """
 
     def __init__(
@@ -52,6 +56,82 @@ class SessionManager:
         self._tracker = tracker
         self._cost_estimator = cost_estimator
         self._sessions: dict[str, ChatSession] = {}
+
+        # Pre-build routing structures if enabled
+        self._routing_enabled = False
+        self._routing_routes: dict | None = None
+        self._routing_votes: int = 1
+        if root_config and root_config.routing.enabled and root_config.routing.routes:
+            self._init_routing(root_config)
+
+    def _init_routing(self, root_config: "VectorConfig") -> None:
+        """Initialize routing classifier from config."""
+        from eyetor.workflows.router import Route
+
+        routing_cfg = root_config.routing
+        self._routing_routes = {
+            name: Route(
+                name=name,
+                description=rcfg.description,
+                system_prompt=rcfg.system_prompt,
+            )
+            for name, rcfg in routing_cfg.routes.items()
+        }
+        self._routing_votes = routing_cfg.classifier_votes
+        self._routing_enabled = True
+        logger.info(
+            "Routing enabled: %d routes, %d classifier votes",
+            len(self._routing_routes),
+            self._routing_votes,
+        )
+
+    async def route_and_send(
+        self, session_id: str, user_input: str
+    ) -> AsyncIterator[str]:
+        """Classify the message (if routing enabled), then send to session.
+
+        When routing is active, the classifier determines which route best
+        matches the input, and the route's system_prompt is applied as a
+        temporary override for this turn. The session's base system_prompt
+        is restored after the turn completes.
+        """
+        session = self.get_or_create(session_id)
+
+        if self._routing_enabled and self._routing_routes:
+            route_name, reasoning, confidence = await self._classify(user_input)
+            if route_name and route_name in self._routing_routes:
+                route = self._routing_routes[route_name]
+                logger.info(
+                    "Routed session '%s' to '%s' (%.0f%% confidence): %s",
+                    session_id, route_name, confidence * 100, reasoning,
+                )
+                # Apply route-specific system prompt as suffix for this turn
+                original_suffix = session._system_prompt_suffix
+                route_context = (
+                    f"\n\n[Route: {route_name}]\n{route.system_prompt}"
+                )
+                session._system_prompt_suffix = original_suffix + route_context
+                try:
+                    async for chunk in session.send(user_input):
+                        yield chunk
+                finally:
+                    session._system_prompt_suffix = original_suffix
+                return
+
+        # No routing — direct send
+        async for chunk in session.send(user_input):
+            yield chunk
+
+    async def _classify(self, user_input: str) -> tuple[str, str, float]:
+        """Run the routing classifier with optional voting."""
+        from eyetor.workflows.router import classify
+
+        return await classify(
+            user_input=user_input,
+            routes=self._routing_routes,
+            provider=self._provider,
+            n_votes=self._routing_votes,
+        )
 
     def get_or_create(self, session_id: str) -> ChatSession:
         """Return the existing session or create a new one."""
