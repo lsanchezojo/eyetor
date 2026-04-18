@@ -127,6 +127,11 @@ class CliChannel(BaseChannel):
                 with self._console.status("", spinner="dots"):
                     async for chunk in session.send(user_input):
                         response_text += chunk
+                # Show reasoning/thinking block if present
+                if session.last_reasoning:
+                    self._console.print(
+                        f"[dim]💭 Thinking:\n{session.last_reasoning.strip()}[/dim]\n"
+                    )
                 # Strip image markers from text
                 clean_text = _IMAGE_MARKER_RE.sub("", response_text).strip()
                 if clean_text:

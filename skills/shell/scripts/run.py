@@ -48,12 +48,21 @@ def run_command(cmd: str, cwd: str | None = None, timeout: int = 30) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Execute a shell command")
-    parser.add_argument("--cmd", required=True, help="Command to execute")
+    parser.add_argument("--cmd", default=None, help="Command to execute")
     parser.add_argument("--cwd", default=None, help="Working directory")
     parser.add_argument("--timeout", type=int, default=30, help="Timeout in seconds")
+    parser.add_argument("rest", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    result = run_command(args.cmd, cwd=args.cwd, timeout=args.timeout)
+    cmd = args.cmd
+    if not cmd and args.rest:
+        # Small models often forget the --cmd flag and pass the command
+        # as positional tokens. Re-join them into a single shell string.
+        cmd = " ".join(args.rest)
+    if not cmd:
+        parser.error("a command is required (use --cmd \"...\" or pass it as positional args)")
+
+    result = run_command(cmd, cwd=args.cwd, timeout=args.timeout)
     print(json.dumps(result, ensure_ascii=False))
 
 

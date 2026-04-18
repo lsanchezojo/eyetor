@@ -27,6 +27,14 @@ Interact with Google Calendar, Gmail, and Google Tasks for a personal Google acc
 scripts/gcalendar.py list --days 7
 scripts/gcalendar.py list --days 3 --calendar primary
 ```
+
+### List events for a specific date
+Use `--date YYYY-MM-DD` when the user asks about a concrete day. **Always prefer `--date` over computing `--days` manually.**
+```
+scripts/gcalendar.py list --date 2026-04-29
+scripts/gcalendar.py list --date 2026-05-01 --calendar primary
+```
+
 Returns: `{"ok": true, "events": [{"id": "...", "title": "...", "start": "...", "end": "...", "location": "...", "description": "..."}]}`
 
 ### Get event details

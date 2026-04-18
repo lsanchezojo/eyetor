@@ -26,6 +26,9 @@ _CODE_BOUNDARY_RE = re.compile(
     re.MULTILINE,
 )
 
+# Matches the page markers that ``extract_pdf`` inserts, e.g. ``[Page 12]``.
+_PAGE_MARKER_RE = re.compile(r"\[Page (\d+)\]")
+
 
 class Chunker:
     def __init__(self, max_chars: int = 1500, overlap_chars: int = 150) -> None:
@@ -114,11 +117,23 @@ class Chunker:
         chunks: list[Chunk] = []
         pieces = self._split_oversized(doc.text)
         title = doc.title or ""
+        # Track the running page across pieces: if a piece has no marker of its
+        # own it inherits the page from the previous piece (marker sits at the
+        # top of the page, the rest of the page has no marker).
+        current_page: int | None = None
         for i, piece in enumerate(pieces):
+            match = _PAGE_MARKER_RE.search(piece)
+            if match:
+                current_page = int(match.group(1))
+            heading: str | None
+            if current_page is not None:
+                heading = f"Page {current_page}"
+            else:
+                heading = title if title else None
             chunks.append(
                 Chunk(
                     ordinal=i,
-                    heading_path=title if title else None,
+                    heading_path=heading,
                     start_line=None,
                     end_line=None,
                     content=piece,

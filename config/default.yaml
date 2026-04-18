@@ -18,7 +18,13 @@ providers:
     base_url: http://localhost:8080/v1
     model: default
     temperature: 0.5
-
+    thinking: true   # set to true to enable reasoning channel (Gemma-4, QwQ, etc.)
+    
+  llamacpp-vision:
+    type: llamacpp
+    base_url: http://localhost:8082/v1
+    model: default
+    
   gemini:
     type: gemini
     base_url: https://generativelanguage.googleapis.com/v1beta
@@ -32,7 +38,7 @@ fallback:
 skills_dirs:
   - ./skills
   - ~/.eyetor/skills
-# - ~/.agents/skills
+  - ~/.agents/skills
 
 plugins_dirs:
   - ./plugins
@@ -101,8 +107,8 @@ default_image_provider: gemini-flash
 # Vision provider: used to describe images sent by users (multimodal LLM call).
 # References one of the providers above — inherits its base_url and api_key.
 # The api_key must be set in .env (e.g. OPENROUTER_API_KEY).
-vision_provider: llamacpp # ej. llamacpp
-vision_model: ggml-org/gemma-4-E4B-it-GGUF:Q8_0 # ej. nvidia/nemotron-nano-12b-v2-vl:free
+vision_provider: openrouter # ej. openrouter
+vision_model: nvidia/nemotron-nano-12b-v2-vl:free # ej. nvidia/nemotron-nano-12b-v2-vl:free
 
 mcp_servers: {}
 
@@ -115,10 +121,10 @@ knowledge:
   db_path: ~/.eyetor/knowledge.db
   auto_reindex_on_start: true
   auto_cwd_workspace: true
-  max_file_size_bytes: 5242880    # 5 MB (fits typical PDFs/DOCX/XLSX)
+  max_file_size_bytes: 52428800   # 50 MB (admite PDFs grandes escaneados)
   workspaces:
     - name: default
-      path: ~/Dev/workspace/eyetor
+      path: ~/.eyetor/knowledge
       include:
         - "**/*.md"
         - "**/*.mdx"
@@ -157,8 +163,8 @@ knowledge:
     rrf_k: 60
     candidate_multiplier: 3
   embedding:
-    enabled: true
-    model: intfloat/multilingual-e5-small
+    enabled: false   # BM25-only: evita cargar fastembed/ONNX (~400 MB RAM residentes)
+    model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
     model_dir: ~/.eyetor/models/fastembed
     dim: 384
     batch_size: 64
@@ -172,7 +178,7 @@ sessions:
     plan_votes: 1         # voting rounds for planning step (1 = no voting)
   compaction:
     enabled: true
-    context_window: 128000
+    context_window: 32000           # aligned with llama-server -c 32768
     trigger_at_percent: 0.80
     tool_output_max_chars: 2000
     keep_last_n_user_turns: 2

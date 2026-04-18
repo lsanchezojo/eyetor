@@ -64,6 +64,7 @@ class StreamingResponse:
 
     _iterator: AsyncIterator[str] = field(repr=False)
     _usage: TokenUsage | None = None
+    reasoning_content: str | None = None  # Populated after stream exhaustion
 
     def __aiter__(self) -> AsyncIterator[str]:
         return self
@@ -89,3 +90,4 @@ class CompletionResult:
     usage: TokenUsage | None = None
     model: str | None = None
     finish_reason: str | None = None
+    reasoning_content: str | None = None  # Thinking/reasoning from models that support it

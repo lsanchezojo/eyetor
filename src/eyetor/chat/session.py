@@ -79,11 +79,29 @@ _ASK_USER_MARKERS = (
 )
 
 
+# Patterns stripped before scanning for question marks in `_is_asking_user`.
+# Without these, a '?' inside a URL query string (e.g. `?item=10523`) or a
+# code example makes the heuristic misclassify an announcement as a question
+# and suppresses the announce-without-call nudge.
+_FENCED_CODE_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+
+
 def _is_asking_user(text: str) -> bool:
-    """True if the model's message is a request for user input."""
+    """True if the model's message is a request for user input.
+
+    Fenced/inline code and URLs are stripped before scanning for '?'/'¿' so
+    a query string like ``?item=10523`` or a code example doesn't count as
+    a question to the user. The ``_ASK_USER_MARKERS`` check still runs on
+    the original text because those are prose phrases.
+    """
     if not text:
         return False
-    if "?" in text or "¿" in text:
+    cleaned = _FENCED_CODE_RE.sub("", text)
+    cleaned = _INLINE_CODE_RE.sub("", cleaned)
+    cleaned = _URL_RE.sub("", cleaned)
+    if "?" in cleaned or "¿" in cleaned:
         return True
     lowered = text.lower()
     return any(m in lowered for m in _ASK_USER_MARKERS)
@@ -97,6 +115,60 @@ def _truncate(s: str, max_len: int) -> str:
     if len(s) <= max_len:
         return s
     return s[:max_len] + f"...(+{len(s) - max_len})"
+
+
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+# Jaccard threshold for the "soft-loop" guard: three consecutive same-tool
+# calls whose token-bags pairwise overlap above this ratio are treated as a
+# loop, catching cases the exact-match check misses (same core, varying
+# satellite words — see _tool_call_bag docstring).
+_LOOP_JACCARD_THRESHOLD = 0.6
+
+
+def _tool_call_bag(name: str, arguments: str) -> tuple[str, frozenset[str]]:
+    """Return (tool_name, lowercase token-bag) for a tool call.
+
+    Used by both the exact-match signature (below) and the Jaccard soft-loop
+    check. Small models often permute the same keywords into dozens of
+    "different" queries; this reduces them to a comparable bag.
+    """
+    try:
+        args = json.loads(arguments) if arguments else {}
+    except (ValueError, TypeError):
+        args = arguments
+
+    def walk(obj) -> list[str]:
+        if isinstance(obj, str):
+            return [t.lower() for t in _TOKEN_RE.findall(obj)]
+        if isinstance(obj, dict):
+            out: list[str] = []
+            for v in obj.values():
+                out.extend(walk(v))
+            return out
+        if isinstance(obj, list):
+            out = []
+            for v in obj:
+                out.extend(walk(v))
+            return out
+        return []
+
+    return name, frozenset(walk(args))
+
+
+def _normalize_tool_call(name: str, arguments: str) -> str:
+    """Collapse a tool call to a sorted-token signature for exact-match loop
+    detection. Captures pure permutations (``a b c`` ≡ ``c a b``).
+    """
+    _, tokens = _tool_call_bag(name, arguments)
+    return f"{name}:{','.join(sorted(tokens))}"
+
+
+def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
+    if not a and not b:
+        return 1.0
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
 
 
 class ChatSession:
@@ -133,6 +205,7 @@ class ChatSession:
         self._tracker = tracker
         self._cost_estimator = cost_estimator
         self._observer = observer
+        self.last_reasoning: str | None = None  # Accumulated reasoning from the latest send() turn
 
         self._compactor: ConversationCompactor | None = None
         if root_config and root_config.sessions.compaction.enabled:
@@ -226,12 +299,19 @@ class ChatSession:
                 "Failed to load session history from %s: %s", self._persist_path, exc
             )
 
-    def _persist_message(self, msg: Message) -> None:
-        """Append a single message to the JSONL file."""
+    def _persist_message(self, msg: Message, *, reasoning: str | None = None) -> None:
+        """Append a single message to the JSONL file.
+
+        If *reasoning* is provided (thinking/reasoning from the LLM), it is
+        stored alongside the message under the ``reasoning_content`` key for
+        auditing purposes.
+        """
         if not self._persist_path:
             return
         try:
             data = msg.model_dump(exclude_none=True)
+            if reasoning:
+                data["reasoning_content"] = reasoning
             with open(self._persist_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(data, ensure_ascii=False) + "\n")
             self._maybe_rotate()
@@ -267,6 +347,7 @@ class ChatSession:
                 yield chunk
             return
 
+        self.last_reasoning = None
         user_msg = Message(role="user", content=user_input)
         self._messages.append(user_msg)
         self._persist_message(user_msg)
@@ -288,7 +369,8 @@ class ChatSession:
 
         full_messages = self._get_full_messages()
         iterations = 0
-        recent_calls: list[str] = []  # track "name:args" for loop detection
+        recent_calls: list[str] = []  # normalized sig for exact-match detection
+        recent_bags: list[list[tuple[str, frozenset[str]]]] = []  # for Jaccard
         max_repeat = 3  # max consecutive identical tool calls before forcing answer
         nudged = False  # allow at most one "announce-without-call" nudge per turn
 
@@ -303,8 +385,13 @@ class ChatSession:
                 temperature=self.config.temperature,
             )
             response = result.message
+            if result.reasoning_content:
+                self.last_reasoning = (
+                    (self.last_reasoning + "\n\n" if self.last_reasoning else "")
+                    + result.reasoning_content
+                )
             self._messages.append(response)
-            self._persist_message(response)
+            self._persist_message(response, reasoning=result.reasoning_content)
             full_messages.append(response)
             if self._observer:
                 self._observer.on_llm_response(
@@ -362,23 +449,57 @@ class ChatSession:
                 " | ".join(call_details),
             )
 
-            # Loop detection: track "name:args" signatures
+            # Loop detection — two layers:
+            # 1. Exact match on normalized token-bag signature (catches pure
+            #    keyword permutations: "a b c" ≡ "c a b").
+            # 2. Jaccard soft-loop: N same-tool calls whose token bags
+            #    pairwise overlap ≥ threshold (catches "same core + varying
+            #    satellite words" — the real failure mode of small models).
             call_signatures = [
-                f"{tc.function.name}:{tc.function.arguments}"
+                _normalize_tool_call(tc.function.name, tc.function.arguments)
+                for tc in response.tool_calls
+            ]
+            current_bags = [
+                _tool_call_bag(tc.function.name, tc.function.arguments)
                 for tc in response.tool_calls
             ]
             current_sig = "|".join(sorted(call_signatures))
             recent_calls.append(current_sig)
+            recent_bags.append(current_bags)
             if len(recent_calls) > max_repeat:
                 recent_calls = recent_calls[-max_repeat:]
+                recent_bags = recent_bags[-max_repeat:]
 
+            loop_reason: str | None = None
             if len(recent_calls) == max_repeat and len(set(recent_calls)) == 1:
+                loop_reason = f"exact repetition of {call_names}"
+            elif (
+                len(recent_bags) == max_repeat
+                and all(len(b) == 1 for b in recent_bags)
+                and len({b[0][0] for b in recent_bags}) == 1
+            ):
+                # Soft loop: among the last N same-tool calls, if ANY pair
+                # overlaps ≥ threshold, the model is re-asking what it just
+                # asked. Using ``max`` (not ``min``) is deliberate — small
+                # models vary satellite tokens wildly, so min would never
+                # trip; max catches "iter N is nearly iter N-1".
+                bags = [b[0][1] for b in recent_bags]
+                pairwise = [
+                    _jaccard(bags[i], bags[j])
+                    for i in range(len(bags))
+                    for j in range(i + 1, len(bags))
+                ]
+                if pairwise and max(pairwise) >= _LOOP_JACCARD_THRESHOLD:
+                    loop_reason = (
+                        f"{max_repeat} near-duplicate '{recent_bags[-1][0][0]}' "
+                        f"calls (max Jaccard {max(pairwise):.2f} ≥ {_LOOP_JACCARD_THRESHOLD})"
+                    )
+
+            if loop_reason:
                 logger.warning(
-                    "Session '%s' — loop detected: same tool call(s) repeated %d times: %s. "
-                    "Forcing final answer.",
+                    "Session '%s' — loop detected: %s. Forcing final answer.",
                     self.session_id,
-                    max_repeat,
-                    call_names,
+                    loop_reason,
                 )
                 # Ask the model to answer without tools
                 full_messages.append(
@@ -397,8 +518,13 @@ class ChatSession:
                     temperature=self.config.temperature,
                 )
                 forced = result.message
+                if result.reasoning_content:
+                    self.last_reasoning = (
+                        (self.last_reasoning + "\n\n" if self.last_reasoning else "")
+                        + result.reasoning_content
+                    )
                 self._messages.append(forced)
-                self._persist_message(forced)
+                self._persist_message(forced, reasoning=result.reasoning_content)
                 content = forced.content or ""
                 yield content
                 return
@@ -441,6 +567,24 @@ class ChatSession:
                     len(result),
                     _truncate(result, 200),
                 )
+
+            # Intra-turn compaction: tool outputs can blow the context mid-loop
+            # even when the turn started under the threshold. Re-check before
+            # the next LLM call so we don't bust the window.
+            if self._compactor:
+                system_content = self._build_system_content()
+                if self._compactor.should_compact(self._messages, system_content):
+                    logger.info(
+                        "Session '%s' — intra-turn compaction at iter %d",
+                        self.session_id,
+                        iterations,
+                    )
+                    result = await self._compactor.compact(
+                        self._messages, system_content, self.provider, self.session_id
+                    )
+                    if result.compacted:
+                        self._apply_compaction(result)
+                        full_messages = self._get_full_messages()
 
         # Max iterations reached
         logger.warning(
@@ -572,8 +716,13 @@ class ChatSession:
                 temperature=self.config.temperature,
             )
             response = result.message
+            if result.reasoning_content:
+                self.last_reasoning = (
+                    (self.last_reasoning + "\n\n" if self.last_reasoning else "")
+                    + result.reasoning_content
+                )
             self._messages.append(response)
-            self._persist_message(response)
+            self._persist_message(response, reasoning=result.reasoning_content)
             full_messages.append(response)
 
             if not response.tool_calls:

@@ -161,7 +161,10 @@ def load_skill_info(metadata: SkillMetadata) -> SkillInfo:
     scripts_dir = metadata.path / "scripts"
     scripts: list[Path] = []
     if scripts_dir.exists():
-        scripts = sorted(scripts_dir.iterdir())
+        scripts = sorted(
+            p for p in scripts_dir.iterdir()
+            if p.is_file() and not p.name.startswith(("_", "."))
+        )
 
     return SkillInfo(metadata=metadata, instructions=instructions, scripts=scripts)
 

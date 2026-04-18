@@ -34,6 +34,12 @@ def sanitize_fts5_query(query: str) -> str:
     filter ``col:``), we respect it verbatim. Otherwise every token that isn't
     purely alphanumeric gets quoted as a literal phrase, so
     ``two-phase compaction`` becomes ``"two-phase" compaction``.
+
+    Tokens are joined with ``OR`` rather than the FTS5 implicit-AND so a
+    natural-language query like ``RE acronym second era`` can still surface
+    chunks that only contain a subset of terms (common when the document
+    language differs from the query language). BM25 handles ranking — chunks
+    matching more terms score higher.
     """
     q = (query or "").strip()
     if not q:
@@ -61,7 +67,7 @@ def sanitize_fts5_query(query: str) -> str:
             continue
         escaped = stripped.replace('"', '""')
         out.append(f'"{escaped}"')
-    return " ".join(out)
+    return " OR ".join(out)
 
 _SQLITE_VEC_WARNING_LOGGED = False
 
@@ -287,6 +293,12 @@ class KnowledgeStore:
             "SELECT * FROM docs WHERE id = ?", (doc_id,)
         ).fetchone()
         return DocRow(**dict(row)) if row else None
+
+    def doc_exists(self, doc_id: int) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM docs WHERE id = ? LIMIT 1", (doc_id,)
+        ).fetchone()
+        return row is not None
 
     def list_docs(
         self, workspace: str | None = None, limit: int = 100
@@ -523,7 +535,14 @@ class KnowledgeStore:
     def read_chunks(
         self, doc_id: int, heading_prefix: str | None = None
     ) -> list[ChunkRow]:
-        """Return chunks of a doc in order, optionally filtered by heading prefix."""
+        """Return chunks of a doc in order, optionally filtered by heading.
+
+        The ``heading_prefix`` name is historical: matching is now a
+        case-insensitive substring so the LLM can pass an approximate heading
+        ("líneas de habilidad" matches "Líneas de habilidad", "3. Líneas de
+        habilidad", etc.). This is important for non-structural extractors
+        (PDFs) where the LLM rarely gets the heading verbatim.
+        """
         if heading_prefix:
             rows = self._conn.execute(
                 """
@@ -531,10 +550,11 @@ class KnowledgeStore:
                        d.workspace, d.rel_path, d.title
                 FROM chunks c
                 JOIN docs d ON d.id = c.doc_id
-                WHERE c.doc_id = ? AND c.heading_path LIKE ?
+                WHERE c.doc_id = ?
+                  AND c.heading_path LIKE ? COLLATE NOCASE
                 ORDER BY c.ordinal
                 """,
-                (doc_id, heading_prefix + "%"),
+                (doc_id, f"%{heading_prefix}%"),
             ).fetchall()
         else:
             rows = self._conn.execute(
@@ -560,6 +580,21 @@ class KnowledgeStore:
             )
             for r in rows
         ]
+
+    def list_sections(self, doc_id: int, limit: int = 20) -> list[str]:
+        """Return distinct heading_path values for a doc, ordered by first ordinal."""
+        rows = self._conn.execute(
+            """
+            SELECT heading_path, MIN(ordinal) AS first_ordinal
+            FROM chunks
+            WHERE doc_id = ? AND heading_path IS NOT NULL
+            GROUP BY heading_path
+            ORDER BY first_ordinal
+            LIMIT ?
+            """,
+            (doc_id, limit),
+        ).fetchall()
+        return [r["heading_path"] for r in rows if r["heading_path"]]
 
     def snippet_for(self, chunk_id: int, query: str, max_tokens: int = 32) -> str:
         """Use FTS5 snippet() for a single chunk id; fall back to raw content."""

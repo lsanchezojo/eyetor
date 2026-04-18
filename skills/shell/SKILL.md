@@ -19,30 +19,42 @@ Use when the user asks to:
 - Interact with CLI tools (docker, kubectl, ffmpeg, etc.)
 
 ## How to run a command
-1. Run `scripts/run.py --cmd "<command>" [--cwd "<directory>"] [--timeout N]`
-2. Returns JSON: `{"stdout": "...", "stderr": "...", "exit_code": 0}`
+
+**Canonical form** — wrap the command in `--cmd "..."`:
+```
+--cmd "<command>" [--cwd "<directory>"] [--timeout N]
+```
+
+The whole command must live inside a single `--cmd "..."` quoted string
+(including pipes, redirects, and arguments). Returns JSON:
+`{"stdout": "...", "stderr": "...", "exit_code": 0}`.
 
 ## Examples
 
+Get today's date:
+```
+--cmd "date +%Y-%m-%d"
+```
+
 Run a Python script:
 ```
-scripts/run.py --cmd "python myscript.py" --cwd "/home/user/project"
+--cmd "python myscript.py" --cwd "/home/user/project"
 ```
 
 Check git status:
 ```
-scripts/run.py --cmd "git status"
+--cmd "git status"
 ```
 
 Install npm packages:
 ```
-scripts/run.py --cmd "npm install" --cwd "/home/user/myapp" --timeout 120
+--cmd "npm install" --cwd "/home/user/myapp" --timeout 120
 ```
 
 List running processes:
 ```
-scripts/run.py --cmd "ps aux"        # Linux/macOS
-scripts/run.py --cmd "tasklist"      # Windows
+--cmd "ps aux"        # Linux/macOS
+--cmd "tasklist"      # Windows
 ```
 
 ## Notes

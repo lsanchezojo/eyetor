@@ -259,13 +259,17 @@ class SchedulerChannel(BaseChannel):
 
         logger.info("Running scheduled task '%s' (id=%s)", task.name, task_id)
         try:
+            # Scheduled runs are independent: wipe history so every run starts
+            # clean. Without this the session accumulates 40+ messages over
+            # weeks and drifts the prompt past the model's context window.
             session = self._session_mgr.get_or_create(task.session_id)
+            session.reset()
             response = await session.send_sync(task.prompt)
 
             await self._deliver(task, response)
             self._store.update_last_run(task_id)
         except Exception as exc:
-            logger.error("Error running task '%s': %s", task.name, exc)
+            logger.exception("Error running task '%s': %s", task.name, exc)
 
     async def _deliver(self, task: ScheduledTask, response: str) -> None:
         if task.notify == "telegram":

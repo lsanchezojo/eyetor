@@ -37,9 +37,20 @@ def _parse_event(event: dict) -> dict:
 
 def cmd_list(args):
     service = _build_service()
-    now = datetime.now(timezone.utc)
-    time_min = now.isoformat()
-    time_max = (now + timedelta(days=args.days)).isoformat()
+
+    if args.date:
+        # Query a specific calendar date (local timezone, full day window)
+        try:
+            day = datetime.strptime(args.date, "%Y-%m-%d")
+        except ValueError:
+            print(json.dumps({"ok": False, "error": f"Invalid --date format: {args.date!r}. Use YYYY-MM-DD."}))
+            sys.exit(1)
+        time_min = day.replace(hour=0, minute=0, second=0, tzinfo=timezone.utc).isoformat()
+        time_max = day.replace(hour=23, minute=59, second=59, tzinfo=timezone.utc).isoformat()
+    else:
+        now = datetime.now(timezone.utc)
+        time_min = now.isoformat()
+        time_max = (now + timedelta(days=args.days)).isoformat()
 
     result = service.events().list(
         calendarId=args.calendar,
@@ -124,7 +135,8 @@ def main():
 
     # list
     p_list = sub.add_parser("list", help="List upcoming events")
-    p_list.add_argument("--days", type=int, default=7, help="Number of days ahead (default: 7)")
+    p_list.add_argument("--days", type=int, default=7, help="Number of days ahead (default: 7). Ignored if --date is set.")
+    p_list.add_argument("--date", default=None, help="Query a specific date (YYYY-MM-DD). Takes priority over --days.")
     p_list.add_argument("--calendar", default="primary", help="Calendar ID (default: primary)")
 
     # get

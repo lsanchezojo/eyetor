@@ -60,6 +60,8 @@ class TelegramChannel(BaseChannel):
         self._dp = None
         self._bot = None
 
+        self._show_thinking: dict[int, bool] = {}  # per chat_id toggle for /thinking
+
         # Resolve vision provider settings from config (fallback to env vars in _describe_image)
         self._vision_base_url: str | None = None
         self._vision_api_key: str | None = None
@@ -257,6 +259,14 @@ class TelegramChannel(BaseChannel):
                             logger.error("Skill prompt command error: %s", exc)
                             await placeholder.edit_text(f"Error: {exc}")
 
+        @dp.message(Command("thinking"))
+        async def cmd_thinking(msg: Message) -> None:
+            chat_id = msg.chat.id
+            current = self._show_thinking.get(chat_id, False)
+            self._show_thinking[chat_id] = not current
+            state = "activado ✅" if not current else "desactivado ❌"
+            await msg.answer(f"Modo thinking {state}")
+
         @dp.message(Command("help"))
         async def cmd_help(msg: Message) -> None:
             extra = ""
@@ -270,6 +280,7 @@ class TelegramChannel(BaseChannel):
                 "/model — list or change LLM provider\n"
                 "/tasks — list scheduled tasks\n"
                 "/usage — show token usage and costs\n"
+                "/thinking — toggle thinking display\n"
                 f"{extra}"
                 "/help — show this help\n\n"
                 "Send a message to chat, a voice note to transcribe, "
@@ -298,6 +309,14 @@ class TelegramChannel(BaseChannel):
                             last_edit = buffer
                         except Exception:
                             pass  # Ignore edit conflicts
+
+                # Send reasoning/thinking block as a separate message (if enabled)
+                if session.last_reasoning and self._show_thinking.get(msg.chat.id, False):
+                    reasoning_html = f"💭 <blockquote>{_escape_html(session.last_reasoning.strip())}</blockquote>"
+                    try:
+                        await msg.answer(reasoning_html, parse_mode="HTML")
+                    except Exception:
+                        await msg.answer(f"💭 {session.last_reasoning.strip()}")
 
                 # Final edit always applies HTML formatting
                 if buffer:
@@ -329,6 +348,7 @@ class TelegramChannel(BaseChannel):
                 return
 
             caption = msg.caption or ""
+            placeholder = None
             try:
                 import base64 as _b64
                 import io as _io
@@ -385,24 +405,26 @@ class TelegramChannel(BaseChannel):
 
                 buffer = ""
                 last_edit = ""
-                try:
-                    async for chunk in session.send(prompt):
-                        buffer += chunk
-                        if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
-                            try:
-                                await placeholder.edit_text(buffer or "...")
-                                last_edit = buffer
-                            except Exception:
-                                pass
-                    if buffer:
-                        html = _md_to_html(buffer)
-                        await _safe_edit_or_send(msg, placeholder, html, buffer)
-                except Exception as exc:
-                    logger.error("Telegram photo handler error: %s", exc)
-                    await placeholder.edit_text(f"Error: {exc}")
+                async for chunk in session.send(prompt):
+                    buffer += chunk
+                    if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
+                        try:
+                            await placeholder.edit_text(buffer or "...")
+                            last_edit = buffer
+                        except Exception:
+                            pass
+                if buffer:
+                    html = _md_to_html(buffer)
+                    await _safe_edit_or_send(msg, placeholder, html, buffer)
             except Exception as exc:
-                logger.error("Photo download error: %s", exc)
-                await msg.answer(f"No se pudo procesar la foto: {exc}")
+                logger.error("Photo handler error: %s", exc)
+                if placeholder is not None:
+                    try:
+                        await placeholder.edit_text(f"Error procesando la imagen: {exc}")
+                    except Exception:
+                        await msg.answer(f"Error procesando la imagen: {exc}")
+                else:
+                    await msg.answer(f"No se pudo procesar la foto: {exc}")
 
         @dp.message(F.voice | F.audio)
         async def on_voice(msg: Message) -> None:

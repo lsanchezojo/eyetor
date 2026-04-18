@@ -17,30 +17,21 @@ Use when the user asks to:
 - Take a screenshot of a URL
 - Open a local HTML file in the browser
 
-## How to open a URL
-```
-scripts/browser.py open --url "https://example.com"
-```
-Opens the URL in the system default browser.
+## Usage
 
-## How to open a local file
-```
-scripts/browser.py open --url "file:///C:/Users/user/report.html"
-```
+Call `run_skill_script` with `skill="browser"`, `script="browser.py"`, and `args` set to one of the commands below.
 
-## How to take a screenshot (requires playwright or selenium)
-```
-scripts/browser.py screenshot --url "https://example.com" --output "/tmp/screenshot.png"
-```
-Falls back gracefully if playwright is not installed.
+### Fetch page content (most common — use this to read a URL)
+- args: `source --url "https://example.com"`
+- If you omit the subcommand, `source` is assumed: `--url "https://example.com"` also works.
 
-## How to fetch page source (no browser, just HTTP)
-```
-scripts/browser.py source --url "https://example.com"
-```
+### Open URL in system browser
+- args: `open --url "https://example.com"`
+
+### Take a screenshot
+- args: `screenshot --url "https://example.com" --output "/tmp/screenshot.png"`
+- Requires playwright. Falls back gracefully if not installed.
 
 ## Notes
-- `open` works without any additional dependencies
-- `screenshot` requires `playwright` (optional): `pip install playwright && playwright install chromium`
-- `source` uses httpx (already a project dependency)
-- Returns JSON with status and path/content
+- `source` strips HTML and returns plain text (truncated at 10k chars)
+- Returns JSON: `{"ok": true, ...}` on success, `{"ok": false, "error": "..."}` on failure

@@ -47,13 +47,17 @@ def create_provider(config: ProviderConfig) -> BaseProvider:
     cls = _PROVIDER_MAP.get(config.type)
     if cls is None:
         raise ValueError(f"Unknown provider type: {config.type}")
-    return cls(
-        base_url=config.base_url,
-        api_key=config.api_key,
-        model=config.model,
-        ssl_verify=config.ssl_verify,
-        temperature=config.temperature,
-    )
+    kwargs: dict = {
+        "base_url": config.base_url,
+        "api_key": config.api_key,
+        "model": config.model,
+        "ssl_verify": config.ssl_verify,
+        "temperature": config.temperature,
+    }
+    if config.type == "llamacpp":
+        kwargs["thinking"] = config.thinking
+        kwargs["request_timeout"] = config.request_timeout
+    return cls(**kwargs)
 
 
 def get_provider(

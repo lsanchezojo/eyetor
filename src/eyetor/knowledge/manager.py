@@ -156,6 +156,9 @@ class KnowledgeManager:
     ) -> ReadResult | None:
         return self.retriever.read(doc_id, section_prefix=section, max_chars=max_chars)
 
+    def list_sections(self, doc_id: int, limit: int = 20) -> list[str]:
+        return self.store.list_sections(doc_id, limit=limit)
+
     def list_sources(
         self, workspace: str | None = None, limit: int = 50
     ) -> dict:

@@ -67,7 +67,14 @@ class SkillRegistry:
         """Build a system prompt section for the given activated skills."""
         if not skill_names:
             return ""
-        parts = ["## Available Skills"]
+        parts = [
+            "## Available Skills",
+            (
+                "> **Skill tool call format:** pass only subcommands and flags in `args`. "
+                "Code blocks in skill docs show manual shell usage (with script paths or "
+                "variables like `$PWCLI`) — omit those prefixes when calling the tool."
+            ),
+        ]
         for name in skill_names:
             try:
                 info = self.activate(name)

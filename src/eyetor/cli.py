@@ -104,6 +104,9 @@ def start(
         from eyetor.skills.executor import run_script, DEFAULT_TIMEOUT
         from eyetor.tracking.usage import UsageTracker
         from eyetor.tracking.pricing import CostEstimator
+        from eyetor.runtime import write_snapshot
+
+        write_snapshot(cfg)
 
         tracker = UsageTracker.from_config(cfg.tracking)
         cost_estimator = CostEstimator()
@@ -156,6 +159,20 @@ def start(
                 "Solo pregunta al usuario cuando haya una ambigüedad real que no puedas resolver con los datos disponibles."
             )
 
+        # Inject current date/time so the model knows "today"
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        _DAYS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+        _MONTHS_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
+                      "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+        tz = ZoneInfo(cfg.scheduler.default_timezone)
+        now = datetime.now(tz)
+        now_str = (
+            f"{_DAYS_ES[now.weekday()]} {now.day} de {_MONTHS_ES[now.month - 1]} "
+            f"de {now.year}, {now.strftime('%H:%M')} ({now.tzname()})"
+        )
+        base_system = f"{base_system}\n\nFecha y hora actual: {now_str}"
+
         skills_context = skill_reg.build_skills_context(skill_names)
         if skills_context:
             base_system = f"{base_system}\n\n{skills_context}"
@@ -184,61 +201,64 @@ def start(
         # Shared tool registry
         tool_registry = ToolRegistry(plugin_registry=plugin_registry)
         if skill_names:
+            from eyetor.skills.router import RoutingError, ScriptRouter
 
-            async def run_skill_script_handler(
-                skill: str, script: str, args: str = ""
-            ) -> str:
-                scripts = skill_reg.list_scripts(skill)
-                script_path = next((s for s in scripts if s.name == script), None)
-                if not script_path:
-                    return json.dumps(
-                        {"error": f"Script '{script}' not found in skill '{skill}'"}
-                    )
-                arg_list = _split_args(args)
-                if use_host_tools and _is_dangerous(skill, script, args):
-                    confirmed = await _ask_confirm(skill, script, args)
-                    if not confirmed:
-                        return json.dumps({"error": "Operation cancelled by user."})
-                meta = skill_reg.get_metadata(skill)
-                timeout = meta.timeout if meta.timeout is not None else DEFAULT_TIMEOUT
-                return await run_script(script_path, arg_list, timeout=timeout)
-
-            # Build dynamic skill list for tool description
-            _skill_summaries = []
+            # Register one tool per skill — always just an "args" param.
+            # ScriptRouter handles mapping the first token to the correct
+            # script for multi-script skills; single-script skills pass
+            # everything through unchanged.
             for _sn in skill_names:
-                _sm = skill_reg.get_metadata(_sn)
-                if _sm:
-                    _skill_summaries.append(f"{_sm.name} ({_sm.description[:80]})")
-            _skills_desc = ", ".join(_skill_summaries) if _skill_summaries else "none"
+                _meta = skill_reg.get_metadata(_sn)
+                _scripts = skill_reg.list_scripts(_sn)
+                if not _scripts:
+                    continue
 
-            tool_registry.register(
-                ToolDefinition(
-                    name="run_skill_script",
-                    description=(
-                        "Execute a script from an available skill. "
-                        f"Available skills: {_skills_desc}"
-                    ),
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "skill": {
-                                "type": "string",
-                                "description": f"Skill name. One of: {', '.join(skill_names)}",
+                _router = ScriptRouter(_sn, _scripts)
+
+                def _make_handler(skill_name: str, router: ScriptRouter, meta):
+                    async def _handler(args: str = "") -> str:
+                        try:
+                            script_path, arg_list = router.route(args)
+                        except RoutingError as exc:
+                            return json.dumps({"error": str(exc)})
+                        routed_args = " ".join(arg_list)
+                        if use_host_tools and _is_dangerous(skill_name, script_path.name, routed_args):
+                            confirmed = await _ask_confirm(skill_name, script_path.name, routed_args)
+                            if not confirmed:
+                                return json.dumps({"error": "Operation cancelled by user."})
+                        timeout = meta.timeout if meta.timeout is not None else DEFAULT_TIMEOUT
+                        return await run_script(script_path, arg_list, timeout=timeout)
+                    return _handler
+
+                _handler = _make_handler(_sn, _router, _meta)
+
+                _desc = _meta.description[:200]
+                _public = _router.public_scripts
+                if len(_public) > 1:
+                    _desc += f" Scripts: {', '.join(s.stem for s in _public)}."
+
+                tool_registry.register(
+                    ToolDefinition(
+                        name=f"skill_{_sn.replace('-', '_')}",
+                        description=_desc,
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                "args": {
+                                    "type": "string",
+                                    "description": (
+                                        "Subcommand and flags to pass to the skill script. "
+                                        "Pass only the arguments — do NOT include the script name, "
+                                        "interpreter, or wrapper variables (e.g. $PWCLI, bash, python). "
+                                        "Example: 'open https://example.com --headed'"
+                                    ),
+                                },
                             },
-                            "script": {
-                                "type": "string",
-                                "description": "Script filename (e.g. run.py, fs.py, browser.py, search.py)",
-                            },
-                            "args": {
-                                "type": "string",
-                                "description": "CLI arguments as a single string (e.g. '--cmd \"ls -la\"')",
-                            },
+                            "required": [],
                         },
-                        "required": ["skill", "script"],
-                    },
-                    handler=run_skill_script_handler,
+                        handler=_handler,
+                    )
                 )
-            )
 
         # Image generation tool
         if cfg.default_image_provider and cfg.image_providers:
@@ -388,6 +408,24 @@ def start(
                 if result is None:
                     return json.dumps(
                         {"error": f"Document {doc_id} not found"}, ensure_ascii=False
+                    )
+                if not result.section_matched:
+                    return json.dumps(
+                        {
+                            "error": (
+                                f"Section '{section}' not found in document {doc_id}."
+                            ),
+                            "doc_id": result.doc_id,
+                            "path": result.path,
+                            "title": result.title,
+                            "available_sections": result.available_sections or [],
+                            "hint": (
+                                "Call kb_read without the 'section' parameter to "
+                                "read the whole document, or pick one of "
+                                "available_sections verbatim."
+                            ),
+                        },
+                        ensure_ascii=False,
                     )
                 return json.dumps(
                     {
@@ -1274,6 +1312,15 @@ def kb_read(ctx: click.Context, doc_id: int, section: str | None, max_chars: int
     result = km.read_doc(doc_id, section=section, max_chars=max_chars)
     if not result:
         console.print(f"[red]Document {doc_id} not found.[/red]")
+        sys.exit(1)
+    if not result.section_matched:
+        console.print(
+            f"[yellow]Section '{section}' not found in document {doc_id}.[/yellow]"
+        )
+        if result.available_sections:
+            console.print("[dim]Available sections:[/dim]")
+            for s in result.available_sections:
+                console.print(f"  - {s}")
         sys.exit(1)
     console.print(f"[bold]{result.title or result.path}[/bold] ({result.path})")
     if result.section:

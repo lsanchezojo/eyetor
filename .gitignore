@@ -16,6 +16,7 @@ venv/
 
 #cache
 .cache/
+.playwright-cli/
 
 #Claude
 CLAUDE.md

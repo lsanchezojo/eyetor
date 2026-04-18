@@ -39,6 +39,8 @@ class ReadResult:
     content: str
     truncated: bool
     total_chars: int
+    section_matched: bool = True
+    available_sections: list[str] | None = None
 
 
 @runtime_checkable
@@ -54,6 +56,8 @@ class SearchBackend(Protocol):
     def read_chunks(
         self, doc_id: int, heading_prefix: str | None = None
     ) -> list[ChunkRow]: ...
+    def doc_exists(self, doc_id: int) -> bool: ...
+    def list_sections(self, doc_id: int, limit: int = 20) -> list[str]: ...
 
 
 def rrf_fuse(rankings: list[list[int]], k: int = 60) -> list[int]:
@@ -154,6 +158,23 @@ class Retriever:
     ) -> ReadResult | None:
         rows = self.backend.read_chunks(doc_id, heading_prefix=section_prefix)
         if not rows:
+            # Distinguish missing doc from missing section so callers can
+            # surface an actionable error instead of a misleading "not found".
+            if section_prefix and self.backend.doc_exists(doc_id):
+                doc_rows = self.backend.read_chunks(doc_id, heading_prefix=None)
+                first_path = doc_rows[0].rel_path if doc_rows else ""
+                first_title = doc_rows[0].title if doc_rows else None
+                return ReadResult(
+                    doc_id=doc_id,
+                    path=first_path,
+                    title=first_title,
+                    section=section_prefix,
+                    content="",
+                    truncated=False,
+                    total_chars=0,
+                    section_matched=False,
+                    available_sections=self.backend.list_sections(doc_id),
+                )
             return None
         first = rows[0]
         parts: list[str] = []

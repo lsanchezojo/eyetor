@@ -91,6 +91,12 @@ def cmd_source(url: str) -> None:
 
 
 def main() -> None:
+    # If no subcommand is given but --url is present, default to "source".
+    # This handles SLMs that omit the subcommand (e.g. --url "..." instead of source --url "...").
+    raw = sys.argv[1:]
+    if raw and raw[0].startswith("--"):
+        raw.insert(0, "source")
+
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -98,7 +104,7 @@ def main() -> None:
     p = sub.add_parser("screenshot"); p.add_argument("--url", required=True); p.add_argument("--output", required=True)
     p = sub.add_parser("source"); p.add_argument("--url", required=True)
 
-    args = parser.parse_args()
+    args = parser.parse_args(raw)
     if args.command == "open":         cmd_open(args.url)
     elif args.command == "screenshot": cmd_screenshot(args.url, args.output)
     elif args.command == "source":     cmd_source(args.url)

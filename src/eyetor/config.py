@@ -20,6 +20,8 @@ class ProviderConfig(BaseModel):
     model: str
     ssl_verify: bool | str = True  # False to disable, or path to CA bundle
     temperature: float = 0.7  # Sampling temperature sent in every request
+    thinking: bool = False  # Enable thinking/reasoning mode (llamacpp only)
+    request_timeout: float = 600.0  # HTTP timeout (s) per chat/completions call
 
 
 class TrackingLimits(BaseModel):
