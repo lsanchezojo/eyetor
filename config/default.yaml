@@ -1,5 +1,3 @@
-default_provider: llamacpp
-
 providers:
   openrouter:
     type: openrouter
@@ -32,7 +30,7 @@ providers:
     model: gemini-2.0-flash
 
 fallback:
-  fallback_chain: [ollama, openrouter, llamacpp]
+  fallback_chain: [llamacpp, openrouter, gemini]
   retry_on: [timeout, connection_error, "500", "502", "503", "529"]
 
 skills_dirs:

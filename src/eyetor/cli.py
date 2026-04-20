@@ -41,6 +41,45 @@ def _load_cfg(config_path: str | None):
     return load_config(path)
 
 
+def _resolve_provider(cfg, provider, model, tracker, cost_estimator):
+    """Resolve the runtime provider based on CLI flags and config.
+
+    Rules:
+      - ``--provider X``: single provider X (with optional ``--model Y`` override).
+      - ``--model Y`` alone: single provider = first entry of ``fallback_chain``.
+      - No flags: full ``FallbackProvider`` over ``fallback_chain``.
+    """
+    from eyetor.providers import get_provider, get_fallback_provider
+
+    chain = cfg.fallback.fallback_chain
+
+    if provider is None and model is None:
+        if not chain:
+            raise click.UsageError(
+                "No fallback_chain configured and no --provider given. "
+                "Add providers to fallback.fallback_chain or pass --provider."
+            )
+        logging.getLogger(__name__).info("Fallback provider chain: %s", chain)
+        return get_fallback_provider(
+            cfg, tracker=tracker, cost_estimator=cost_estimator
+        )
+
+    target = provider
+    if target is None:
+        if not chain:
+            raise click.UsageError(
+                "--model requires --provider when no fallback_chain is configured."
+            )
+        target = chain[0]
+
+    prov = get_provider(cfg, target, tracker=tracker, cost_estimator=cost_estimator)
+    if model:
+        prov.model = model
+        if hasattr(prov, "_inner"):
+            prov._inner.model = model
+    return prov
+
+
 # ---------------------------------------------------------------------------
 # Root group
 # ---------------------------------------------------------------------------
@@ -95,7 +134,6 @@ def start(
         _setup_logging(cfg.log_level, interactive=True)
 
     async def _run():
-        from eyetor.providers import get_provider
         from eyetor.models.agents import AgentConfig
         from eyetor.chat.manager import SessionManager
         from eyetor.models.tools import ToolRegistry, ToolDefinition
@@ -110,13 +148,7 @@ def start(
 
         tracker = UsageTracker.from_config(cfg.tracking)
         cost_estimator = CostEstimator()
-        prov = get_provider(
-            cfg, provider, tracker=tracker, cost_estimator=cost_estimator
-        )
-        if model:
-            prov.model = model
-            if hasattr(prov, "_inner"):
-                prov._inner.model = model
+        prov = _resolve_provider(cfg, provider, model, tracker, cost_estimator)
 
         memory = MemoryManager.from_path(cfg.memory_db_path)
 
@@ -555,7 +587,7 @@ def start(
 
         agent_cfg = AgentConfig(
             name="eyetor",
-            provider=provider or cfg.default_provider,
+            provider=provider or "fallback",
             model=model or prov.model,
             system_prompt=base_system,
             temperature=prov.temperature,
@@ -810,7 +842,6 @@ def run(
     cfg = ctx.obj["cfg"]
 
     async def _run():
-        from eyetor.providers import get_provider
         from eyetor.agents.base import BaseAgent
         from eyetor.models.agents import AgentConfig
         from eyetor.tracking.usage import UsageTracker
@@ -818,18 +849,12 @@ def run(
 
         tracker = UsageTracker.from_config(cfg.tracking)
         cost_estimator = CostEstimator()
-        prov = get_provider(
-            cfg, provider, tracker=tracker, cost_estimator=cost_estimator
-        )
-        if model:
-            prov.model = model
-            if hasattr(prov, "_inner"):
-                prov._inner.model = model
+        prov = _resolve_provider(cfg, provider, model, tracker, cost_estimator)
 
         agent = BaseAgent(
             config=AgentConfig(
                 name="one-shot",
-                provider=provider or cfg.default_provider,
+                provider=provider or "fallback",
                 model=prov.model,
                 system_prompt=system or "You are a helpful assistant.",
                 temperature=prov.temperature,
@@ -923,15 +948,17 @@ def providers() -> None:
 def providers_list(ctx: click.Context) -> None:
     """List all configured providers."""
     cfg = ctx.obj["cfg"]
+    chain = cfg.fallback.fallback_chain
+    chain_index = {name: i + 1 for i, name in enumerate(chain)}
     table = Table(title="Configured Providers")
     table.add_column("Name", style="bold cyan")
     table.add_column("Type")
     table.add_column("Model")
     table.add_column("Base URL")
-    table.add_column("Default", style="green")
+    table.add_column("Chain", style="green")
     for name, p in cfg.providers.items():
-        is_default = "*" if name == cfg.default_provider else ""
-        table.add_row(name, p.type, p.model, p.base_url, is_default)
+        position = str(chain_index[name]) if name in chain_index else ""
+        table.add_row(name, p.type, p.model, p.base_url, position)
     console.print(table)
 
 
@@ -946,7 +973,15 @@ def providers_test(ctx: click.Context, name: str | None) -> None:
         from eyetor.providers import get_provider
         from eyetor.models.messages import Message
 
-        target = name or cfg.default_provider
+        target = name
+        if target is None:
+            chain = cfg.fallback.fallback_chain
+            if not chain:
+                console.print(
+                    "[red]No provider name given and fallback.fallback_chain is empty.[/red]"
+                )
+                sys.exit(1)
+            target = chain[0]
         try:
             prov = get_provider(cfg, target)
         except KeyError as e:

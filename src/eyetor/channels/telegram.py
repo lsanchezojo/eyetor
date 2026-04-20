@@ -256,8 +256,8 @@ class TelegramChannel(BaseChannel):
                                 html = _md_to_html(buffer)
                                 await _safe_edit_or_send(msg, placeholder, html, buffer)
                         except Exception as exc:
-                            logger.error("Skill prompt command error: %s", exc)
-                            await placeholder.edit_text(f"Error: {exc}")
+                            logger.exception("Skill prompt command error")
+                            await placeholder.edit_text(f"Error: {_format_exc(exc)}")
 
         @dp.message(Command("thinking"))
         async def cmd_thinking(msg: Message) -> None:
@@ -333,8 +333,8 @@ class TelegramChannel(BaseChannel):
                 await _send_images(msg, image_paths)
 
             except Exception as exc:
-                logger.error("Telegram message handler error: %s", exc)
-                await placeholder.edit_text(f"Error: {exc}")
+                logger.exception("Telegram message handler error")
+                await placeholder.edit_text(f"Error: {_format_exc(exc)}")
 
         @dp.message(F.photo)
         async def on_photo(msg: Message) -> None:
@@ -417,14 +417,15 @@ class TelegramChannel(BaseChannel):
                     html = _md_to_html(buffer)
                     await _safe_edit_or_send(msg, placeholder, html, buffer)
             except Exception as exc:
-                logger.error("Photo handler error: %s", exc)
+                logger.exception("Photo handler error")
+                detail = _format_exc(exc)
                 if placeholder is not None:
                     try:
-                        await placeholder.edit_text(f"Error procesando la imagen: {exc}")
+                        await placeholder.edit_text(f"Error procesando la imagen: {detail}")
                     except Exception:
-                        await msg.answer(f"Error procesando la imagen: {exc}")
+                        await msg.answer(f"Error procesando la imagen: {detail}")
                 else:
-                    await msg.answer(f"No se pudo procesar la foto: {exc}")
+                    await msg.answer(f"No se pudo procesar la foto: {detail}")
 
         @dp.message(F.voice | F.audio)
         async def on_voice(msg: Message) -> None:
@@ -462,8 +463,8 @@ class TelegramChannel(BaseChannel):
                     plain = f"🎤 {transcription}\n\n{buffer}"
                     await _safe_edit_or_send(msg, placeholder, html, plain)
             except Exception as exc:
-                logger.error("Telegram voice handler error: %s", exc)
-                await placeholder.edit_text(f"Error: {exc}")
+                logger.exception("Telegram voice handler error")
+                await placeholder.edit_text(f"Error: {_format_exc(exc)}")
 
         commands = [
             BotCommand(command="start", description="Start the bot"),
@@ -487,6 +488,11 @@ class TelegramChannel(BaseChannel):
             await self._dp.stop_polling()
         if self._bot:
             await self._bot.session.close()
+
+
+def _format_exc(exc: BaseException) -> str:
+    msg = str(exc).strip()
+    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
 
 
 async def _describe_image(

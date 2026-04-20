@@ -231,7 +231,6 @@ class VectorConfig(BaseModel):
     """Root configuration for Eyetor."""
 
     providers: dict[str, ProviderConfig] = {}
-    default_provider: str = "ollama"
     fallback: FallbackConfig = FallbackConfig()
     skills_dirs: list[str] = ["./skills"]
     plugins_dirs: list[str] = []

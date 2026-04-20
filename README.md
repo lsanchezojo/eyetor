@@ -57,14 +57,15 @@ GEMINI_API_KEY=         # only if using Gemini provider (LLM and/or images)
 Main config: `config/default.yaml`. Key sections:
 
 ```yaml
-default_provider: llamacpp
-
 providers:
   llamacpp:
     type: llamacpp
     base_url: http://localhost:8080/v1
     model: default
     temperature: 0.6
+
+fallback:
+  fallback_chain: [llamacpp, openrouter]   # first entry is primary, later ones are tried on retryable failures
 
 channels:
   cli:
@@ -536,8 +537,9 @@ image_providers:
     provider: gemini          # inherits base_url, api_key from providers.gemini
     model: gemini-2.0-flash-exp
 
-default_provider: llamacpp              # main LLM
-default_image_provider: gemini          # images via Gemini
+fallback:
+  fallback_chain: [llamacpp]              # primary LLM (add cloud fallbacks here)
+default_image_provider: gemini            # images via Gemini
 ```
 
 For OpenAI-compatible services (Together AI, OpenAI DALL-E, etc.):

@@ -14,7 +14,7 @@ Schema (stable keys, additive — never remove fields without a major bump):
     {
       "pid": int,
       "started_at": "ISO-8601 UTC",
-      "default_provider": str,
+      "fallback_chain": [str, ...],
       "providers": {
         "<name>": {"type": str, "base_url": str, "model": str, "api_key": str}
       },
@@ -99,7 +99,7 @@ def write_snapshot(cfg: Any) -> Path:
     snapshot = {
         "pid": os.getpid(),
         "started_at": datetime.now(timezone.utc).isoformat(),
-        "default_provider": cfg.default_provider,
+        "fallback_chain": list(cfg.fallback.fallback_chain),
         "providers": providers,
         "vision": vision,
         "image": image,

@@ -62,12 +62,11 @@ def create_provider(config: ProviderConfig) -> BaseProvider:
 
 def get_provider(
     config: VectorConfig,
-    name: str | None = None,
+    name: str,
     tracker: "UsageTracker | None" = None,
     cost_estimator: "CostEstimator | None" = None,
 ) -> BaseProvider:
-    """Return a provider by name (or the default provider)."""
-    name = name or config.default_provider
+    """Return a single provider by name."""
     if name not in config.providers:
         raise KeyError(f"Provider '{name}' not found. Available: {list(config.providers)}")
     prov = create_provider(config.providers[name])
@@ -82,7 +81,12 @@ def get_fallback_provider(
     cost_estimator: "CostEstimator | None" = None,
 ) -> FallbackProvider:
     """Build a FallbackProvider from the fallback_chain in config."""
-    chain = config.fallback.fallback_chain or [config.default_provider]
+    chain = config.fallback.fallback_chain
+    if not chain:
+        raise ValueError(
+            "fallback.fallback_chain is empty — configure at least one provider "
+            "in the chain or invoke with an explicit --provider."
+        )
     providers: list[BaseProvider] = []
     for name in chain:
         if name in config.providers:
