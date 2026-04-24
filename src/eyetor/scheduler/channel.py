@@ -173,6 +173,8 @@ class SchedulerChannel(BaseChannel):
         self._default_tz = default_timezone
         self._scheduler = None
         self._stop_event = asyncio.Event()
+        # Jobs registered before start() lands here and is drained on start.
+        self._pending_callable_jobs: list[tuple] = []
 
     async def start(self) -> None:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -182,6 +184,21 @@ class SchedulerChannel(BaseChannel):
         for task in self._store.list_enabled():
             self._add_job(task)
             logger.info("Scheduled task '%s' (%s)", task.name, task.schedule)
+
+        for job_id, func, trigger, name in self._pending_callable_jobs:
+            try:
+                self._scheduler.add_job(
+                    func,
+                    trigger,
+                    id=job_id,
+                    name=name,
+                    replace_existing=True,
+                    misfire_grace_time=3700,
+                )
+                logger.info("Scheduled callable job '%s' (id=%s)", name, job_id)
+            except Exception as exc:
+                logger.error("Failed to schedule callable job '%s': %s", name, exc)
+        self._pending_callable_jobs.clear()
 
         self._scheduler.start()
         logger.info("Scheduler started with %d task(s)", len(self._store.list_enabled()))
@@ -203,6 +220,30 @@ class SchedulerChannel(BaseChannel):
             self._add_job(task)
         logger.info("Added task '%s' (id=%s, schedule=%s)", task.name, task.id, task.schedule)
         return task
+
+    def add_callable_job(self, job_id: str, func, trigger, name: str) -> None:
+        """Register a Python callable (sync or async) to run on a trigger.
+
+        Unlike add_task(), this bypasses the prompt-based pipeline and executes
+        the callable directly. Used for internal system jobs (e.g. dreams analysis)
+        that aren't agent turns. If the scheduler hasn't started yet, the job is
+        queued and registered when start() runs.
+        """
+        if self._scheduler and self._scheduler.running:
+            try:
+                self._scheduler.add_job(
+                    func,
+                    trigger,
+                    id=job_id,
+                    name=name,
+                    replace_existing=True,
+                    misfire_grace_time=3700,
+                )
+                logger.info("Scheduled callable job '%s' (id=%s)", name, job_id)
+            except Exception as exc:
+                logger.error("Failed to schedule callable job '%s': %s", name, exc)
+        else:
+            self._pending_callable_jobs.append((job_id, func, trigger, name))
 
     def cancel_task(self, task_id: str) -> bool:
         """Remove a task from the store and unschedule it."""

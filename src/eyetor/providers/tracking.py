@@ -55,6 +55,7 @@ class TrackingProvider(BaseProvider):
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
+        thinking: bool | None = None,
     ) -> CompletionResult:
         if not self._tracker.check_limits(self._provider_name):
             raise UsageLimitExceeded(
@@ -62,7 +63,7 @@ class TrackingProvider(BaseProvider):
             )
 
         t0 = time.monotonic()
-        result = await self._inner.complete(messages, tools, temperature)
+        result = await self._inner.complete(messages, tools, temperature, thinking=thinking)
         duration_s = time.monotonic() - t0
         duration_ms = int(duration_s * 1000)
 

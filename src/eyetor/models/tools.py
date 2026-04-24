@@ -25,6 +25,7 @@ class ToolDefinition(BaseModel):
     description: str
     parameters: dict[str, Any]  # JSON Schema object
     handler: Callable[..., Awaitable[str]] | None = None
+    max_output_chars: int | None = None  # per-tool override; None → use registry default
 
     def to_openai_format(self) -> dict[str, Any]:
         """Serialize to OpenAI tools array element."""
@@ -41,9 +42,30 @@ class ToolDefinition(BaseModel):
 class ToolRegistry:
     """Central registry for tool definitions. Agents and skills register tools here."""
 
-    def __init__(self, plugin_registry: "PluginRegistry | None" = None) -> None:
+    def __init__(
+        self,
+        plugin_registry: "PluginRegistry | None" = None,
+        default_max_output_chars: int = 8000,
+    ) -> None:
         self._tools: dict[str, ToolDefinition] = {}
         self._plugin_registry = plugin_registry
+        self._default_max_output_chars = default_max_output_chars
+
+    def _cap_result(self, name: str, result: str) -> str:
+        """Apply size cap: per-tool override first, then registry default."""
+        tool = self._tools.get(name)
+        cap = tool.max_output_chars if tool and tool.max_output_chars else self._default_max_output_chars
+        if cap <= 0 or len(result) <= cap:
+            return result
+        original_len = len(result)
+        truncated = result[:cap]
+        logger.warning(
+            "Tool '%s' output truncated: %d → %d chars", name, original_len, cap
+        )
+        return (
+            truncated
+            + f"\n[truncated from {original_len} chars — refine the query or use a more specific tool]"
+        )
 
     def register(self, tool: ToolDefinition) -> None:
         """Register a tool definition."""
@@ -80,7 +102,7 @@ class ToolRegistry:
             if decision.deny:
                 return json.dumps({"error": f"Blocked by plugin: {decision.deny_reason}"})
             if decision.provided_result is not None:
-                return decision.provided_result
+                return self._cap_result(name, decision.provided_result)
             if decision.modified_input:
                 arguments = decision.modified_input
 
@@ -89,6 +111,7 @@ class ToolRegistry:
             args = json.loads(arguments) if arguments else {}
             result = await tool.handler(**args)
             result = result if isinstance(result, str) else json.dumps(result)
+            result = self._cap_result(name, result)
             duration_ms = int((time.monotonic() - t0) * 1000)
             # Post-hook (fire & forget)
             if self._plugin_registry:

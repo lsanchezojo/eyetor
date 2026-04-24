@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import AsyncIterator, TYPE_CHECKING
 
-from eyetor.models.agents import AgentConfig
+from eyetor.models.agents import AgentConfig, TurnBudget
 from eyetor.models.messages import Message, ToolCall
 from eyetor.models.tools import ToolRegistry, ToolDefinition
 from eyetor.providers.base import BaseProvider
@@ -87,6 +89,34 @@ _FENCED_CODE_RE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 
+# Small local models (Hermes/chatml/Qwen) sometimes emit tool-call syntax as
+# plain text content instead of a structured tool_call — especially after a
+# forced-answer nudge when tools=None. Detect and strip those blocks so the
+# user never sees raw invocation markup. Covers:
+#   <tool_call>...</tool_call>
+#   <function=name>...</function>   (Hermes variant)
+#   <|tool_call|>...<|/tool_call|>  (chatml variant)
+_TEXTUAL_TOOL_CALL_RE = re.compile(
+    r"<tool_call\b[^>]*>.*?</tool_call>"
+    r"|<function=[^>]*>.*?</function>"
+    r"|<\|tool_call\|>.*?<\|/tool_call\|>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _strip_textual_tool_calls(text: str) -> tuple[str, bool]:
+    """Strip textual tool-call markup from model output.
+
+    Returns (cleaned, had_markup). Cleaned output has markup removed and
+    surrounding whitespace collapsed; had_markup is True if any block was
+    stripped, so callers can log / take fallback action.
+    """
+    if not text:
+        return text, False
+    stripped = _TEXTUAL_TOOL_CALL_RE.sub("", text)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+    return stripped, stripped != text.strip()
+
 
 def _is_asking_user(text: str) -> bool:
     """True if the model's message is a request for user input.
@@ -124,6 +154,45 @@ _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 # loop, catching cases the exact-match check misses (same core, varying
 # satellite words — see _tool_call_bag docstring).
 _LOOP_JACCARD_THRESHOLD = 0.6
+
+# Per-tool overrides (prefix match). Web search loops are the dominant failure
+# mode for small models — they permute keywords endlessly when the answer
+# isn't on the open web. A lower threshold trips the guard sooner.
+_TOOL_LOOP_THRESHOLDS: dict[str, float] = {
+    "skill_web_search": 0.4,
+}
+
+
+def _loop_threshold_for(tool_name: str) -> float:
+    for prefix, threshold in _TOOL_LOOP_THRESHOLDS.items():
+        if tool_name.startswith(prefix):
+            return threshold
+    return _LOOP_JACCARD_THRESHOLD
+
+
+def _is_empty_search_result(result: str) -> bool:
+    """True if a web-search tool result has no hits.
+
+    The web-search skill prints a JSON array; empty means ``[]``. Be lenient
+    with whitespace / wrapping objects (``{"results": []}``) since other
+    backends might emit slightly different shapes.
+    """
+    if not result:
+        return True
+    stripped = result.strip()
+    if stripped in ("[]", "{}", ""):
+        return True
+    try:
+        data = json.loads(stripped)
+    except (ValueError, TypeError):
+        return False
+    if isinstance(data, list):
+        return len(data) == 0
+    if isinstance(data, dict):
+        for key in ("results", "items", "hits"):
+            if key in data and isinstance(data[key], list) and not data[key]:
+                return True
+    return False
 
 
 def _tool_call_bag(name: str, arguments: str) -> tuple[str, frozenset[str]]:
@@ -171,6 +240,27 @@ def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     return len(a & b) / len(union) if union else 0.0
 
 
+def _filter_tool_defs(
+    all_tools: list[ToolDefinition],
+    allowlist: list[str] | None,
+) -> list[ToolDefinition] | None:
+    """Apply a route-scoped allowlist to the full tool registry.
+
+    * ``None`` → return all tools verbatim (no filtering).
+    * ``[]``   → return ``None`` so the provider is called with no tools.
+    * list of patterns (exact name or fnmatch glob) → keep matches only.
+    """
+    if allowlist is None:
+        return list(all_tools) if all_tools else None
+    if not allowlist:
+        return None
+    keep: list[ToolDefinition] = []
+    for td in all_tools:
+        if any(fnmatch.fnmatchcase(td.name, pat) for pat in allowlist):
+            keep.append(td)
+    return keep or None
+
+
 class ChatSession:
     """A single ongoing conversation with an agent.
 
@@ -206,6 +296,16 @@ class ChatSession:
         self._cost_estimator = cost_estimator
         self._observer = observer
         self.last_reasoning: str | None = None  # Accumulated reasoning from the latest send() turn
+
+        # Per-turn budget: YAML (sessions.budget) overrides the AgentConfig
+        # default so deployments can tune this without rebuilding the agent.
+        if root_config is not None:
+            self._budget = TurnBudget(
+                max_tool_calls=root_config.sessions.budget.max_tool_calls,
+                max_wall_seconds=root_config.sessions.budget.max_wall_seconds,
+            )
+        else:
+            self._budget = config.budget
 
         self._compactor: ConversationCompactor | None = None
         if root_config and root_config.sessions.compaction.enabled:
@@ -334,28 +434,49 @@ class ChatSession:
     # Sending messages
     # ------------------------------------------------------------------
 
-    async def send(self, user_input: str) -> AsyncIterator[str]:
+    async def send(
+        self,
+        user_input: str,
+        *,
+        allow_chain: bool = True,
+        tools_override: list[str] | None = None,
+    ) -> AsyncIterator[str]:
         """Send a user message; yield streaming tokens from the assistant.
 
         Tool calls are executed silently. The final response is streamed.
         When chain mode is active and the query is complex, delegates to
-        send_chained() automatically.
+        send_chained() automatically. Pass ``allow_chain=False`` to force
+        single-turn execution (e.g. for photo handlers where the prompt is
+        long but doesn't need decomposition).
+
+        ``tools_override`` narrows the toolset for this turn only (used by
+        the intent router to scope routes to relevant tools). See
+        ``_filter_tool_defs`` for semantics.
         """
-        # Check if chain mode should be used for this query
-        if self._is_complex_query(user_input):
-            async for chunk in self.send_chained(user_input):
+        if allow_chain and self._is_complex_query(user_input):
+            async for chunk in self.send_chained(user_input, tools_override=tools_override):
                 yield chunk
             return
 
+        try:
+            async for chunk in self._send_single_turn(user_input, tools_override=tools_override):
+                yield chunk
+        finally:
+            self._squash_tool_messages()
+
+    async def _send_single_turn(
+        self,
+        user_input: str,
+        *,
+        tools_override: list[str] | None = None,
+    ) -> AsyncIterator[str]:
+        """Single-turn body of ``send()``. Wrapped so squash runs exactly once."""
         self.last_reasoning = None
         user_msg = Message(role="user", content=user_input)
         self._messages.append(user_msg)
         self._persist_message(user_msg)
-        tool_defs = (
-            list(self.tool_registry._tools.values())
-            if self.tool_registry._tools
-            else None
-        )
+        all_tools = list(self.tool_registry._tools.values())
+        tool_defs = _filter_tool_defs(all_tools, tools_override)
         current_session_id.set(self.session_id)
 
         if self._compactor:
@@ -373,16 +494,40 @@ class ChatSession:
         recent_bags: list[list[tuple[str, frozenset[str]]]] = []  # for Jaccard
         max_repeat = 3  # max consecutive identical tool calls before forcing answer
         nudged = False  # allow at most one "announce-without-call" nudge per turn
+        empty_web_search_streak = 0  # consecutive web-search calls returning 0 hits
+        kb_nudge_sent = False  # one-shot nudge per turn
+        tool_calls_used = 0
+        turn_start = time.monotonic()
+        budget = self._budget
 
         while iterations < self.config.max_iterations:
             iterations += 1
+            # Turn-budget guard — primary stopper, runs before max_iterations
+            # catches anything. 0 on either field disables that specific budget.
+            elapsed = time.monotonic() - turn_start
+            over_calls = budget.max_tool_calls > 0 and tool_calls_used >= budget.max_tool_calls
+            over_wall = budget.max_wall_seconds > 0 and elapsed >= budget.max_wall_seconds
+            if over_calls or over_wall:
+                reason = (
+                    f"presupuesto agotado ({tool_calls_used} tool calls, "
+                    f"{elapsed:.0f}s de {budget.max_wall_seconds}s)"
+                )
+                async for chunk in self._force_final_answer(
+                    full_messages, user_input, reason=reason
+                ):
+                    yield chunk
+                return
             if self._observer:
                 self._observer.on_iteration(iterations)
-            # Non-streaming call to detect tool calls
+            # When no tools are exposed (chat route, or no registry), the
+            # call is pure conversation — disable reasoning so the local
+            # thinking-mode model doesn't waste ~30 s per turn on a greeting.
+            iter_thinking = None if tool_defs else False
             result = await self.provider.complete(
                 messages=full_messages,
                 tools=tool_defs,
                 temperature=self.config.temperature,
+                thinking=iter_thinking,
             )
             response = result.message
             if result.reasoning_content:
@@ -430,9 +575,20 @@ class ChatSession:
                     )
                     continue
                 # Final answer — yield it token by token (character-level)
+                cleaned, had_markup = _strip_textual_tool_calls(content)
+                if had_markup:
+                    logger.warning(
+                        "Session '%s' — final answer contained textual tool-call markup; stripped.",
+                        self.session_id,
+                    )
+                if not cleaned:
+                    cleaned = (
+                        "No he podido completar la consulta con las herramientas disponibles. "
+                        "¿Puedes reformular la pregunta o darme más contexto?"
+                    )
                 if self._observer:
-                    self._observer.on_done(content)
-                yield content
+                    self._observer.on_done(cleaned)
+                yield cleaned
                 return
 
             # Log tool calls at INFO level for observability
@@ -484,49 +640,24 @@ class ChatSession:
                 # models vary satellite tokens wildly, so min would never
                 # trip; max catches "iter N is nearly iter N-1".
                 bags = [b[0][1] for b in recent_bags]
+                tool_name = recent_bags[-1][0][0]
+                threshold = _loop_threshold_for(tool_name)
                 pairwise = [
                     _jaccard(bags[i], bags[j])
                     for i in range(len(bags))
                     for j in range(i + 1, len(bags))
                 ]
-                if pairwise and max(pairwise) >= _LOOP_JACCARD_THRESHOLD:
+                if pairwise and max(pairwise) >= threshold:
                     loop_reason = (
-                        f"{max_repeat} near-duplicate '{recent_bags[-1][0][0]}' "
-                        f"calls (max Jaccard {max(pairwise):.2f} ≥ {_LOOP_JACCARD_THRESHOLD})"
+                        f"{max_repeat} near-duplicate '{tool_name}' "
+                        f"calls (max Jaccard {max(pairwise):.2f} ≥ {threshold})"
                     )
 
             if loop_reason:
-                logger.warning(
-                    "Session '%s' — loop detected: %s. Forcing final answer.",
-                    self.session_id,
-                    loop_reason,
-                )
-                # Ask the model to answer without tools
-                full_messages.append(
-                    Message(
-                        role="user",
-                        content=(
-                            "IMPORTANT: You seem to be stuck in a loop calling the same tools repeatedly. "
-                            "Please provide your final answer now using the information you already have. "
-                            "Do NOT call any more tools."
-                        ),
-                    )
-                )
-                result = await self.provider.complete(
-                    messages=full_messages,
-                    tools=None,  # no tools — force text response
-                    temperature=self.config.temperature,
-                )
-                forced = result.message
-                if result.reasoning_content:
-                    self.last_reasoning = (
-                        (self.last_reasoning + "\n\n" if self.last_reasoning else "")
-                        + result.reasoning_content
-                    )
-                self._messages.append(forced)
-                self._persist_message(forced, reasoning=result.reasoning_content)
-                content = forced.content or ""
-                yield content
+                async for chunk in self._force_final_answer(
+                    full_messages, user_input, reason=f"loop detectado ({loop_reason})"
+                ):
+                    yield chunk
                 return
 
             # Execute tool calls in parallel
@@ -546,6 +677,7 @@ class ChatSession:
                 *[_exec_tool(tc) for tc in response.tool_calls],
                 return_exceptions=True,
             )
+            tool_calls_used += len(response.tool_calls)
             for entry in exec_results:
                 if isinstance(entry, BaseException):
                     logger.error(
@@ -567,6 +699,36 @@ class ChatSession:
                     len(result),
                     _truncate(result, 200),
                 )
+                if tc.function.name.startswith("skill_web_search"):
+                    if _is_empty_search_result(result):
+                        empty_web_search_streak += 1
+                    else:
+                        empty_web_search_streak = 0
+
+            # Nudge toward kb_search after two consecutive empty web searches.
+            # Small models otherwise re-permute keywords endlessly when the
+            # answer is in the local KB rather than on the open web.
+            if (
+                empty_web_search_streak >= 2
+                and not kb_nudge_sent
+                and any(t.name == "kb_search" for t in tool_defs or [])
+            ):
+                kb_nudge_sent = True
+                logger.info(
+                    "Session '%s' — %d consecutive empty web searches; nudging toward kb_search",
+                    self.session_id,
+                    empty_web_search_streak,
+                )
+                full_messages.append(
+                    Message(
+                        role="user",
+                        content=(
+                            "Las búsquedas web no están dando resultados. "
+                            "Si la información puede estar en el knowledge base local, "
+                            "usa kb_search en su lugar antes de seguir reintentando."
+                        ),
+                    )
+                )
 
             # Intra-turn compaction: tool outputs can blow the context mid-loop
             # even when the turn started under the threshold. Re-check before
@@ -586,7 +748,9 @@ class ChatSession:
                         self._apply_compaction(result)
                         full_messages = self._get_full_messages()
 
-        # Max iterations reached
+        # Max iterations reached — last-resort safety net; budget/loop guards
+        # should normally trip first. Force a final answer instead of bailing
+        # with a canned English message so the user gets something useful.
         logger.warning(
             "Session '%s' — max_iterations (%d) reached. Tool calls made: %s",
             self.session_id,
@@ -598,11 +762,12 @@ class ChatSession:
                 for tc in m.tool_calls
             ),
         )
-        msg = "I reached the maximum number of reasoning steps. Please try a simpler question."
-        max_msg = Message(role="assistant", content=msg)
-        self._messages.append(max_msg)
-        self._persist_message(max_msg)
-        yield msg
+        async for chunk in self._force_final_answer(
+            full_messages,
+            user_input,
+            reason=f"max_iterations ({self.config.max_iterations}) alcanzado",
+        ):
+            yield chunk
 
     async def send_sync(self, user_input: str) -> str:
         """Send a user message and return the complete response (non-streaming)."""
@@ -644,7 +809,12 @@ class ChatSession:
             return False
         return bool(self._MULTI_INSTRUCTION_RE.search(user_input))
 
-    async def send_chained(self, user_input: str) -> AsyncIterator[str]:
+    async def send_chained(
+        self,
+        user_input: str,
+        *,
+        tools_override: list[str] | None = None,
+    ) -> AsyncIterator[str]:
         """Decompose a complex query into plan → execute → synthesize.
 
         Phase 1 (Plan): Ask the LLM to analyze the query and produce a step-by-step
@@ -657,12 +827,20 @@ class ChatSession:
             "Session '%s' — using chain mode for complex query (%d chars)",
             self.session_id, len(user_input),
         )
+        try:
+            async for chunk in self._send_chained_body(user_input, tools_override=tools_override):
+                yield chunk
+        finally:
+            self._squash_tool_messages()
 
-        tool_defs = (
-            list(self.tool_registry._tools.values())
-            if self.tool_registry._tools
-            else None
-        )
+    async def _send_chained_body(
+        self,
+        user_input: str,
+        *,
+        tools_override: list[str] | None = None,
+    ) -> AsyncIterator[str]:
+        all_tools = list(self.tool_registry._tools.values())
+        tool_defs = _filter_tool_defs(all_tools, tools_override)
         tool_names = (
             ", ".join(t.name for t in tool_defs) if tool_defs else "none"
         )
@@ -707,9 +885,21 @@ class ChatSession:
         full_messages = self._get_full_messages()
         execution_output = ""
         iterations = 0
+        tool_calls_used = 0
+        turn_start = time.monotonic()
+        budget = self._budget
 
         while iterations < self.config.max_iterations:
             iterations += 1
+            elapsed = time.monotonic() - turn_start
+            over_calls = budget.max_tool_calls > 0 and tool_calls_used >= budget.max_tool_calls
+            over_wall = budget.max_wall_seconds > 0 and elapsed >= budget.max_wall_seconds
+            if over_calls or over_wall:
+                logger.warning(
+                    "Session '%s' — chain exec budget exhausted (%d calls, %.0fs); stopping.",
+                    self.session_id, tool_calls_used, elapsed,
+                )
+                break
             result = await self.provider.complete(
                 messages=full_messages,
                 tools=tool_defs,
@@ -739,6 +929,7 @@ class ChatSession:
                 *[_exec_tool(tc) for tc in response.tool_calls],
                 return_exceptions=True,
             )
+            tool_calls_used += len(response.tool_calls)
             for entry in exec_results:
                 if isinstance(entry, BaseException):
                     logger.error("Session '%s' chain exec error: %s", self.session_id, entry)
@@ -762,15 +953,27 @@ class ChatSession:
             messages=synth_messages,
             tools=None,
             temperature=self.config.temperature,
+            thinking=False,
         )
         final_output = synth_result.message.content or execution_output
+        cleaned, had_markup = _strip_textual_tool_calls(final_output)
+        if had_markup:
+            logger.warning(
+                "Session '%s' — synthesis output contained textual tool-call markup; stripped.",
+                self.session_id,
+            )
+        if not cleaned:
+            cleaned = (
+                "No he podido completar la consulta con las herramientas disponibles. "
+                "¿Puedes reformular la pregunta o darme más contexto?"
+            )
 
         # Store the synthesis as the final assistant message
-        synth_msg = Message(role="assistant", content=final_output)
+        synth_msg = Message(role="assistant", content=cleaned)
         self._messages.append(synth_msg)
         self._persist_message(synth_msg)
 
-        yield final_output
+        yield cleaned
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -806,23 +1009,400 @@ class ChatSession:
             logger.info("Archived pre-compaction messages to %s", result.archived_path)
 
         self._messages = result.new_messages
+        self._rewrite_persist_file(label="compaction")
 
-        if self._persist_path:
-            try:
-                with open(self._persist_path, "w", encoding="utf-8") as f:
-                    for msg in self._messages:
-                        f.write(
-                            json.dumps(
-                                msg.model_dump(exclude_none=True), ensure_ascii=False
-                            )
-                            + "\n"
+    def _rewrite_persist_file(self, *, label: str = "rewrite") -> None:
+        """Rewrite the JSONL to match current ``self._messages`` verbatim."""
+        if not self._persist_path:
+            return
+        try:
+            with open(self._persist_path, "w", encoding="utf-8") as f:
+                for msg in self._messages:
+                    f.write(
+                        json.dumps(
+                            msg.model_dump(exclude_none=True), ensure_ascii=False
                         )
+                        + "\n"
+                    )
+            logger.info(
+                "Rewrote session JSONL after %s (%d messages)",
+                label, len(self._messages),
+            )
+        except Exception as e:
+            logger.warning("Failed to rewrite JSONL after %s: %s", label, e)
+
+    def _squash_tool_messages(self) -> None:
+        """Collapse raw tool-result content into compact snapshots.
+
+        Run at the end of every turn so the next turn doesn't carry the raw
+        tool output (PDF dumps, 6 kB JSON blobs) into the provider context.
+        Pure structural rewrite — no LLM call — because per-result LLM
+        condensation was exactly what regressed the local-provider path in
+        the previous iteration. The snapshot keeps the tool_call_id pairing
+        intact so OpenAI's message schema stays valid.
+        """
+        changed = False
+        for i, msg in enumerate(self._messages):
+            if msg.role != "tool":
+                continue
+            content = msg.content or ""
+            if not content or content.startswith("[snapshot"):
+                continue
+            preview = _truncate(content, 300)
+            snapshot = f"[snapshot · {len(content)} chars] {preview}"
+            self._messages[i] = Message(
+                role="tool",
+                tool_call_id=msg.tool_call_id,
+                content=snapshot,
+            )
+            changed = True
+        if not changed:
+            return
+        logger.info(
+            "Session '%s' — squashed tool messages (now %d msgs in history)",
+            self.session_id, len(self._messages),
+        )
+        self._rewrite_persist_file(label="squash")
+
+    # ------------------------------------------------------------------
+    # KB 2-phase handler (research → synthesis)
+    # ------------------------------------------------------------------
+
+    async def send_kb_query(
+        self,
+        user_input: str,
+        *,
+        tools_override: list[str] | None = None,
+    ) -> AsyncIterator[str]:
+        """Answer a KB question in two explicit phases.
+
+        Phase 1 — research: the model is exposed to KB tools only (by
+        default ``kb_search`` / ``kb_read`` / ``kb_list_sources``). Each raw
+        tool result is *condensed* into a few bullets with a micro-LLM call
+        before re-entering the context, so the model never drags 5 kB of raw
+        PDF back into its next decision.
+
+        Phase 2 — synthesis: the model is called once more with ``tools=None``
+        and only the condensed bullets in context. This is the step that
+        actually answers the user; SLMs handle it much more reliably than
+        the generic "decide when to stop" loop.
+
+        Budget is tighter than the generic ``TurnBudget``: 3 tool calls and
+        60 s max, because research should be focused, not exhaustive.
+        """
+        try:
+            async for chunk in self._send_kb_query_body(user_input, tools_override=tools_override):
+                yield chunk
+        finally:
+            self._squash_tool_messages()
+
+    async def _send_kb_query_body(
+        self,
+        user_input: str,
+        *,
+        tools_override: list[str] | None = None,
+    ) -> AsyncIterator[str]:
+        self.last_reasoning = None
+        user_msg = Message(role="user", content=user_input)
+        self._messages.append(user_msg)
+        self._persist_message(user_msg)
+        current_session_id.set(self.session_id)
+
+        all_tools = list(self.tool_registry._tools.values())
+        allow = (
+            tools_override
+            if tools_override is not None
+            else ["kb_search", "kb_read", "kb_list_sources"]
+        )
+        kb_tools = _filter_tool_defs(all_tools, allow)
+        if not kb_tools:
+            msg = (
+                "No hay herramientas de KB disponibles. Revisa la configuración "
+                "de knowledge en config/default.yaml."
+            )
+            final = Message(role="assistant", content=msg)
+            self._messages.append(final)
+            self._persist_message(final)
+            yield msg
+            return
+
+        research_system = self._build_system_content() + (
+            "\n\n[Modo investigación KB]\n"
+            "Dispones sólo de herramientas KB y un presupuesto estricto de 3 "
+            "llamadas a tools. Úsalas para localizar y leer lo que necesites. "
+            "Tras reunir la información, DEJA DE LLAMAR TOOLS; una síntesis "
+            "posterior redactará la respuesta al usuario. No repitas búsquedas "
+            "ni vuelvas a leer secciones ya consultadas."
+        )
+        research_messages: list[Message] = [
+            Message(role="system", content=research_system),
+            Message(role="user", content=user_input),
+        ]
+        scratchpad: list[str] = []
+
+        budget = self._budget
+        cfg_calls = budget.max_tool_calls if budget.max_tool_calls > 0 else 3
+        cfg_wall = budget.max_wall_seconds if budget.max_wall_seconds > 0 else 60
+        max_calls = min(cfg_calls, 3)
+        max_wall = min(cfg_wall, 60)
+        tool_calls_used = 0
+        turn_start = time.monotonic()
+
+        logger.info(
+            "Session '%s' — KB 2-phase research start (budget %d calls, %ds)",
+            self.session_id, max_calls, max_wall,
+        )
+
+        while tool_calls_used < max_calls:
+            elapsed = time.monotonic() - turn_start
+            if elapsed >= max_wall:
                 logger.info(
-                    "Rewrote session JSONL after compaction (%d messages)",
-                    len(self._messages),
+                    "Session '%s' — KB research wall-time reached (%.0fs)",
+                    self.session_id, elapsed,
                 )
-            except Exception as e:
-                logger.warning("Failed to rewrite JSONL after compaction: %s", e)
+                break
+            try:
+                result = await self.provider.complete(
+                    messages=research_messages,
+                    tools=kb_tools,
+                    temperature=self.config.temperature,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Session '%s' — KB research LLM error: %s",
+                    self.session_id, exc,
+                )
+                break
+            response = result.message
+            if result.reasoning_content:
+                self.last_reasoning = (
+                    (self.last_reasoning + "\n\n" if self.last_reasoning else "")
+                    + result.reasoning_content
+                )
+            self._messages.append(response)
+            self._persist_message(response, reasoning=result.reasoning_content)
+            research_messages.append(response)
+
+            if not response.tool_calls:
+                break
+
+            async def _exec(tc: ToolCall) -> tuple[ToolCall, str]:
+                r = await self.tool_registry.execute(
+                    tc.function.name, tc.function.arguments
+                )
+                return tc, r
+
+            exec_results = await asyncio.gather(
+                *[_exec(tc) for tc in response.tool_calls],
+                return_exceptions=True,
+            )
+            for entry in exec_results:
+                if isinstance(entry, BaseException):
+                    logger.error(
+                        "Session '%s' — KB tool error: %s",
+                        self.session_id, entry,
+                    )
+                    continue
+                tc, raw = entry
+                tool_calls_used += 1
+                # KB tools already bound their own output (kb_search snippets
+                # ≤400 chars, kb_read sections ≤1800 chars). A further LLM
+                # condensation call used to live here but burned 1 extra LLM
+                # round-trip per tool call for marginal benefit — removed so
+                # the local thinking-mode model doesn't pay that overhead.
+                kept = raw[:2000] if len(raw) > 2000 else raw
+                logger.info(
+                    "Session '%s' — KB call %d/%d: %s(%s) → %d chars raw (kept %d)",
+                    self.session_id, tool_calls_used, max_calls,
+                    tc.function.name, _truncate(tc.function.arguments, 100),
+                    len(raw), len(kept),
+                )
+                scratchpad.append(
+                    f"[{tc.function.name} · {_truncate(tc.function.arguments, 80)}]\n{kept}"
+                )
+                tool_msg = Message(role="tool", tool_call_id=tc.id, content=kept)
+                self._messages.append(tool_msg)
+                self._persist_message(tool_msg)
+                research_messages.append(tool_msg)
+
+        logger.info(
+            "Session '%s' — KB research done: %d calls, %d bullet blocks, %.0fs",
+            self.session_id, tool_calls_used, len(scratchpad),
+            time.monotonic() - turn_start,
+        )
+
+        scratch_text = "\n\n".join(scratchpad) if scratchpad else "(no se obtuvo información de la KB)"
+        synth_messages = [
+            Message(
+                role="system",
+                content=(
+                    "Eres un asistente que responde en castellano basándose en "
+                    "notas de investigación ya recabadas. No uses herramientas. "
+                    "Cita documento y sección cuando aporte valor. Si las notas "
+                    "no bastan, dilo con claridad y pide al usuario lo que falta."
+                ),
+            ),
+            Message(
+                role="user",
+                content=(
+                    f"Pregunta del usuario:\n{user_input}\n\n"
+                    f"Notas de la KB:\n{scratch_text}\n\n"
+                    "Redacta la respuesta final."
+                ),
+            ),
+        ]
+        cleaned = ""
+        try:
+            # thinking=False: synthesis is a straight "summarise these notes"
+            # task — no reasoning pass needed. Skipping it shaves ~10-30 s on
+            # the local thinking-mode model.
+            synth_result = await self.provider.complete(
+                messages=synth_messages,
+                tools=None,
+                temperature=self.config.temperature,
+                thinking=False,
+            )
+            if synth_result.reasoning_content:
+                self.last_reasoning = (
+                    (self.last_reasoning + "\n\n" if self.last_reasoning else "")
+                    + synth_result.reasoning_content
+                )
+            final_text = synth_result.message.content or ""
+            cleaned, _ = _strip_textual_tool_calls(final_text)
+            if not cleaned and synth_result.reasoning_content:
+                raw_reasoning, _ = _strip_textual_tool_calls(
+                    synth_result.reasoning_content
+                )
+                cleaned = raw_reasoning
+        except Exception as exc:
+            logger.error(
+                "Session '%s' — KB synthesis failed: %s",
+                self.session_id, exc,
+            )
+        if not cleaned:
+            cleaned = (
+                "No he podido sintetizar una respuesta. Reformula la pregunta "
+                "o indícame qué documento quieres consultar."
+            )
+        final_msg = Message(role="assistant", content=cleaned)
+        self._messages.append(final_msg)
+        self._persist_message(final_msg)
+        if self._observer:
+            self._observer.on_done(cleaned)
+        yield cleaned
+
+    async def _force_final_answer(
+        self,
+        full_messages: list[Message],
+        user_input: str,
+        *,
+        reason: str,
+    ) -> AsyncIterator[str]:
+        """Force a final answer with ``tools=None`` and yield the cleaned text.
+
+        Shared path for both the loop detector and the per-turn budget
+        guard. Append a "stop calling tools" nudge, call the provider once
+        more, and fall back through three tiers of recovery when the model
+        returns empty content: (1) synthesise from reasoning_content,
+        (2) expose the raw reasoning, (3) generic apology.
+        """
+        logger.warning(
+            "Session '%s' — forcing final answer: %s",
+            self.session_id,
+            reason,
+        )
+        full_messages.append(
+            Message(
+                role="user",
+                content=(
+                    "IMPORTANTE: deja de llamar a herramientas. Responde AHORA al "
+                    "usuario con la información que ya tengas en castellano. "
+                    "Si no basta para contestar, dilo honestamente y pide lo que falta."
+                ),
+            )
+        )
+        # thinking=False: we just need a short synthesis, not another reasoning pass.
+        result = await self.provider.complete(
+            messages=full_messages,
+            tools=None,
+            temperature=self.config.temperature,
+            thinking=False,
+        )
+        forced = result.message
+        if result.reasoning_content:
+            self.last_reasoning = (
+                (self.last_reasoning + "\n\n" if self.last_reasoning else "")
+                + result.reasoning_content
+            )
+        self._messages.append(forced)
+        self._persist_message(forced, reasoning=result.reasoning_content)
+        content = forced.content or ""
+        cleaned, had_markup = _strip_textual_tool_calls(content)
+        if had_markup:
+            logger.warning(
+                "Session '%s' — forced answer contained textual tool-call markup; stripped.",
+                self.session_id,
+            )
+        if not cleaned and result.reasoning_content:
+            logger.warning(
+                "Session '%s' — forced answer empty; summarising reasoning_content.",
+                self.session_id,
+            )
+            synth_messages = [
+                Message(
+                    role="system",
+                    content=(
+                        "Eres un asistente que transforma razonamientos internos "
+                        "en respuestas útiles al usuario. No uses herramientas. "
+                        "No menciones que estabas pensando ni que te hayan pasado "
+                        "un razonamiento. Responde en primera persona como si "
+                        "fueras directamente el agente."
+                    ),
+                ),
+                Message(
+                    role="user",
+                    content=(
+                        f"Pregunta original del usuario:\n{user_input}\n\n"
+                        f"Razonamiento interno que se produjo:\n{result.reasoning_content}\n\n"
+                        "Redacta una respuesta directa y útil basada en ese "
+                        "razonamiento. Si el razonamiento no basta para responder, "
+                        "dilo honestamente y pide al usuario lo que falta."
+                    ),
+                ),
+            ]
+            try:
+                synth_result = await self.provider.complete(
+                    messages=synth_messages,
+                    tools=None,
+                    temperature=self.config.temperature,
+                    thinking=False,
+                )
+                synth_content = synth_result.message.content or ""
+                cleaned, _ = _strip_textual_tool_calls(synth_content)
+            except Exception as exc:
+                logger.warning(
+                    "Session '%s' — reasoning synthesis failed: %s",
+                    self.session_id,
+                    exc,
+                )
+            if not cleaned:
+                logger.warning(
+                    "Session '%s' — synthesis empty; exposing raw reasoning.",
+                    self.session_id,
+                )
+                raw, _ = _strip_textual_tool_calls(result.reasoning_content or "")
+                cleaned = raw
+        if not cleaned:
+            cleaned = (
+                "No he podido completar la consulta con las herramientas disponibles. "
+                "¿Puedes reformular la pregunta o darme más contexto?"
+            )
+        final_msg = Message(role="assistant", content=cleaned)
+        self._messages.append(final_msg)
+        self._persist_message(final_msg)
+        if self._observer:
+            self._observer.on_done(cleaned)
+        yield cleaned
 
     def _register_memory_tools(self, memory_manager: "MemoryManager") -> None:
         """Register remember/forget tools backed by persistent memory."""

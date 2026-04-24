@@ -13,6 +13,7 @@ from rich.markdown import Markdown
 from rich.prompt import Prompt
 
 from eyetor.channels.base import BaseChannel
+from eyetor.channels.errors import format_user_error
 from eyetor.chat.manager import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -44,9 +45,11 @@ class CliChannel(BaseChannel):
         self,
         session_manager: SessionManager,
         skill_reg=None,
+        dreams_scheduler=None,
     ) -> None:
         self._manager = session_manager
         self._skill_reg = skill_reg
+        self._dreams_scheduler = dreams_scheduler
         self._console = Console()
         self._running = False
 
@@ -58,7 +61,8 @@ class CliChannel(BaseChannel):
             "Type [bold]/help[/bold] for commands, [bold]/exit[/bold] to quit.\n"
         )
 
-        session = self._manager.get_or_create(_get_cli_session_id())
+        session_id = _get_cli_session_id()
+        session = self._manager.get_or_create(session_id)
 
         while self._running:
             try:
@@ -119,13 +123,18 @@ class CliChannel(BaseChannel):
             elif user_input.lower() == "/help":
                 self._console.print(_HELP)
                 continue
+            elif user_input.lower().startswith("/dreams"):
+                await self._handle_dreams_command(user_input)
+                continue
 
             # Send to agent and stream response
             self._console.print("\n[bold green]Assistant[/bold green]:", end=" ")
             response_text = ""
             try:
                 with self._console.status("", spinner="dots"):
-                    async for chunk in session.send(user_input):
+                    async for chunk in self._manager.route_and_send(
+                        session_id, user_input
+                    ):
                         response_text += chunk
                 # Show reasoning/thinking block if present
                 if session.last_reasoning:
@@ -140,12 +149,51 @@ class CliChannel(BaseChannel):
                 for img_path in _collect_image_paths(response_text, session):
                     self._console.print(f"[green]Imagen guardada:[/green] {img_path}")
             except Exception as exc:
-                self._console.print(f"[red]Error: {exc}[/red]")
+                self._console.print(f"[red]{format_user_error(exc)}[/red]")
                 logger.error("Chat error: %s", exc)
             self._console.print()
 
     async def stop(self) -> None:
         self._running = False
+
+    async def _handle_dreams_command(self, user_input: str) -> None:
+        """Handle /dreams command."""
+        if self._dreams_scheduler is None:
+            self._console.print("[dim]Sistema de sueños no configurado.[/dim]")
+            return
+
+        parts = user_input.strip().split()
+        command = parts[1].lower() if len(parts) > 1 else "list"
+
+        try:
+            if command == "list" or command == "":
+                result = await self._dreams_scheduler.handle_list()
+                self._console.print(Markdown(result))
+            elif command == "run":
+                result = await self._dreams_scheduler.handle_run()
+                self._console.print(f"[green]{result}[/green]")
+            elif command.startswith("apply"):
+                if len(parts) < 3:
+                    self._console.print("[yellow]Uso: /dreams apply <id>[/yellow]")
+                    return
+                proposal_id = int(parts[2])
+                result = await self._dreams_scheduler.handle_apply(proposal_id)
+                self._console.print(f"[green]{result}[/green]")
+            elif command.startswith("dismiss"):
+                if len(parts) < 3:
+                    self._console.print("[yellow]Uso: /dreams dismiss <id>[/yellow]")
+                    return
+                proposal_id = int(parts[2])
+                result = await self._dreams_scheduler.handle_dismiss(proposal_id)
+                self._console.print(f"[green]{result}[/green]")
+            else:
+                self._console.print(
+                    "[yellow]Uso: /dreams [list|run|apply <id>|dismiss <id>][/yellow]"
+                )
+        except ValueError:
+            self._console.print("[red]ID de propuesta inválido.[/red]")
+        except Exception as exc:
+            self._console.print(f"[red]Error: {exc}[/red]")
 
     def _show_history(self, session) -> None:
         history = session.get_history()

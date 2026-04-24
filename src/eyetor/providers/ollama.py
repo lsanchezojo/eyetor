@@ -32,7 +32,9 @@ class OllamaProvider(BaseProvider):
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
+        thinking: bool | None = None,
     ) -> CompletionResult:
+        del thinking  # Ollama's OpenAI bridge has no reasoning toggle.
         payload = self._build_payload(messages, tools, temperature, stream=False)
         async with self._client(timeout=300.0) as client:
             response = await client.post(

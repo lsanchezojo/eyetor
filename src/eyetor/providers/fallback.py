@@ -8,7 +8,7 @@ import httpx
 
 from eyetor.models.messages import CompletionResult, Message, StreamingResponse
 from eyetor.models.tools import ToolDefinition
-from eyetor.providers.base import BaseProvider
+from eyetor.providers.base import BaseProvider, ContextOverflowError
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,10 @@ class FallbackProvider(BaseProvider):
         self._retry_on = retry_on or (_RETRYABLE_ERRORS | _RETRYABLE_STATUS)
 
     def _should_retry(self, exc: Exception) -> bool:
+        # Context overflow is always retryable — a bigger-context provider
+        # downstream may be able to handle the request.
+        if isinstance(exc, ContextOverflowError):
+            return True
         if isinstance(exc, httpx.TimeoutException) and "timeout" in self._retry_on:
             return True
         if (
@@ -54,11 +58,12 @@ class FallbackProvider(BaseProvider):
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
+        thinking: bool | None = None,
     ) -> CompletionResult:
         last_exc: Exception | None = None
         for provider in self._providers:
             try:
-                return await provider.complete(messages, tools, temperature)
+                return await provider.complete(messages, tools, temperature, thinking=thinking)
             except Exception as exc:
                 if self._should_retry(exc):
                     logger.warning(

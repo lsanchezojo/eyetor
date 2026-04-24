@@ -37,7 +37,12 @@ class OpenRouterProvider(BaseProvider):
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
+        thinking: bool | None = None,
     ) -> CompletionResult:
+        # OpenRouter doesn't surface a reasoning toggle via the OpenAI-compatible
+        # API — individual models decide. Accept the flag for interface
+        # compatibility but ignore it.
+        del thinking
         payload = self._build_payload(messages, tools, temperature, stream=False)
         async with self._client(timeout=120.0) as client:
             response = await client.post(

@@ -17,7 +17,8 @@ providers:
     model: default
     temperature: 0.5
     thinking: true   # set to true to enable reasoning channel (Gemma-4, QwQ, etc.)
-    
+    request_timeout: 180   # cap a single /chat/completions call; aligned with sessions.budget.max_wall_seconds. Auxiliary calls (classifier, synthesis) pass thinking=false to stay under the cap.
+
   llamacpp-vision:
     type: llamacpp
     base_url: http://localhost:8082/v1
@@ -73,21 +74,32 @@ scheduler:
   db_path: ~/.eyetor/scheduler.db
   default_timezone: Europe/Madrid
 
-# Routing: classify incoming messages and apply specialized system prompts.
-# Improves SLM performance by reducing prompt complexity per route.
-# routing:
-#   enabled: true
-#   classifier_votes: 3        # voting rounds for reliable classification (1 = no voting)
-#   routes:
-#     coding:
-#       description: "Programming, code generation, debugging, and technical tasks"
-#       system_prompt: "You are an expert programmer. Focus on writing clean, correct code."
-#     research:
-#       description: "Information lookup, analysis, and summarization tasks"
-#       system_prompt: "You are a research specialist. Be thorough and cite your sources."
-#     conversation:
-#       description: "General chat, greetings, and casual conversation"
-#       system_prompt: "You are a friendly conversational assistant. Be concise."
+# Routing: clasifica cada mensaje y aplica un prompt + subconjunto de tools
+# por ruta. Pensado para SLMs: evita que el modelo vea 15 herramientas cuando
+# la pregunta sólo necesita dos. Cada ruta tiene una lista ``tools``:
+#   - null (omitida)  → hereda todo el registro (todas las tools).
+#   - []              → sin herramientas (respuesta directa, sin loop).
+#   - ["kb_*", ...]   → whitelist (fnmatch) — sólo esas tools visibles.
+routing:
+  enabled: true
+  classifier_votes: 1            # 1 = sin voting; subir a 3 si el clasificador es inconsistente
+  routes:
+    chat:
+      description: "Saludos, charla casual, preguntas sobre el propio agente, small-talk"
+      system_prompt: "Responde brevemente y en castellano. No invoques herramientas."
+      tools: []
+    kb_query:
+      description: "Preguntas cuya respuesta está en la base de conocimientos local (reglamentos, manuales, apuntes indexados)"
+      # handler=kb_2phase usa un flujo investigación→síntesis con budget de 3 tool calls
+      # y condensación por resultado. El system_prompt aquí sólo es informativo — el
+      # handler inyecta sus propios prompts por fase.
+      system_prompt: "Consulta la KB local y responde en castellano citando documento y sección."
+      tools: ["kb_search", "kb_read", "kb_list_sources"]
+      handler: kb_2phase
+    tool_task:
+      description: "Tareas que requieren ejecutar acciones: shell, filesystem, búsquedas web, generación de imágenes, tareas programadas"
+      system_prompt: "Ejecuta la tarea usando las herramientas disponibles. Responde en castellano al terminar."
+      # tools omitido → hereda todo el registro
 
 orchestrator:
   auto_delegate: false
@@ -170,9 +182,16 @@ knowledge:
 # Session persistence and compaction settings
 sessions:
   persist: true
+  # Per-turn budget — hard cap on how long a single user message can occupy the
+  # agent before it is forced to synthesise with whatever it already has.
+  # max_iterations (20) remains as a last-resort safety net; this trips first.
+  # Set either field to 0 to disable that specific budget.
+  budget:
+    max_tool_calls: 6
+    max_wall_seconds: 180
   chain:
     mode: auto           # auto | always | never — decompose complex queries into plan→execute→synthesize
-    complexity_threshold: 300  # min chars to consider a message complex (auto mode)
+    complexity_threshold: 800  # min chars to consider a message complex (auto mode)
     plan_votes: 1         # voting rounds for planning step (1 = no voting)
   compaction:
     enabled: true
@@ -182,5 +201,10 @@ sessions:
     keep_last_n_user_turns: 2
     summary_max_percent: 0.05
     archive_dir: ~/.eyetor/sessions/archive
+
+# Hard cap on tool result size — prevents one oversized result from
+# blowing the context window. Override per-tool via ToolDefinition.max_output_chars.
+tools:
+  max_output_chars: 8000
 
 log_level: INFO

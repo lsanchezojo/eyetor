@@ -231,7 +231,10 @@ def start(
             await plugin_registry.run_init()
 
         # Shared tool registry
-        tool_registry = ToolRegistry(plugin_registry=plugin_registry)
+        tool_registry = ToolRegistry(
+            plugin_registry=plugin_registry,
+            default_max_output_chars=cfg.tools.max_output_chars,
+        )
         if skill_names:
             from eyetor.skills.router import RoutingError, ScriptRouter
 
@@ -624,6 +627,14 @@ def start(
                 default_timezone=sched_cfg.default_timezone,
             )
 
+        # Dreams scheduler (shared across channels)
+        dreams_scheduler = None
+        if cfg.dreams and cfg.dreams.enabled and scheduler:
+            from eyetor.dreams.scheduler import DreamsScheduler
+
+            dreams_scheduler = DreamsScheduler(cfg, scheduler)
+            dreams_scheduler.schedule_dreams()
+
         # Build channels
         channels = []
 
@@ -641,7 +652,7 @@ def start(
                 tracker=tracker,
                 cost_estimator=cost_estimator,
             )
-            channels.append(CliChannel(session_mgr_cli, skill_reg=skill_reg))
+            channels.append(CliChannel(session_mgr_cli, skill_reg=skill_reg, dreams_scheduler=dreams_scheduler))
 
         tg_cfg = cfg.channels.telegram
         if tg_cfg.enabled and tg_cfg.bot_token and not interactive:
@@ -666,6 +677,7 @@ def start(
                     scheduler=scheduler,
                     tracker=tracker,
                     full_config=cfg,
+                    dreams_scheduler=dreams_scheduler,
                 )
             )
 
@@ -816,6 +828,124 @@ def _split_args(args: str) -> list[str]:
         return shlex.split(args)
     except ValueError:
         return args.split()
+
+
+# ---------------------------------------------------------------------------
+# eyetor dreams
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def dreams() -> None:
+    """Sueños system — nocturnal self-reflection and improvement proposals."""
+    pass
+
+
+@dreams.command("run")
+@click.pass_context
+def dreams_run(ctx: click.Context) -> None:
+    """Run dream analysis manually."""
+    import logging
+
+    from eyetor.dreams.analyzer import DreamsAnalyzer
+    from eyetor.dreams.config import DreamConfig
+    from eyetor.dreams.proposer import ProposalGenerator
+    from eyetor.dreams.store import DreamsStore
+    from pathlib import Path
+
+    console = Console()
+    logging.basicConfig(level=logging.INFO)
+
+    cfg = ctx.obj["cfg"]
+    if not cfg.dreams:
+        console.print("[red]Sueños no configurado. Añade 'dreams' a config.yaml[/red]")
+        return
+
+    config = cfg.dreams
+    store = DreamsStore(Path("~/.eyetor/dreams.db").expanduser())
+    sessions_dir = Path("~/.eyetor/sessions").expanduser()
+    tracking_db = Path(config.tracking.db_path.replace("~", str(Path.home())))
+    memory_db = Path(config.memory_db_path.replace("~", str(Path.home())))
+
+    console.print("[dim]Ejecutando análisis de sueños...[/dim]")
+
+    analyzer = DreamsAnalyzer(
+        store=store,
+        sessions_dir=sessions_dir,
+        tracking_db=tracking_db,
+        memory_db=memory_db,
+        config=config,
+    )
+
+    generator = ProposalGenerator(
+        store=store,
+        output_dir=Path(config.output_dir).expanduser(),
+    )
+
+    async def _run():
+        analysis = await analyzer.run_analysis()
+        if analysis.findings:
+            proposal_ids = generator.generate_and_save(analysis)
+            console.print(f"[green]✓ {len(proposal_ids)} propuesta(s) generada(s)[/green]")
+        else:
+            console.print("[dim]No se encontraron hallazgos significativos[/dim]")
+
+    asyncio.run(_run())
+
+
+@dreams.command("list")
+@click.option("--pending/--all", default=True, help="Show only pending proposals.")
+@click.pass_context
+def dreams_list(ctx: click.Context, pending: bool) -> None:
+    """List dream proposals."""
+    from eyetor.dreams.proposer import ProposalGenerator
+    from eyetor.dreams.store import DreamsStore, ProposalStatus
+    from pathlib import Path
+
+    cfg = ctx.obj["cfg"]
+    if not cfg.dreams:
+        console.print("[red]Sueños no configurado[/red]")
+        return
+
+    store = DreamsStore(Path("~/.eyetor/dreams.db").expanduser())
+    generator = ProposalGenerator(store, Path(cfg.dreams.output_dir).expanduser())
+
+    if pending:
+        proposals = store.get_pending_proposals()
+    else:
+        proposals = store.get_all_proposals(limit=30)
+
+    if not proposals:
+        console.print("[dim]No hay propuestas[/dim]")
+    else:
+        output = generator.format_pending_proposals(proposals)
+        console.print(Markdown(output))
+
+
+@dreams.command("apply")
+@click.argument("proposal_id", type=int)
+@click.pass_context
+def dreams_apply(ctx: click.Context, proposal_id: int) -> None:
+    """Mark a proposal as applied."""
+    from eyetor.dreams.store import DreamsStore, ProposalStatus
+    from pathlib import Path
+
+    store = DreamsStore(Path("~/.eyetor/dreams.db").expanduser())
+    store.update_proposal_status(proposal_id, ProposalStatus.APPLIED)
+    console.print(f"[green]Propuesta #{proposal_id} marcada como aplicada[/green]")
+
+
+@dreams.command("dismiss")
+@click.argument("proposal_id", type=int)
+@click.pass_context
+def dreams_dismiss(ctx: click.Context, proposal_id: int) -> None:
+    """Dismiss a proposal."""
+    from eyetor.dreams.store import DreamsStore, ProposalStatus
+    from pathlib import Path
+
+    store = DreamsStore(Path("~/.eyetor/dreams.db").expanduser())
+    store.update_proposal_status(proposal_id, ProposalStatus.DISMISSED)
+    console.print(f"[green]Propuesta #{proposal_id} descartada[/green]")
 
 
 # ---------------------------------------------------------------------------

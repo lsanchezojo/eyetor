@@ -12,6 +12,23 @@ from eyetor.models.tools import ToolDefinition
 logger = logging.getLogger(__name__)
 
 
+class ProviderError(Exception):
+    """Base class for provider-level errors that callers may want to catch."""
+
+
+class ContextOverflowError(ProviderError):
+    """Raised when the request exceeds the provider's context window.
+
+    Treated as retryable by FallbackProvider so a longer-context backend
+    can take over.
+    """
+
+    def __init__(self, message: str, *, n_prompt_tokens: int | None = None, n_ctx: int | None = None) -> None:
+        super().__init__(message)
+        self.n_prompt_tokens = n_prompt_tokens
+        self.n_ctx = n_ctx
+
+
 class BaseProvider(ABC):
     """Abstract base for all LLM providers.
 
@@ -43,8 +60,17 @@ class BaseProvider(ABC):
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
+        thinking: bool | None = None,
     ) -> CompletionResult:
-        """Send messages and return the assistant reply (non-streaming)."""
+        """Send messages and return the assistant reply (non-streaming).
+
+        ``thinking`` overrides the provider's default reasoning mode for this
+        call only. ``None`` uses the provider's configured default; ``False``
+        forces reasoning off even if the provider is configured with
+        ``thinking=True`` (used for cheap auxiliary calls — classifier,
+        synthesis — where deep reasoning just adds latency without value).
+        Providers that don't support reasoning ignore the flag.
+        """
 
     @abstractmethod
     async def stream(

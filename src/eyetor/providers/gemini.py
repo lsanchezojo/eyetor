@@ -32,7 +32,9 @@ class GeminiProvider(BaseProvider):
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
+        thinking: bool | None = None,
     ) -> CompletionResult:
+        del thinking  # Gemini's OpenAI bridge has no reasoning toggle.
         payload = self._build_payload(messages, tools, temperature, stream=False)
         async with self._client(timeout=120.0) as client:
             response = await client.post(

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from eyetor.agents.base import BaseAgent
 from eyetor.models.agents import AgentConfig
+from eyetor.models.messages import Message
 from eyetor.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
@@ -47,10 +48,41 @@ _CLASSIFIER_PROMPT = """You are a routing classifier. Given a user request, choo
 Available routes:
 {routes_list}
 
-Respond with JSON only:
+{history_block}Respond with JSON only:
 {{"route": "<route_name>", "reasoning": "<brief explanation>"}}
 
-Choose the single best route. If no route fits well, choose the closest one."""
+Choose the single best route. If no route fits well, choose the closest one.
+When recent conversation is provided, use it to disambiguate short or context-dependent messages (e.g. a follow-up like "las credenciales están ahí" refers back to whatever the agent was just doing)."""
+
+
+# Keep the last K user/assistant turns as classifier context. Tool messages are
+# skipped — for routing, "what did the user ask and what did the agent say" is
+# the useful signal; raw tool outputs are noise and bloat the prompt.
+_HISTORY_MAX_MESSAGES = 6
+_HISTORY_MESSAGE_CHARS = 200
+
+
+def _format_history(history: list | None) -> str:
+    """Render conversation history into a compact block for the classifier."""
+    if not history:
+        return ""
+    recent: list = []
+    for msg in reversed(history):
+        if getattr(msg, "role", None) not in ("user", "assistant"):
+            continue
+        content = getattr(msg, "content", None) or ""
+        content = " ".join(content.split())
+        if not content:
+            continue
+        if len(content) > _HISTORY_MESSAGE_CHARS:
+            content = content[:_HISTORY_MESSAGE_CHARS] + "…"
+        recent.append(f"{msg.role}: {content}")
+        if len(recent) >= _HISTORY_MAX_MESSAGES:
+            break
+    if not recent:
+        return ""
+    body = "\n".join(reversed(recent))
+    return f"Recent conversation (oldest → newest):\n{body}\n\n"
 
 
 async def classify(
@@ -60,32 +92,44 @@ async def classify(
     model: str = "",
     n_votes: int = 1,
     temperature: float = 0.0,
+    history: list | None = None,
 ) -> tuple[str, str, float]:
     """Classify user input into a route with optional voting.
 
     Returns (route_name, reasoning, confidence).
     When n_votes > 1, runs the classifier multiple times and picks by consensus.
+    ``history`` is an optional list of ``Message`` objects from the ongoing
+    session. The last few user/assistant turns are formatted into the prompt
+    so the classifier can disambiguate short follow-ups.
     """
     routes_list = "\n".join(
         f"- {name}: {route.description}"
         for name, route in routes.items()
     )
-    system = _CLASSIFIER_PROMPT.format(routes_list=routes_list)
-    effective_model = model or provider.model
+    history_block = _format_history(history)
+    system = _CLASSIFIER_PROMPT.format(
+        routes_list=routes_list,
+        history_block=history_block,
+    )
 
     async def _single_classify() -> tuple[str, str]:
-        agent = BaseAgent(
-            config=AgentConfig(
-                name="classifier",
-                provider="",
-                model=effective_model,
-                system_prompt=system,
-                temperature=temperature if n_votes == 1 else 0.7,
-            ),
-            provider=provider,
+        # Call the provider directly with thinking=False. The classifier
+        # outputs a 2-field JSON — reasoning-mode overhead here is pure
+        # latency with no gain. Going around BaseAgent lets us pass the
+        # flag through; BaseAgent has no tools/loop anyway.
+        messages = [
+            Message(role="system", content=system),
+            Message(role="user", content=user_input),
+        ]
+        call_temp = temperature if n_votes == 1 else 0.7
+        result = await provider.complete(
+            messages=messages,
+            tools=None,
+            temperature=call_temp,
+            thinking=False,
         )
-        result = await agent.run(user_input)
-        return _parse_classification(result.final_output, routes)
+        output = result.message.content or ""
+        return _parse_classification(output, routes)
 
     if n_votes <= 1:
         route_name, reasoning = await _single_classify()

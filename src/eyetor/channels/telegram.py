@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 
 from eyetor.channels.base import BaseChannel
+from eyetor.channels.errors import format_user_error
 from eyetor.chat.manager import SessionManager
 from eyetor.config import TelegramChannelConfig
 
@@ -51,12 +52,14 @@ class TelegramChannel(BaseChannel):
         scheduler=None,
         tracker: "UsageTracker | None" = None,
         full_config: "VectorConfig | None" = None,
+        dreams_scheduler=None,
     ) -> None:
         self._manager = session_manager
         self._config = config
         self._skill_reg = skill_reg
         self._scheduler = scheduler
         self._tracker = tracker
+        self._dreams_scheduler = dreams_scheduler
         self._dp = None
         self._bot = None
 
@@ -198,6 +201,47 @@ class TelegramChannel(BaseChannel):
                 except Exception as exc:
                     await msg.answer(f"Error: {exc}")
 
+        @dp.message(Command("dreams"))
+        async def cmd_dreams(msg: Message) -> None:
+            if not _is_authorized(msg):
+                return
+            parts = (msg.text or "").split()
+            command = parts[1].lower() if len(parts) > 1 else "list"
+
+            if self._dreams_scheduler is None:
+                await msg.answer("Sistema de sueños no configurado.")
+                return
+
+            try:
+                if command == "list" or command == "":
+                    result = await self._dreams_scheduler.handle_list()
+                    await _send_long(msg, result, parse_mode="HTML")
+                elif command == "run":
+                    result = await self._dreams_scheduler.handle_run()
+                    await msg.answer(result)
+                elif command.startswith("apply"):
+                    if len(parts) < 3:
+                        await msg.answer("Uso: /dreams apply <id>")
+                        return
+                    proposal_id = int(parts[2])
+                    result = await self._dreams_scheduler.handle_apply(proposal_id)
+                    await msg.answer(result)
+                elif command.startswith("dismiss"):
+                    if len(parts) < 3:
+                        await msg.answer("Uso: /dreams dismiss <id>")
+                        return
+                    proposal_id = int(parts[2])
+                    result = await self._dreams_scheduler.handle_dismiss(proposal_id)
+                    await msg.answer(result)
+                else:
+                    await msg.answer(
+                        "Uso: /dreams [list|run|apply <id>|dismiss <id>]"
+                    )
+            except ValueError:
+                await msg.answer("ID de propuesta inválido.")
+            except Exception as exc:
+                await msg.answer(f"Error: {exc}")
+
         # --- Dynamic skill commands ---
         _skill_commands = []
         if self._skill_reg:
@@ -244,7 +288,9 @@ class TelegramChannel(BaseChannel):
                         buffer = ""
                         last_edit = ""
                         try:
-                            async for chunk in session.send(prompt_text):
+                            async for chunk in self._manager.route_and_send(
+                                session_id, prompt_text
+                            ):
                                 buffer += chunk
                                 if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
                                     try:
@@ -257,7 +303,7 @@ class TelegramChannel(BaseChannel):
                                 await _safe_edit_or_send(msg, placeholder, html, buffer)
                         except Exception as exc:
                             logger.exception("Skill prompt command error")
-                            await placeholder.edit_text(f"Error: {_format_exc(exc)}")
+                            await placeholder.edit_text(format_user_error(exc))
 
         @dp.message(Command("thinking"))
         async def cmd_thinking(msg: Message) -> None:
@@ -301,7 +347,9 @@ class TelegramChannel(BaseChannel):
             buffer = ""
             last_edit = ""
             try:
-                async for chunk in session.send(msg.text or ""):
+                async for chunk in self._manager.route_and_send(
+                    session_id, msg.text or ""
+                ):
                     buffer += chunk
                     if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
                         try:
@@ -334,7 +382,7 @@ class TelegramChannel(BaseChannel):
 
             except Exception as exc:
                 logger.exception("Telegram message handler error")
-                await placeholder.edit_text(f"Error: {_format_exc(exc)}")
+                await placeholder.edit_text(format_user_error(exc))
 
         @dp.message(F.photo)
         async def on_photo(msg: Message) -> None:
@@ -348,84 +396,73 @@ class TelegramChannel(BaseChannel):
                 return
 
             caption = msg.caption or ""
-            placeholder = None
+            placeholder = await msg.answer("📷 Procesando imagen...")
             try:
-                import base64 as _b64
                 import io as _io
 
-                # Download photo bytes into memory
                 tg_file = await bot.get_file(photo.file_id)
                 buf = _io.BytesIO()
                 await bot.download_file(tg_file.file_path, destination=buf)
-                img_bytes = buf.getvalue()
-                img_b64 = _b64.b64encode(img_bytes).decode()
-
-                # Persist to disk (skills that need the file path still work)
-                images_dir = Path.home() / ".eyetor" / "images"
-                images_dir.mkdir(parents=True, exist_ok=True)
-                import time as _time
-
-                img_path = images_dir / f"{msg.chat.id}_{int(_time.time())}.jpg"
-                img_path.write_bytes(img_bytes)
-
-                placeholder = await msg.answer("📷 Procesando imagen...")
-
-                # Step 1: Send image to the vision provider to get a description
-                description = await _describe_image(
-                    img_b64,
-                    caption,
-                    base_url=self._vision_base_url,
-                    api_key=self._vision_api_key,
-                    model=self._vision_model,
+                await self._handle_image_bytes(
+                    msg, placeholder, buf.getvalue(), caption, suffix=".jpg"
                 )
-                logger.debug("Vision description: %s", description[:300])
-
-                # Step 2: Send the description (+ metadata) to the main LLM session
-                user_text = caption.strip() if caption.strip() else ""
-                if user_text:
-                    prompt = (
-                        f"El usuario ha enviado una imagen con este mensaje: «{user_text}»\n\n"
-                        f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
-                        f"Imagen guardada en: {img_path}\n\n"
-                        f"Responde a lo que pide el usuario. Usa el análisis de la imagen "
-                        f"como contexto, pero céntrate en la petición del usuario. "
-                        f"Si dispones de herramientas relevantes, úsalas."
-                    )
-                else:
-                    prompt = (
-                        f"El usuario ha enviado una imagen sin mensaje adicional.\n\n"
-                        f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
-                        f"Imagen guardada en: {img_path}\n\n"
-                        f"Responde al usuario basándote en el contenido descrito. "
-                        f"Si dispones de herramientas relevantes para el contenido, úsalas."
-                    )
-
-                session_id = f"telegram-{msg.chat.id}"
-                session = self._manager.get_or_create(session_id)
-
-                buffer = ""
-                last_edit = ""
-                async for chunk in session.send(prompt):
-                    buffer += chunk
-                    if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
-                        try:
-                            await placeholder.edit_text(buffer or "...")
-                            last_edit = buffer
-                        except Exception:
-                            pass
-                if buffer:
-                    html = _md_to_html(buffer)
-                    await _safe_edit_or_send(msg, placeholder, html, buffer)
             except Exception as exc:
                 logger.exception("Photo handler error")
-                detail = _format_exc(exc)
-                if placeholder is not None:
-                    try:
-                        await placeholder.edit_text(f"Error procesando la imagen: {detail}")
-                    except Exception:
-                        await msg.answer(f"Error procesando la imagen: {detail}")
-                else:
-                    await msg.answer(f"No se pudo procesar la foto: {detail}")
+                await _replace_with_friendly(placeholder, msg, exc)
+
+        @dp.message(F.document)
+        async def on_document(msg: Message) -> None:
+            if not _is_authorized(msg):
+                await msg.answer("Unauthorized. Contact the administrator.")
+                return
+
+            doc = msg.document
+            if doc.file_size and doc.file_size > 25 * 1024 * 1024:
+                await msg.answer("Fichero demasiado grande (máx 25 MB).")
+                return
+
+            caption = msg.caption or ""
+            placeholder = await msg.answer("📎 Procesando fichero...")
+            try:
+                import io as _io
+
+                tg_file = await bot.get_file(doc.file_id)
+                buf = _io.BytesIO()
+                await bot.download_file(tg_file.file_path, destination=buf)
+                file_bytes = buf.getvalue()
+
+                file_name = doc.file_name or "document"
+                suffix = Path(file_name).suffix.lower() or ""
+                mime = (doc.mime_type or "").lower()
+
+                # Route 1: image disguised as document → vision pipeline
+                if mime.startswith("image/") or suffix in {
+                    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp",
+                }:
+                    await self._handle_image_bytes(
+                        msg, placeholder, file_bytes, caption,
+                        suffix=suffix or ".jpg",
+                    )
+                    return
+
+                # Route 2: text-extractable document → KB extractors
+                from eyetor.knowledge.extractors import get_extractor
+
+                extractor = get_extractor(suffix)
+                if extractor is not None:
+                    await self._handle_document_text(
+                        msg, placeholder, file_bytes, caption,
+                        file_name=file_name, suffix=suffix, extractor=extractor,
+                    )
+                    return
+
+                # Route 3: unsupported format → answer caption only
+                await self._handle_unsupported_document(
+                    msg, placeholder, caption, file_name=file_name, mime=mime,
+                )
+            except Exception as exc:
+                logger.exception("Document handler error")
+                await _replace_with_friendly(placeholder, msg, exc)
 
         @dp.message(F.voice | F.audio)
         async def on_voice(msg: Message) -> None:
@@ -447,7 +484,9 @@ class TelegramChannel(BaseChannel):
             buffer = ""
             last_edit = ""
             try:
-                async for chunk in session.send(transcription):
+                async for chunk in self._manager.route_and_send(
+                    session_id, transcription
+                ):
                     buffer += chunk
                     if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
                         try:
@@ -464,7 +503,7 @@ class TelegramChannel(BaseChannel):
                     await _safe_edit_or_send(msg, placeholder, html, plain)
             except Exception as exc:
                 logger.exception("Telegram voice handler error")
-                await placeholder.edit_text(f"Error: {_format_exc(exc)}")
+                await placeholder.edit_text(format_user_error(exc))
 
         commands = [
             BotCommand(command="start", description="Start the bot"),
@@ -488,6 +527,223 @@ class TelegramChannel(BaseChannel):
             await self._dp.stop_polling()
         if self._bot:
             await self._bot.session.close()
+
+    # ------------------------------------------------------------------
+    # Photo / document shared pipelines
+    # ------------------------------------------------------------------
+
+    async def _handle_image_bytes(
+        self,
+        msg,
+        placeholder,
+        img_bytes: bytes,
+        caption: str,
+        *,
+        suffix: str = ".jpg",
+    ) -> None:
+        """Vision pipeline: describe the image, then send to the main LLM session.
+
+        Used by both the photo handler and the document handler when the
+        attachment is an image disguised as a file.
+        """
+        import base64 as _b64
+        import time as _time
+
+        img_b64 = _b64.b64encode(img_bytes).decode()
+
+        images_dir = Path.home() / ".eyetor" / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        img_path = images_dir / f"{msg.chat.id}_{int(_time.time())}{suffix}"
+        img_path.write_bytes(img_bytes)
+
+        description = await _describe_image(
+            img_b64,
+            caption,
+            base_url=self._vision_base_url,
+            api_key=self._vision_api_key,
+            model=self._vision_model,
+        )
+        logger.debug("Vision description: %s", description[:300])
+
+        user_text = caption.strip()
+        # The image has already been processed by the vision model; its text
+        # description is the authoritative source for anything visible in the
+        # image. Do NOT leak the file path into the prompt — small local
+        # models see a path and reflexively try to read it with a filesystem
+        # skill, which returns raw JPG bytes and wastes a loop iteration.
+        vision_guard = (
+            "El análisis de la imagen de arriba es la fuente autoritativa de "
+            "su contenido. No intentes abrir ni leer el fichero de imagen con "
+            "herramientas de filesystem ni con ninguna otra — ya ha sido "
+            "procesado por el modelo de visión."
+        )
+        if user_text:
+            prompt = (
+                f"El usuario ha enviado una imagen con este mensaje: «{user_text}»\n\n"
+                f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
+                f"{vision_guard}\n\n"
+                f"Responde a lo que pide el usuario usando ese análisis como contexto. "
+                f"Si necesitas información que no está en el análisis, usa las "
+                f"herramientas relevantes (web, knowledge base, etc.)."
+            )
+        else:
+            prompt = (
+                f"El usuario ha enviado una imagen sin mensaje adicional.\n\n"
+                f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
+                f"{vision_guard}\n\n"
+                f"Responde al usuario basándote en el contenido descrito. "
+                f"Si necesitas completar con información externa, usa las "
+                f"herramientas relevantes."
+            )
+
+        await self._stream_session_to_placeholder(msg, placeholder, prompt)
+
+    async def _handle_document_text(
+        self,
+        msg,
+        placeholder,
+        file_bytes: bytes,
+        caption: str,
+        *,
+        file_name: str,
+        suffix: str,
+        extractor,
+    ) -> None:
+        """Extract text from a supported document and send it to the LLM session.
+
+        Writes bytes to a temp file (extractors operate on paths), runs the
+        extractor in a thread (some are blocking I/O), then injects the text as
+        context together with the user's caption.
+        """
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = Path(tmp.name)
+
+        try:
+            doc = await asyncio.to_thread(extractor, tmp_path)
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+        if doc is None or not (doc.text or "").strip():
+            await placeholder.edit_text(
+                f"No he podido extraer texto de «{file_name}». "
+                f"Si quieres que responda a tu mensaje igualmente, reenvíalo como texto."
+            )
+            return
+
+        # Cap extracted text to avoid blowing the context. The tool-result cap
+        # (P0a, default 8000 chars) protects tools, but here we're feeding the
+        # text directly into the prompt — apply our own cap.
+        cap = 12000
+        body = doc.text.strip()
+        truncated_note = ""
+        if len(body) > cap:
+            truncated_note = f"\n\n[…truncado, {len(body) - cap} chars adicionales omitidos]"
+            body = body[:cap]
+
+        title_line = f" (título: «{doc.title}»)" if doc.title else ""
+        user_text = caption.strip()
+        intro = (
+            f"El usuario ha adjuntado un fichero «{file_name}»{title_line}"
+        )
+        if user_text:
+            prompt = (
+                f"{intro} con este mensaje: «{user_text}»\n\n"
+                f"Contenido extraído del fichero:\n---\n{body}{truncated_note}\n---\n\n"
+                f"Responde a la petición del usuario usando el contenido del fichero "
+                f"como contexto principal."
+            )
+        else:
+            prompt = (
+                f"{intro}, sin mensaje adicional.\n\n"
+                f"Contenido extraído:\n---\n{body}{truncated_note}\n---\n\n"
+                f"Resume o comenta lo que consideres relevante para el usuario."
+            )
+
+        await self._stream_session_to_placeholder(msg, placeholder, prompt)
+
+    async def _handle_unsupported_document(
+        self,
+        msg,
+        placeholder,
+        caption: str,
+        *,
+        file_name: str,
+        mime: str,
+    ) -> None:
+        """Fallback for documents whose format we cannot parse.
+
+        Answers the caption (if any) so the user still gets a response, and
+        tells them which formats are supported.
+        """
+        from eyetor.knowledge.extractors import supported_extensions
+
+        supported = ", ".join(supported_extensions())
+        notice = (
+            f"He recibido «{file_name}» (mime: {mime or 'desconocido'}) pero no "
+            f"puedo extraer su contenido. Formatos soportados: {supported}."
+        )
+        user_text = caption.strip()
+        if not user_text:
+            await placeholder.edit_text(notice)
+            return
+
+        prompt = (
+            f"El usuario ha adjuntado un fichero «{file_name}» en un formato "
+            f"que no puedo leer (mime: {mime or 'desconocido'}). "
+            f"Su mensaje es: «{user_text}». "
+            f"Responde a su mensaje sin asumir nada del contenido del fichero."
+        )
+        await self._stream_session_to_placeholder(
+            msg, placeholder, prompt, prefix_notice=notice + "\n\n"
+        )
+
+    async def _stream_session_to_placeholder(
+        self,
+        msg,
+        placeholder,
+        prompt: str,
+        *,
+        prefix_notice: str = "",
+    ) -> None:
+        """Run a session.send() and stream tokens into the placeholder message."""
+        session_id = f"telegram-{msg.chat.id}"
+        self._manager.get_or_create(session_id)
+
+        buffer = ""
+        last_edit = ""
+        async for chunk in self._manager.route_and_send(
+            session_id, prompt, allow_chain=False
+        ):
+            buffer += chunk
+            if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
+                try:
+                    await placeholder.edit_text((prefix_notice + buffer) or "...")
+                    last_edit = buffer
+                except Exception:
+                    pass
+        if buffer:
+            html = (
+                _escape_html(prefix_notice) + _md_to_html(buffer)
+                if prefix_notice
+                else _md_to_html(buffer)
+            )
+            await _safe_edit_or_send(msg, placeholder, html, prefix_notice + buffer)
+
+
+async def _replace_with_friendly(placeholder, msg, exc: BaseException) -> None:
+    """Replace a placeholder with a user-friendly error message."""
+    friendly = format_user_error(exc)
+    if placeholder is not None:
+        try:
+            await placeholder.edit_text(friendly)
+            return
+        except Exception:
+            pass
+    await msg.answer(friendly)
 
 
 def _format_exc(exc: BaseException) -> str:

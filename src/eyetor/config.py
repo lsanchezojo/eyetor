@@ -9,6 +9,10 @@ from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from eyetor.dreams.config import DreamConfig
 
 
 class ProviderConfig(BaseModel):
@@ -87,10 +91,21 @@ class OrchestratorConfig(BaseModel):
 
 
 class RouteConfig(BaseModel):
-    """Configuration for a single route in the routing system."""
+    """Configuration for a single route in the routing system.
+
+    ``tools`` narrows the toolset exposed to the agent for this route:
+
+    * ``None`` (default) — inherit the full registry, no filtering.
+    * ``[]`` — route has no tools (e.g. small-talk / ``chat`` route); the
+      agent answers directly with ``tools=None``.
+    * list of names / fnmatch patterns (``"kb_*"``, ``"skill_web_*"``) —
+      whitelist. Only tools whose name matches any pattern are visible.
+    """
 
     description: str
     system_prompt: str
+    tools: list[str] | None = None
+    handler: str | None = None  # e.g. "kb_2phase" to use the research→synthesis handler
 
 
 class RoutingConfig(BaseModel):
@@ -140,6 +155,18 @@ class ChainConfig(BaseModel):
     plan_votes: int = 1  # voting rounds for the planning step (1 = no voting)
 
 
+class TurnBudgetConfig(BaseModel):
+    """Per-turn budget — maps to ``eyetor.models.agents.TurnBudget``.
+
+    Exposed in YAML so deployments can tune how long the agent is allowed to
+    spin on a single user message before being forced into synthesis. A value
+    of ``0`` on either field disables that specific budget.
+    """
+
+    max_tool_calls: int = 6
+    max_wall_seconds: int = 180
+
+
 class SessionsConfig(BaseModel):
     """Configuration for session persistence."""
 
@@ -148,6 +175,13 @@ class SessionsConfig(BaseModel):
     max_messages: int = 200
     chain: ChainConfig = ChainConfig()
     compaction: CompactionConfig = CompactionConfig()
+    budget: TurnBudgetConfig = TurnBudgetConfig()
+
+
+class ToolsConfig(BaseModel):
+    """Global limits for tool execution."""
+
+    max_output_chars: int = 8000
 
 
 class SchedulerConfig(BaseModel):
@@ -156,6 +190,27 @@ class SchedulerConfig(BaseModel):
     enabled: bool = True
     db_path: str = "~/.eyetor/scheduler.db"
     default_timezone: str = "Europe/Madrid"
+
+
+class DreamsThresholds(BaseModel):
+    """Configurable thresholds for dream analysis."""
+
+    critical_error: bool = True
+    slow_tool_ms: int = 30000
+    max_reasoning_tokens: int = 10000
+
+
+class DreamConfig(BaseModel):
+    """Configuration for the dreams system."""
+
+    enabled: bool = True
+    schedule: str = "0 3 * * *"
+    max_proposals: int = 3
+    days_to_analyze: int = 7
+    thresholds: DreamsThresholds = DreamsThresholds()
+    output_dir: str = "~/.eyetor/dreams"
+    tracking: "TrackingConfig" = TrackingConfig()
+    memory_db_path: str = "~/.eyetor/memory.db"
 
 
 class ImageProviderConfig(BaseModel):
@@ -239,6 +294,7 @@ class VectorConfig(BaseModel):
     tracking: TrackingConfig = TrackingConfig()
     channels: ChannelsConfig = ChannelsConfig()
     sessions: SessionsConfig = SessionsConfig()
+    tools: ToolsConfig = ToolsConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
     orchestrator: OrchestratorConfig = OrchestratorConfig()
     routing: RoutingConfig = RoutingConfig()
@@ -253,6 +309,7 @@ class VectorConfig(BaseModel):
         None  # model override; uses provider's default model if None
     )
     log_level: str = "INFO"
+    dreams: "DreamConfig" = DreamConfig()
 
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{(\w+)\}")

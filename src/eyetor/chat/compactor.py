@@ -111,7 +111,31 @@ class ConversationCompactor:
         threshold = self._config.context_window * self._config.trigger_at_percent
 
         history, tail = self._split_tail(messages)
+
+        # Tail bloat guard: even when "verbatim", oversized tool outputs in the
+        # current turn can blow the context. Verbatim protects user/assistant
+        # intent, NOT raw tool noise. Prune tool messages in tail when its
+        # token estimate alone exceeds half the threshold.
+        tail_tokens_before = self.estimate_tokens(tail, system_content)
+        if tail_tokens_before > threshold * 0.5:
+            pruned_tail = self._prune_tool_outputs(tail)
+            if pruned_tail != tail:
+                tail_tokens_after = self.estimate_tokens(pruned_tail, system_content)
+                logger.warning(
+                    "Tail pruning: tail tokens %d → %d (threshold %d)",
+                    tail_tokens_before,
+                    tail_tokens_after,
+                    int(threshold),
+                )
+                tail = pruned_tail
+
         if not history:
+            # If pruning the tail alone changed messages, surface as a phase-1
+            # compaction so callers know to refresh the working window.
+            if tail != messages:
+                return CompactionResult(
+                    compacted=True, new_messages=tail, phase=1
+                )
             return CompactionResult(compacted=False, new_messages=messages)
 
         pruned = self._prune_tool_outputs(history)
@@ -225,12 +249,15 @@ class ConversationCompactor:
         return pruned
 
     async def _summarize(self, history: list[Message], provider: BaseProvider) -> str:
-        """Call LLM to summarize conversation history."""
-        raw_provider = getattr(provider, "_inner", provider)
+        """Call LLM to summarize conversation history.
 
+        Uses the full provider (FallbackProvider/TrackingProvider wrappers
+        included) so that summarization can fail over to a long-context
+        backend when the local model cannot fit the request.
+        """
         prompt = f"{PROMPT_SUMMARY}\n\n---\n\n{self._serialize_for_summary(history)}"
 
-        result = await raw_provider.complete(
+        result = await provider.complete(
             messages=[Message(role="user", content=prompt)],
             tools=None,
             temperature=0.0,
