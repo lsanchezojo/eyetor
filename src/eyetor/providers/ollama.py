@@ -44,7 +44,7 @@ class OllamaProvider(BaseProvider):
             )
             response.raise_for_status()
             data = response.json()
-            return _parse_completion_response(data)
+            return _parse_completion_response(data, tools=tools)
 
     async def stream(
         self,

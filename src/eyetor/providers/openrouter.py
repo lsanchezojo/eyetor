@@ -18,6 +18,7 @@ from eyetor.models.messages import (
 from eyetor.models.tools import ToolDefinition
 from eyetor.providers.base import BaseProvider
 from eyetor.streaming.parsers import extract_delta_content, extract_usage, parse_sse
+from eyetor.utils.tool_calls import offered_tool_names, parse_textual_tool_calls
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ class OpenRouterProvider(BaseProvider):
             )
             response.raise_for_status()
             data = response.json()
-            return _parse_completion_response(data)
+            return _parse_completion_response(data, tools=tools)
 
     async def stream(
         self,
@@ -88,7 +89,10 @@ class OpenRouterProvider(BaseProvider):
         return StreamingResponse(_stream_tokens(), usage)
 
 
-def _parse_completion_response(data: dict[str, Any]) -> CompletionResult:
+def _parse_completion_response(
+    data: dict[str, Any],
+    tools: list[ToolDefinition] | None = None,
+) -> CompletionResult:
     """Parse a non-streaming /chat/completions response into a CompletionResult."""
     choice = data["choices"][0]
     msg = choice["message"]
@@ -123,6 +127,14 @@ def _parse_completion_response(data: dict[str, Any]) -> CompletionResult:
         tool_calls = parsed or None
 
     message = Message(role=role, content=content, tool_calls=tool_calls)
+    if not message.tool_calls and tools and message.content:
+        parsed = parse_textual_tool_calls(
+            message.content,
+            available_tool_names=offered_tool_names(tools),
+        )
+        if parsed.tool_calls:
+            message.content = parsed.cleaned_text or None
+            message.tool_calls = parsed.tool_calls
 
     raw_usage = data.get("usage")
     usage = None

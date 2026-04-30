@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from eyetor.models.messages import Message
+from eyetor.models.tools import ToolDefinition
 from eyetor.providers.llamacpp import LlamaCppProvider
 from eyetor.providers.ollama import OllamaProvider
 from eyetor.providers.openrouter import _parse_completion_response
@@ -84,6 +85,33 @@ def test_parse_normal_tool_call_unchanged() -> None:
     assert call.function.arguments == "{\"x\": 1}"
 
 
+def test_parse_textual_tool_call_when_tools_are_offered() -> None:
+    result = _parse_completion_response(
+        {
+            "model": "local",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": '[toolcall]{"name":"third-party","args":{"x":1}}',
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+        tools=[
+            ToolDefinition(
+                name="third_party",
+                description="arbitrary",
+                parameters={"type": "object", "properties": {}, "required": []},
+            )
+        ],
+    )
+    call = result.message.tool_calls[0]
+    assert call.function.name == "third_party"
+    assert json.loads(call.function.arguments) == {"x": 1}
+
+
 def test_llamacpp_payload_merges_extra_body_without_overwriting_core() -> None:
     provider = LlamaCppProvider(
         base_url="http://localhost:8080/v1",
@@ -113,4 +141,3 @@ def test_ollama_payload_includes_options_when_set() -> None:
         temperature=0.1,
     )
     assert payload["options"] == {"num_ctx": 4096, "repeat_penalty": 1.1}
-

@@ -21,6 +21,7 @@ from eyetor.channels.base import BaseChannel
 from eyetor.channels.errors import format_user_error
 from eyetor.chat.manager import SessionManager
 from eyetor.config import TelegramChannelConfig
+from eyetor.utils.tool_calls import strip_textual_tool_calls
 
 from typing import TYPE_CHECKING
 
@@ -33,6 +34,11 @@ logger = logging.getLogger(__name__)
 _CHUNK_TOKENS = 20  # Edit message every N characters
 _TG_MAX_LEN = 4096  # Telegram message character limit
 _IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(.*?)\]")
+
+
+def _sanitize_model_text(text: str) -> str:
+    cleaned, _ = strip_textual_tool_calls(text)
+    return cleaned
 
 
 class TelegramChannel(BaseChannel):
@@ -294,13 +300,15 @@ class TelegramChannel(BaseChannel):
                                 buffer += chunk
                                 if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
                                     try:
-                                        await placeholder.edit_text(buffer or "...")
+                                        visible = _sanitize_model_text(buffer)
+                                        await placeholder.edit_text(visible or "...")
                                         last_edit = buffer
                                     except Exception:
                                         pass
                             if buffer:
-                                html = _md_to_html(buffer)
-                                await _safe_edit_or_send(msg, placeholder, html, buffer)
+                                visible = _sanitize_model_text(buffer)
+                                html = _md_to_html(visible)
+                                await _safe_edit_or_send(msg, placeholder, html, visible)
                         except Exception as exc:
                             logger.exception("Skill prompt command error")
                             await placeholder.edit_text(format_user_error(exc))
@@ -353,7 +361,8 @@ class TelegramChannel(BaseChannel):
                     buffer += chunk
                     if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
                         try:
-                            await placeholder.edit_text(buffer or "...")
+                            visible = _sanitize_model_text(buffer)
+                            await placeholder.edit_text(visible or "...")
                             last_edit = buffer
                         except Exception:
                             pass  # Ignore edit conflicts
@@ -369,7 +378,9 @@ class TelegramChannel(BaseChannel):
                 # Final edit always applies HTML formatting
                 if buffer:
                     # Strip [IMAGE:...] markers from text (images sent separately)
-                    clean_buffer = _IMAGE_MARKER_RE.sub("", buffer).strip()
+                    clean_buffer = _IMAGE_MARKER_RE.sub(
+                        "", _sanitize_model_text(buffer)
+                    ).strip()
                     html = _md_to_html(clean_buffer) if clean_buffer else ""
                     if html:
                         await _safe_edit_or_send(msg, placeholder, html, clean_buffer)
@@ -721,17 +732,21 @@ class TelegramChannel(BaseChannel):
             buffer += chunk
             if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
                 try:
-                    await placeholder.edit_text((prefix_notice + buffer) or "...")
+                    visible = prefix_notice + _sanitize_model_text(buffer)
+                    await placeholder.edit_text(visible or "...")
                     last_edit = buffer
                 except Exception:
                     pass
         if buffer:
+            clean_buffer = _sanitize_model_text(buffer)
             html = (
-                _escape_html(prefix_notice) + _md_to_html(buffer)
+                _escape_html(prefix_notice) + _md_to_html(clean_buffer)
                 if prefix_notice
-                else _md_to_html(buffer)
+                else _md_to_html(clean_buffer)
             )
-            await _safe_edit_or_send(msg, placeholder, html, prefix_notice + buffer)
+            await _safe_edit_or_send(
+                msg, placeholder, html, prefix_notice + clean_buffer
+            )
 
 
 async def _replace_with_friendly(placeholder, msg, exc: BaseException) -> None:

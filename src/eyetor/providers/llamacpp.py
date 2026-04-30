@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import re
-import uuid
 from typing import Any, AsyncIterator
 
-from eyetor.models.messages import CompletionResult, FunctionCall, Message, StreamingResponse, ToolCall
+from eyetor.models.messages import CompletionResult, Message, StreamingResponse, ToolCall
 from eyetor.models.tools import ToolDefinition
 from eyetor.providers.base import BaseProvider, ContextOverflowError
 from eyetor.providers.openrouter import _parse_completion_response
 from eyetor.streaming.parsers import extract_delta_content, parse_sse
+from eyetor.utils.tool_calls import offered_tool_names, parse_textual_tool_calls
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +101,7 @@ class LlamaCppProvider(BaseProvider):
                     )
             response.raise_for_status()
             data = response.json()
-            result = _parse_completion_response(data)
+            result = _parse_completion_response(data, tools=tools)
             if use_thinking:
                 reasoning = _extract_reasoning(data)
                 if reasoning:
@@ -115,7 +113,7 @@ class LlamaCppProvider(BaseProvider):
             # a structured call would wipe msg.content and leave the session
             # with an empty response.
             if tools:
-                _recover_textual_tool_calls(result)
+                _recover_textual_tool_calls(result, tools)
             return result
 
     # ------------------------------------------------------------------
@@ -177,112 +175,10 @@ def _extract_reasoning_delta(chunk: dict[str, Any]) -> str | None:
         return None
 
 
-# Hermes/Qwen/chatml variants that small local models sometimes emit as plain
-# text (inside <think> or leaked to content) instead of as structured tool_calls.
-# Pattern captures the inner payload so we can parse it.
-_TEXTUAL_TOOL_CALL_RE = re.compile(
-    r"<tool_call\b[^>]*>(.*?)</tool_call>"
-    r"|<\|tool_call\|>(.*?)<\|/tool_call\|>",
-    re.DOTALL | re.IGNORECASE,
-)
-_FUNCTION_BLOCK_RE = re.compile(
-    r"<function=([^>\s]+)\s*>(.*?)</function>",
-    re.DOTALL | re.IGNORECASE,
-)
-_PARAMETER_BLOCK_RE = re.compile(
-    r"<parameter=([^>\s]+)\s*>(.*?)</parameter>",
-    re.DOTALL | re.IGNORECASE,
-)
-
-
-def _parse_textual_tool_calls(text: str) -> tuple[list[ToolCall], str]:
-    """Extract tool calls emitted as plain-text markup (Hermes/chatml XML or
-    JSON) and return a list of structured ``ToolCall``\\ s plus the original
-    text with those blocks stripped.
-
-    Handles three shapes the local models actually emit:
-
-    * ``<tool_call><function=NAME><parameter=KEY>VAL</parameter>...</function></tool_call>``
-    * ``<tool_call>{"name": "...", "arguments": {...}}</tool_call>``
-    * Bare ``<function=NAME>...</function>`` without the outer wrapper.
-    """
-    if not text:
-        return [], text
-    lowered = text.lower()
-    if (
-        "<tool_call" not in lowered
-        and "<|tool_call|>" not in lowered
-        and "<function=" not in lowered
-    ):
-        return [], text
-
-    calls: list[ToolCall] = []
-    consumed_spans: list[tuple[int, int]] = []
-
-    def _record(name: str, arguments: dict[str, Any] | str) -> None:
-        args_json = (
-            arguments if isinstance(arguments, str)
-            else json.dumps(arguments, ensure_ascii=False)
-        )
-        calls.append(
-            ToolCall(
-                id=uuid.uuid4().hex[:24],
-                function=FunctionCall(name=name, arguments=args_json),
-            )
-        )
-
-    # 1) <tool_call>...</tool_call> wrapper (with JSON or nested <function=>).
-    for m in _TEXTUAL_TOOL_CALL_RE.finditer(text):
-        payload = (m.group(1) or m.group(2) or "").strip()
-        consumed_spans.append(m.span())
-        # Prefer JSON shape; fall back to nested function/parameter blocks.
-        parsed_as_json = False
-        if payload.startswith("{"):
-            try:
-                obj = json.loads(payload)
-                if isinstance(obj, dict) and "name" in obj:
-                    _record(obj["name"], obj.get("arguments", {}))
-                    parsed_as_json = True
-            except (ValueError, TypeError):
-                pass
-        if not parsed_as_json:
-            for fm in _FUNCTION_BLOCK_RE.finditer(payload):
-                name = fm.group(1).strip()
-                inner = fm.group(2)
-                params = {
-                    pm.group(1).strip(): pm.group(2).strip()
-                    for pm in _PARAMETER_BLOCK_RE.finditer(inner)
-                }
-                if name:
-                    _record(name, params)
-
-    # 2) Bare <function=...>...</function> blocks outside any wrapper.
-    for fm in _FUNCTION_BLOCK_RE.finditer(text):
-        # Skip blocks already covered by a <tool_call> span.
-        if any(start <= fm.start() < end for start, end in consumed_spans):
-            continue
-        name = fm.group(1).strip()
-        inner = fm.group(2)
-        params = {
-            pm.group(1).strip(): pm.group(2).strip()
-            for pm in _PARAMETER_BLOCK_RE.finditer(inner)
-        }
-        if name:
-            consumed_spans.append(fm.span())
-            _record(name, params)
-
-    if not calls:
-        return [], text
-
-    # Strip consumed spans in reverse to preserve offsets.
-    cleaned = text
-    for start, end in sorted(consumed_spans, key=lambda s: s[0], reverse=True):
-        cleaned = cleaned[:start] + cleaned[end:]
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    return calls, cleaned
-
-
-def _recover_textual_tool_calls(result: CompletionResult) -> None:
+def _recover_textual_tool_calls(
+    result: CompletionResult,
+    tools: list[ToolDefinition],
+) -> None:
     """Promote textual tool-call markup to structured ``tool_calls``.
 
     Small thinking-mode models (Qwen/Hermes family served via llama.cpp) often
@@ -300,21 +196,29 @@ def _recover_textual_tool_calls(result: CompletionResult) -> None:
         ("content", msg.content or ""),
     ]
     all_calls: list[ToolCall] = []
+    tool_names = offered_tool_names(tools)
     for label, text in sources:
-        calls, cleaned = _parse_textual_tool_calls(text)
-        if not calls:
+        parsed = parse_textual_tool_calls(text, available_tool_names=tool_names)
+        if not parsed.had_markup:
             continue
-        all_calls.extend(calls)
-        if label == "reasoning":
-            result.reasoning_content = cleaned or None
-        else:
-            msg.content = cleaned or None
-        logger.warning(
-            "llama.cpp: recovered %d textual tool_call(s) from %s: %s",
-            len(calls),
-            label,
-            ", ".join(tc.function.name for tc in calls),
-        )
+        all_calls.extend(parsed.tool_calls)
+        if parsed.tool_calls:
+            if label == "reasoning":
+                result.reasoning_content = parsed.cleaned_text or None
+            else:
+                msg.content = parsed.cleaned_text or None
+            logger.warning(
+                "llama.cpp: recovered %d textual tool_call(s) from %s: %s",
+                len(parsed.tool_calls),
+                label,
+                ", ".join(tc.function.name for tc in parsed.tool_calls),
+            )
+        if parsed.unresolved_names:
+            logger.warning(
+                "llama.cpp: ignored unresolved textual tool_call(s) from %s: %s",
+                label,
+                ", ".join(parsed.unresolved_names),
+            )
 
     if all_calls:
         msg.tool_calls = all_calls

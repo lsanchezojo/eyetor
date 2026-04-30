@@ -16,6 +16,7 @@ from eyetor.models.messages import Message, ToolCall
 from eyetor.models.tools import ToolRegistry, ToolDefinition
 from eyetor.providers.base import BaseProvider
 from eyetor.providers.tracking import current_session_id
+from eyetor.utils.tool_calls import parse_textual_tool_calls, strip_textual_tool_calls
 
 if TYPE_CHECKING:
     from eyetor.config import VectorConfig
@@ -89,21 +90,6 @@ _FENCED_CODE_RE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 
-# Small local models (Hermes/chatml/Qwen) sometimes emit tool-call syntax as
-# plain text content instead of a structured tool_call — especially after a
-# forced-answer nudge when tools=None. Detect and strip those blocks so the
-# user never sees raw invocation markup. Covers:
-#   <tool_call>...</tool_call>
-#   <function=name>...</function>   (Hermes variant)
-#   <|tool_call|>...<|/tool_call|>  (chatml variant)
-_TEXTUAL_TOOL_CALL_RE = re.compile(
-    r"<tool_call\b[^>]*>.*?</tool_call>"
-    r"|<function=[^>]*>.*?</function>"
-    r"|<\|tool_call\|>.*?<\|/tool_call\|>",
-    re.DOTALL | re.IGNORECASE,
-)
-
-
 def _strip_textual_tool_calls(text: str) -> tuple[str, bool]:
     """Strip textual tool-call markup from model output.
 
@@ -111,11 +97,7 @@ def _strip_textual_tool_calls(text: str) -> tuple[str, bool]:
     surrounding whitespace collapsed; had_markup is True if any block was
     stripped, so callers can log / take fallback action.
     """
-    if not text:
-        return text, False
-    stripped = _TEXTUAL_TOOL_CALL_RE.sub("", text)
-    stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
-    return stripped, stripped != text.strip()
+    return strip_textual_tool_calls(text)
 
 
 def _is_asking_user(text: str) -> bool:
@@ -433,6 +415,42 @@ class ChatSession:
                 target.extra_body = extra_body
                 target.options = options
 
+    def _promote_textual_tool_calls(
+        self,
+        response: Message,
+        tool_defs: list[ToolDefinition] | None,
+    ) -> None:
+        """Promote textual tool-call markup to structured calls when possible."""
+        if response.tool_calls or not response.content or not tool_defs:
+            return
+        parsed = parse_textual_tool_calls(
+            response.content,
+            available_tool_names=[tool.name for tool in tool_defs],
+        )
+        if not parsed.had_markup:
+            return
+        response.content = parsed.cleaned_text or None
+        if parsed.tool_calls:
+            response.tool_calls = parsed.tool_calls
+            logger.warning(
+                "Session '%s' — recovered %d textual tool_call(s): %s",
+                self.session_id,
+                len(parsed.tool_calls),
+                ", ".join(tc.function.name for tc in parsed.tool_calls),
+            )
+            return
+        if parsed.unresolved_names:
+            response.content = (
+                "No he podido ejecutar la herramienta solicitada porque "
+                "no está disponible o su nombre es ambiguo: "
+                + ", ".join(parsed.unresolved_names)
+            )
+            logger.warning(
+                "Session '%s' — ignored unresolved textual tool_call(s): %s",
+                self.session_id,
+                ", ".join(parsed.unresolved_names),
+            )
+
     # ------------------------------------------------------------------
     # Conversation history
     # ------------------------------------------------------------------
@@ -629,6 +647,8 @@ class ChatSession:
                     (self.last_reasoning + "\n\n" if self.last_reasoning else "")
                     + result.reasoning_content
                 )
+
+            self._promote_textual_tool_calls(response, tool_defs)
             self._messages.append(response)
             self._persist_message(response, reasoning=result.reasoning_content)
             full_messages.append(response)
@@ -1003,6 +1023,7 @@ class ChatSession:
                 default_temperature=self.config.temperature,
             )
             response = result.message
+            self._promote_textual_tool_calls(response, tool_defs)
             if result.reasoning_content:
                 self.last_reasoning = (
                     (self.last_reasoning + "\n\n" if self.last_reasoning else "")
@@ -1276,6 +1297,7 @@ class ChatSession:
                 )
                 break
             response = result.message
+            self._promote_textual_tool_calls(response, kb_tools)
             if result.reasoning_content:
                 self.last_reasoning = (
                     (self.last_reasoning + "\n\n" if self.last_reasoning else "")
