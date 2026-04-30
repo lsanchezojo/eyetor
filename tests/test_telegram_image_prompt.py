@@ -17,7 +17,8 @@ def test_image_prompt_exposes_attachment_path_for_registered_tools() -> None:
 
     assert str(img_path) in prompt
     assert "herramienta registrada" in prompt
-    assert "ruta indicada" in prompt
+    assert "local_attachment_path" in prompt
+    assert "No respondas solo con" in prompt
 
 
 def test_image_prompt_preserves_caption_and_vision_analysis() -> None:
@@ -31,6 +32,7 @@ def test_image_prompt_preserves_caption_and_vision_analysis() -> None:
     assert "solo analiza esto" in prompt
     assert "Tipo: documento" in prompt
     assert str(img_path) in prompt
+    assert "respuesta al usuario debe ser humana" in prompt
 
 
 def test_image_prompt_does_not_reference_specific_skills_or_domains() -> None:

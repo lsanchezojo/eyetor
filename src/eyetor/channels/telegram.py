@@ -741,8 +741,10 @@ def _build_image_prompt(description: str, caption: str, img_path: Path) -> str:
     """Build the main-agent prompt for an already-described image attachment."""
     user_text = caption.strip()
     attachment_context = (
-        "Archivo local del adjunto ya guardado para herramientas que procesen "
-        f"adjuntos o imágenes: {img_path}"
+        "## Metadatos internos del adjunto\n"
+        f"- local_attachment_path: {img_path}\n"
+        "- Usa este path solo como argumento de una herramienta registrada que "
+        "procese adjuntos o imágenes."
     )
     vision_guard = (
         "El análisis de la imagen de arriba es la fuente autoritativa de su "
@@ -750,24 +752,32 @@ def _build_image_prompt(description: str, caption: str, img_path: Path) -> str:
         "genéricas de lectura de archivos para entender la imagen; usa la ruta solo como "
         "entrada de una herramienta registrada que procese adjuntos o imágenes."
     )
+    response_guard = (
+        "Tu respuesta al usuario debe ser humana y útil. No respondas solo con "
+        "la ruta del archivo local y no la menciones salvo que sea imprescindible "
+        "para explicar un error técnico. Si no usas ninguna herramienta, responde "
+        "igualmente basándote en el análisis de visión."
+    )
     if user_text:
         return (
             f"El usuario ha enviado una imagen con este mensaje: «{user_text}»\n\n"
             f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
             f"{attachment_context}\n\n"
             f"{vision_guard}\n\n"
+            f"{response_guard}\n\n"
             f"Responde a lo que pide el usuario usando ese análisis como contexto. "
             f"Si una herramienta registrada necesita el archivo original del "
-            f"adjunto, usa la ruta indicada arriba."
+            f"adjunto, usa `local_attachment_path`."
         )
     return (
         f"El usuario ha enviado una imagen sin mensaje adicional.\n\n"
         f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
         f"{attachment_context}\n\n"
         f"{vision_guard}\n\n"
+        f"{response_guard}\n\n"
         f"Responde al usuario basándote en el contenido descrito. Si una "
         f"herramienta registrada necesita el archivo original del adjunto, usa "
-        f"la ruta indicada arriba."
+        f"`local_attachment_path`."
     )
 
 
