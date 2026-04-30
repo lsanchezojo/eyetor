@@ -54,6 +54,10 @@ class LlamaCppProvider(BaseProvider):
         payload = super()._build_payload(messages, tools, temperature, stream)
         use_thinking = self.thinking if thinking is None else thinking
         payload["chat_template_kwargs"] = {"enable_thinking": bool(use_thinking)}
+        protected = {"messages", "model", "tools"}
+        for key, value in self.extra_body.items():
+            if key not in protected:
+                payload[key] = value
         return payload
 
     # ------------------------------------------------------------------

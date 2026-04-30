@@ -9,8 +9,8 @@ This improves reliability with SLMs that are inconsistent in classification.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import re
 from collections import Counter
 from dataclasses import dataclass
 
@@ -18,6 +18,7 @@ from eyetor.agents.base import BaseAgent
 from eyetor.models.agents import AgentConfig
 from eyetor.models.messages import Message
 from eyetor.providers.base import BaseProvider
+from eyetor.utils.json import extract_json_object
 
 logger = logging.getLogger(__name__)
 
@@ -162,15 +163,39 @@ def _parse_classification(
     text: str, routes: dict[str, Route]
 ) -> tuple[str, str]:
     """Parse classifier output into (route_name, reasoning)."""
-    try:
-        data = json.loads(text)
-        return data.get("route", ""), data.get("reasoning", "")
-    except (json.JSONDecodeError, AttributeError):
-        # Try to extract route name from plain text
-        for name in routes:
-            if name.lower() in text.lower():
-                return name, text
-        return "", text
+    data = extract_json_object(text)
+    if data:
+        route = str(data.get("route", ""))
+        if route in routes:
+            return route, str(data.get("reasoning", ""))
+        if route:
+            best = _score_route(route, routes)
+            if best:
+                return best, str(data.get("reasoning", ""))
+    best = _score_route(text, routes)
+    return (best or "", text)
+
+
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _score_route(text: str, routes: dict[str, Route]) -> str:
+    """Choose the route whose name/description overlaps most with text."""
+    text_tokens = {t.lower() for t in _WORD_RE.findall(text)}
+    if not text_tokens:
+        return ""
+    best_name = ""
+    best_score = 0.0
+    for name, route in routes.items():
+        name_l = name.lower()
+        score = 2.0 if name_l in text.lower() else 0.0
+        route_tokens = {t.lower() for t in _WORD_RE.findall(f"{name} {route.description}")}
+        if route_tokens:
+            score += len(text_tokens & route_tokens) / len(route_tokens)
+        if score > best_score:
+            best_name = name
+            best_score = score
+    return best_name if best_score > 0 else ""
 
 
 class Router:

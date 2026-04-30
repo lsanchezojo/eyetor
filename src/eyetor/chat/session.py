@@ -9,7 +9,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import AsyncIterator, TYPE_CHECKING
+from typing import Any, AsyncIterator, TYPE_CHECKING
 
 from eyetor.models.agents import AgentConfig, TurnBudget
 from eyetor.models.messages import Message, ToolCall
@@ -162,6 +162,12 @@ _TOOL_LOOP_THRESHOLDS: dict[str, float] = {
     "skill_web_search": 0.4,
 }
 
+_KB_QUERY_STOPWORDS = {
+    "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del",
+    "que", "qué", "cual", "cuál", "sobre", "para", "por", "con", "en",
+    "y", "o", "a", "me", "di", "dime", "explica", "busca", "consulta",
+}
+
 
 def _loop_threshold_for(tool_name: str) -> float:
     for prefix, threshold in _TOOL_LOOP_THRESHOLDS.items():
@@ -193,6 +199,16 @@ def _is_empty_search_result(result: str) -> bool:
             if key in data and isinstance(data[key], list) and not data[key]:
                 return True
     return False
+
+
+def _reformulate_kb_query(query: str) -> str:
+    """Cheap second-pass KB query for tiny models: keep discriminative terms."""
+    tokens = [
+        t for t in _TOKEN_RE.findall(query.lower())
+        if len(t) > 2 and t not in _KB_QUERY_STOPWORDS
+    ]
+    deduped = list(dict.fromkeys(tokens))
+    return " ".join(deduped[:8]) or query
 
 
 def _tool_call_bag(name: str, arguments: str) -> tuple[str, frozenset[str]]:
@@ -340,6 +356,82 @@ class ChatSession:
                 self._register_scheduler_tools(scheduler)
         else:
             self.tool_registry = tool_registry or ToolRegistry()
+
+    def _profile(self, name: str):
+        if not self._root_config:
+            return None
+        return getattr(self._root_config.profiles, name, None)
+
+    def _profile_temperature(self, name: str, default: float) -> float:
+        profile = self._profile(name)
+        value = getattr(profile, "temperature", None) if profile else None
+        return default if value is None else value
+
+    def _profile_thinking(self, name: str, default: bool | None = None) -> bool | None:
+        profile = self._profile(name)
+        value = getattr(profile, "thinking", None) if profile else None
+        return default if value is None else value
+
+    def _profile_budget(self, name: str, fallback: TurnBudget) -> TurnBudget:
+        profile = self._profile(name)
+        if not profile:
+            return fallback
+        return TurnBudget(
+            max_tool_calls=(
+                fallback.max_tool_calls
+                if profile.max_tool_calls is None
+                else profile.max_tool_calls
+            ),
+            max_wall_seconds=(
+                fallback.max_wall_seconds
+                if profile.max_wall_seconds is None
+                else profile.max_wall_seconds
+            ),
+        )
+
+    async def _complete_with_profile(
+        self,
+        profile_name: str,
+        *,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        default_temperature: float,
+        default_thinking: bool | None = None,
+    ):
+        """Call the provider with optional profile overrides."""
+        profile = self._profile(profile_name)
+        temperature = self._profile_temperature(profile_name, default_temperature)
+        thinking = self._profile_thinking(profile_name, default_thinking)
+        targets: list[Any] = []
+
+        def _collect_provider_targets(provider: Any) -> None:
+            if provider in targets:
+                return
+            targets.append(provider)
+            inner = getattr(provider, "_inner", None)
+            if inner is not None:
+                _collect_provider_targets(inner)
+            for child in getattr(provider, "_providers", []) or []:
+                _collect_provider_targets(child)
+
+        _collect_provider_targets(self.provider)
+        saved: list[tuple[Any, dict[str, Any], dict[str, Any]]] = []
+        if profile and (profile.extra_body or profile.options):
+            for target in targets:
+                saved.append((target, dict(target.extra_body), dict(target.options)))
+                target.extra_body = {**target.extra_body, **profile.extra_body}
+                target.options = {**target.options, **profile.options}
+        try:
+            return await self.provider.complete(
+                messages=messages,
+                tools=tools,
+                temperature=temperature,
+                thinking=thinking,
+            )
+        finally:
+            for target, extra_body, options in saved:
+                target.extra_body = extra_body
+                target.options = options
 
     # ------------------------------------------------------------------
     # Conversation history
@@ -498,7 +590,7 @@ class ChatSession:
         kb_nudge_sent = False  # one-shot nudge per turn
         tool_calls_used = 0
         turn_start = time.monotonic()
-        budget = self._budget
+        budget = self._profile_budget("tool_use", self._budget)
 
         while iterations < self.config.max_iterations:
             iterations += 1
@@ -522,12 +614,14 @@ class ChatSession:
             # When no tools are exposed (chat route, or no registry), the
             # call is pure conversation — disable reasoning so the local
             # thinking-mode model doesn't waste ~30 s per turn on a greeting.
+            profile_name = "tool_use" if tool_defs else "chat"
             iter_thinking = None if tool_defs else False
-            result = await self.provider.complete(
+            result = await self._complete_with_profile(
+                profile_name,
                 messages=full_messages,
                 tools=tool_defs,
-                temperature=self.config.temperature,
-                thinking=iter_thinking,
+                default_temperature=self.config.temperature,
+                default_thinking=iter_thinking,
             )
             response = result.message
             if result.reasoning_content:
@@ -857,10 +951,12 @@ class ChatSession:
         plan_messages = self._get_full_messages()
         plan_messages.append(Message(role="user", content=plan_prompt))
 
-        plan_result = await self.provider.complete(
+        plan_result = await self._complete_with_profile(
+            "classifier",
             messages=plan_messages,
             tools=None,  # no tools in planning phase
-            temperature=self.config.temperature,
+            default_temperature=self.config.temperature,
+            default_thinking=False,
         )
         plan_text = plan_result.message.content or ""
         logger.info(
@@ -887,7 +983,7 @@ class ChatSession:
         iterations = 0
         tool_calls_used = 0
         turn_start = time.monotonic()
-        budget = self._budget
+        budget = self._profile_budget("tool_use", self._budget)
 
         while iterations < self.config.max_iterations:
             iterations += 1
@@ -900,10 +996,11 @@ class ChatSession:
                     self.session_id, tool_calls_used, elapsed,
                 )
                 break
-            result = await self.provider.complete(
+            result = await self._complete_with_profile(
+                "tool_use",
                 messages=full_messages,
                 tools=tool_defs,
-                temperature=self.config.temperature,
+                default_temperature=self.config.temperature,
             )
             response = result.message
             if result.reasoning_content:
@@ -949,11 +1046,12 @@ class ChatSession:
         synth_messages = self._get_full_messages()
         synth_messages.append(Message(role="user", content=synth_prompt))
 
-        synth_result = await self.provider.complete(
+        synth_result = await self._complete_with_profile(
+            "synthesis",
             messages=synth_messages,
             tools=None,
-            temperature=self.config.temperature,
-            thinking=False,
+            default_temperature=self.config.temperature,
+            default_thinking=False,
         )
         final_output = synth_result.message.content or execution_output
         cleaned, had_markup = _strip_textual_tool_calls(final_output)
@@ -1139,8 +1237,10 @@ class ChatSession:
             Message(role="user", content=user_input),
         ]
         scratchpad: list[str] = []
+        read_doc_ids: set[int] = set()
+        retried_empty_search = False
 
-        budget = self._budget
+        budget = self._profile_budget("kb_research", self._budget)
         cfg_calls = budget.max_tool_calls if budget.max_tool_calls > 0 else 3
         cfg_wall = budget.max_wall_seconds if budget.max_wall_seconds > 0 else 60
         max_calls = min(cfg_calls, 3)
@@ -1162,10 +1262,12 @@ class ChatSession:
                 )
                 break
             try:
-                result = await self.provider.complete(
+                result = await self._complete_with_profile(
+                    "kb_research",
                     messages=research_messages,
                     tools=kb_tools,
-                    temperature=self.config.temperature,
+                    default_temperature=self.config.temperature,
+                    default_thinking=False,
                 )
             except Exception as exc:
                 logger.warning(
@@ -1225,6 +1327,109 @@ class ChatSession:
                 self._persist_message(tool_msg)
                 research_messages.append(tool_msg)
 
+                if tc.function.name == "kb_read":
+                    try:
+                        read_doc_ids.add(int(json.loads(tc.function.arguments).get("doc_id")))
+                    except (ValueError, TypeError, json.JSONDecodeError, AttributeError):
+                        pass
+                    continue
+                if tc.function.name != "kb_search":
+                    continue
+
+                try:
+                    search_args = json.loads(tc.function.arguments or "{}")
+                    search_data = json.loads(raw)
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    continue
+                results = search_data.get("results") if isinstance(search_data, dict) else None
+                if not isinstance(results, list):
+                    continue
+
+                meta_lines = [
+                    "doc_id={doc_id} path={path} heading={heading} score={score}".format(
+                        doc_id=hit.get("doc_id"),
+                        path=hit.get("path") or "",
+                        heading=hit.get("heading") or "",
+                        score=hit.get("score") or "",
+                    )
+                    for hit in results[:3]
+                    if isinstance(hit, dict)
+                ]
+                if meta_lines:
+                    scratchpad.append("[kb_search metadata]\n" + "\n".join(meta_lines))
+
+                if not results and not retried_empty_search and tool_calls_used < max_calls:
+                    original_query = str(search_args.get("query") or "")
+                    second_query = _reformulate_kb_query(original_query)
+                    if second_query and second_query != original_query:
+                        retried_empty_search = True
+                        retry_args = {
+                            "query": second_query,
+                            "top_k": search_args.get("top_k", 5),
+                        }
+                        if search_args.get("workspace"):
+                            retry_args["workspace"] = search_args["workspace"]
+                        retry_raw = await self.tool_registry.execute(
+                            "kb_search",
+                            json.dumps(retry_args, ensure_ascii=False),
+                        )
+                        tool_calls_used += 1
+                        kept_retry = retry_raw[:2000] if len(retry_raw) > 2000 else retry_raw
+                        scratchpad.append(
+                            f"[kb_search retry Â· {second_query}]\n{kept_retry}"
+                        )
+                        research_messages.append(
+                            Message(
+                                role="user",
+                                content=(
+                                    "Resultado automatico de segunda busqueda KB "
+                                    f"({second_query}):\n{kept_retry}"
+                                ),
+                            )
+                        )
+                        try:
+                            retry_data = json.loads(retry_raw)
+                            retry_results = retry_data.get("results", [])
+                            if isinstance(retry_results, list):
+                                results = retry_results
+                        except (ValueError, TypeError, json.JSONDecodeError):
+                            pass
+
+                for hit in results[:2]:
+                    if tool_calls_used >= max_calls or not isinstance(hit, dict):
+                        break
+                    try:
+                        doc_id = int(hit["doc_id"])
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    if doc_id in read_doc_ids:
+                        continue
+                    read_doc_ids.add(doc_id)
+                    read_args = {
+                        "doc_id": doc_id,
+                        "section": hit.get("heading"),
+                        "max_chars": 1800,
+                    }
+                    read_raw = await self.tool_registry.execute(
+                        "kb_read",
+                        json.dumps(read_args, ensure_ascii=False),
+                    )
+                    tool_calls_used += 1
+                    kept_read = read_raw[:2000] if len(read_raw) > 2000 else read_raw
+                    scratchpad.append(
+                        f"[kb_read auto Â· doc_id={doc_id} path={hit.get('path')} heading={hit.get('heading')}]\n{kept_read}"
+                    )
+                    research_messages.append(
+                        Message(
+                            role="user",
+                            content=(
+                                "Lectura automatica del resultado KB principal "
+                                f"(doc_id={doc_id}, path={hit.get('path')}, "
+                                f"heading={hit.get('heading')}):\n{kept_read}"
+                            ),
+                        )
+                    )
+
         logger.info(
             "Session '%s' — KB research done: %d calls, %d bullet blocks, %.0fs",
             self.session_id, tool_calls_used, len(scratchpad),
@@ -1256,11 +1461,12 @@ class ChatSession:
             # thinking=False: synthesis is a straight "summarise these notes"
             # task — no reasoning pass needed. Skipping it shaves ~10-30 s on
             # the local thinking-mode model.
-            synth_result = await self.provider.complete(
+            synth_result = await self._complete_with_profile(
+                "synthesis",
                 messages=synth_messages,
                 tools=None,
-                temperature=self.config.temperature,
-                thinking=False,
+                default_temperature=self.config.temperature,
+                default_thinking=False,
             )
             if synth_result.reasoning_content:
                 self.last_reasoning = (
@@ -1322,11 +1528,12 @@ class ChatSession:
             )
         )
         # thinking=False: we just need a short synthesis, not another reasoning pass.
-        result = await self.provider.complete(
+        result = await self._complete_with_profile(
+            "synthesis",
             messages=full_messages,
             tools=None,
-            temperature=self.config.temperature,
-            thinking=False,
+            default_temperature=self.config.temperature,
+            default_thinking=False,
         )
         forced = result.message
         if result.reasoning_content:
@@ -1371,11 +1578,12 @@ class ChatSession:
                 ),
             ]
             try:
-                synth_result = await self.provider.complete(
+                synth_result = await self._complete_with_profile(
+                    "synthesis",
                     messages=synth_messages,
                     tools=None,
-                    temperature=self.config.temperature,
-                    thinking=False,
+                    default_temperature=self.config.temperature,
+                    default_thinking=False,
                 )
                 synth_content = synth_result.message.content or ""
                 cleaned, _ = _strip_textual_tool_calls(synth_content)
@@ -1603,36 +1811,10 @@ class ChatSession:
             ToolDefinition(
                 name="schedule_task",
                 description=(
-                    "Programa una tarea que se ejecuta automáticamente. Tres modos:\n"
-                    "\n"
-                    "1) ONE-SHOT (un solo disparo) — usa una fecha-hora absoluta o relativa:\n"
-                    "   - Absoluta: '2026-04-16 09:00' o 'at 2026-04-16T09:00:00'\n"
-                    "   - Relativa: 'next thursday at 9', 'next monday at 18:30', 'tomorrow at 8'\n"
-                    "\n"
-                    "2) RECURRENTE por cron de 5 campos ('m h dom mon dow'):\n"
-                    "   - '0 9 * * *' = cada día a las 9:00\n"
-                    "   - '0 9 * * 4' = todos los jueves a las 9:00 (dow: 0=domingo, 4=jueves)\n"
-                    "   - '30 18 * * 1-5' = lunes a viernes a las 18:30\n"
-                    "\n"
-                    "3) INTERVALO: 'every 30m', 'every 2h', 'every 1d'.\n"
-                    "\n"
-                    "REGLAS OBLIGATORIAS — léelas antes de llamar:\n"
-                    "- Si el usuario dice 'el jueves', 'el lunes', 'el día X' (singular, sin "
-                    "  'cada' ni 'todos los'), interprétalo como ONE-SHOT del próximo jueves/"
-                    "  lunes/etc. NO crees un cron recurrente.\n"
-                    "- Si el usuario dice 'los jueves', 'cada lunes', 'todos los días', es "
-                    "  RECURRENTE (cron o intervalo).\n"
-                    "- Si el usuario NO especifica hora, NO inventes una. PREGÚNTASELA "
-                    "  primero y vuelve a llamar a esta herramienta cuando la sepas. "
-                    "  Nunca uses 00:00 ni 09:00 por defecto.\n"
-                    "- Si la hora es 00:00 (medianoche), debe ser porque el usuario lo pidió "
-                    "  explícitamente. En ese caso pasa user_confirmed_midnight=true.\n"
-                    "- Tras crear la tarea, confirma al usuario el modo (one-shot o "
-                    "  recurrente) y la próxima ejecución exacta que devuelve la herramienta "
-                    "  en el campo 'next_run'.\n"
-                    "\n"
-                    "Notify: 'telegram' (envía a este chat), 'log' (escribe a fichero), "
-                    "'none' (silencioso)."
+                    "Programa una tarea one-shot, recurrente cron o intervalo. "
+                    "No inventes hora si falta. Para 00:00 usa "
+                    "user_confirmed_midnight=true solo si el usuario pidio medianoche. "
+                    "Notify: telegram, log o none."
                 ),
                 parameters={
                     "type": "object",
@@ -1648,10 +1830,8 @@ class ChatSession:
                         "schedule": {
                             "type": "string",
                             "description": (
-                                "Cuándo ejecutar. One-shot: '2026-04-16 09:00', "
-                                "'next thursday at 9', 'tomorrow at 18:00'. "
-                                "Recurrente: cron 5 campos '0 9 * * 4'. "
-                                "Intervalo: 'every 30m', 'every 2h', 'every 1d'."
+                                "Cuando ejecutar: fecha relativa/absoluta, cron de 5 campos "
+                                "o intervalo como 'every 30m'."
                             ),
                         },
                         "notify": {
@@ -1691,13 +1871,8 @@ class ChatSession:
             ToolDefinition(
                 name="cancel_task",
                 description=(
-                    "Cancela y elimina una tarea programada. Puedes pasar task_id "
-                    "(preferido, exacto) o name (búsqueda por subcadena, case-insensitive). "
-                    "Si pasas name y hay múltiples coincidencias, la herramienta devuelve "
-                    "'ambiguous' con la lista de candidatos para que pidas confirmación al "
-                    "usuario antes de volver a llamar con el task_id correcto. Cuando el "
-                    "usuario te diga 'borra esa tarea', 'cancela el recordatorio del pan' "
-                    "o similar, llama primero a list_tasks o usa directamente name."
+                    "Cancela una tarea por task_id o por name. Si name es ambiguo, "
+                    "devuelve candidatos para pedir confirmacion."
                 ),
                 parameters={
                     "type": "object",

@@ -26,6 +26,36 @@ class ProviderConfig(BaseModel):
     temperature: float = 0.7  # Sampling temperature sent in every request
     thinking: bool = False  # Enable thinking/reasoning mode (llamacpp only)
     request_timeout: float = 600.0  # HTTP timeout (s) per chat/completions call
+    max_tokens: int | None = None
+    num_predict: int | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    repeat_penalty: float | None = None
+    stop: list[str] | None = None
+    extra_body: dict[str, Any] = {}
+    options: dict[str, Any] = {}
+
+
+class TaskProfileConfig(BaseModel):
+    """Optional per-task overrides for SLM-friendly calls."""
+
+    temperature: float | None = None
+    thinking: bool | None = None
+    max_tool_calls: int | None = None
+    max_wall_seconds: int | None = None
+    extra_body: dict[str, Any] = {}
+    options: dict[str, Any] = {}
+
+
+class ProfilesConfig(BaseModel):
+    """Task profiles. Missing fields preserve current behavior."""
+
+    chat: TaskProfileConfig = TaskProfileConfig(thinking=False)
+    tool_use: TaskProfileConfig = TaskProfileConfig()
+    classifier: TaskProfileConfig = TaskProfileConfig(temperature=0.0, thinking=False)
+    kb_research: TaskProfileConfig = TaskProfileConfig(thinking=False, max_tool_calls=3, max_wall_seconds=60)
+    synthesis: TaskProfileConfig = TaskProfileConfig(thinking=False)
+    compaction: TaskProfileConfig = TaskProfileConfig(temperature=0.0, thinking=False)
 
 
 class TrackingLimits(BaseModel):
@@ -287,6 +317,7 @@ class VectorConfig(BaseModel):
 
     providers: dict[str, ProviderConfig] = {}
     fallback: FallbackConfig = FallbackConfig()
+    profiles: ProfilesConfig = ProfilesConfig()
     skills_dirs: list[str] = ["./skills"]
     plugins_dirs: list[str] = []
     agent_instructions: str = "~/.eyetor/AGENTS.md"

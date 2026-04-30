@@ -52,6 +52,8 @@ TELEGRAM_BOT_TOKEN=     # from @BotFather on Telegram
 TELEGRAM_ALLOWED_USER=  # your numeric chat_id (get it from @userinfobot)
 OPENROUTER_API_KEY=     # only if using OpenRouter provider
 GEMINI_API_KEY=         # only if using Gemini provider (LLM and/or images)
+LLAMACPP_API_KEY=       # optional; only needed if your llama.cpp endpoint requires auth
+OLLAMA_API_KEY=         # optional; useful when Ollama is behind a proxy
 ```
 
 Main config: `config/default.yaml`. Key sections:
@@ -61,11 +63,29 @@ providers:
   llamacpp:
     type: llamacpp
     base_url: http://localhost:8080/v1
+    api_key: ${LLAMACPP_API_KEY}
     model: default
-    temperature: 0.6
+    temperature: 0.5
+
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434/v1
+    api_key: ${OLLAMA_API_KEY}
+    model: llama3.2
 
 fallback:
-  fallback_chain: [llamacpp, openrouter]   # first entry is primary, later ones are tried on retryable failures
+  fallback_chain: [llamacpp, ollama, openrouter]   # local first; cloud providers are optional fallbacks
+
+profiles:
+  classifier:
+    temperature: 0.0
+    thinking: false
+  kb_research:
+    thinking: false
+    max_tool_calls: 3
+    max_wall_seconds: 60
+  synthesis:
+    thinking: false
 
 channels:
   cli:
@@ -490,8 +510,19 @@ A fallback chain retries across providers on timeout or server errors:
 
 ```yaml
 fallback:
-  fallback_chain: [llamacpp, openrouter]
+  fallback_chain: [llamacpp, ollama, openrouter]
   retry_on: [timeout, connection_error, "500", "502", "503"]
+```
+
+For low-memory KB/RAG, keep `knowledge.embedding.enabled: false` for BM25-only retrieval.
+For higher quality local retrieval, install `knowledge-vector` or `knowledge-full` and enable a small embedding model:
+
+```yaml
+knowledge:
+  embedding:
+    enabled: true
+    model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+    dim: 384
 ```
 
 ## Image generation

@@ -9,11 +9,13 @@ providers:
   ollama:
     type: ollama
     base_url: http://localhost:11434/v1
+    api_key: ${OLLAMA_API_KEY}   # optional; useful when Ollama is behind a local proxy
     model: llama3.2
 
   llamacpp:
     type: llamacpp
     base_url: http://localhost:8080/v1
+    api_key: ${LLAMACPP_API_KEY}
     model: default
     temperature: 0.5
     thinking: true   # set to true to enable reasoning channel (Gemma-4, QwQ, etc.)
@@ -31,8 +33,30 @@ providers:
     model: gemini-2.0-flash
 
 fallback:
-  fallback_chain: [llamacpp, openrouter, gemini]
+  fallback_chain: [llamacpp, ollama, openrouter, gemini]
   retry_on: [timeout, connection_error, "500", "502", "503", "529"]
+
+# Local-first task profiles for small models. Missing fields keep provider defaults.
+profiles:
+  chat:
+    thinking: false
+    temperature: 0.3
+  tool_use:
+    max_tool_calls: 6
+    max_wall_seconds: 180
+  classifier:
+    temperature: 0.0
+    thinking: false
+  kb_research:
+    thinking: false
+    max_tool_calls: 3
+    max_wall_seconds: 60
+  synthesis:
+    thinking: false
+    temperature: 0.2
+  compaction:
+    temperature: 0.0
+    thinking: false
 
 skills_dirs:
   - ./skills

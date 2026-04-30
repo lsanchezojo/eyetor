@@ -205,7 +205,7 @@ def start(
         )
         base_system = f"{base_system}\n\nFecha y hora actual: {now_str}"
 
-        skills_context = skill_reg.build_skills_context(skill_names)
+        skills_context = skill_reg.build_skills_summary_context(skill_names)
         if skills_context:
             base_system = f"{base_system}\n\n{skills_context}"
 

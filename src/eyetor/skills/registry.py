@@ -84,6 +84,52 @@ class SkillRegistry:
                 logger.warning("Skill not found in registry: %s", name)
         return "\n".join(parts)
 
+    def build_skills_summary_context(
+        self,
+        skill_names: list[str],
+        *,
+        expanded_skill_names: list[str] | None = None,
+    ) -> str:
+        """Build a compact system prompt skill section for small local models.
+
+        The summary intentionally avoids SKILL.md bodies. It includes only
+        name, description and public script names, while still allowing callers
+        to opt in to full instructions for a small set of relevant skills.
+        """
+        if not skill_names:
+            return ""
+        expanded = set(expanded_skill_names or [])
+        parts = [
+            "## Available Skills (summary)",
+            (
+                "Call a skill via its `skill_<name>` tool. Pass only subcommands "
+                "and flags in `args`; do not include interpreter, script path or wrapper."
+            ),
+        ]
+        for name in skill_names:
+            try:
+                meta = self.get_metadata(name)
+            except KeyError:
+                logger.warning("Skill not found in registry: %s", name)
+                continue
+            script_names: list[str] = []
+            scripts_dir = meta.path / "scripts"
+            if scripts_dir.exists():
+                script_names = [
+                    p.stem
+                    for p in sorted(scripts_dir.iterdir())
+                    if p.is_file() and not p.name.startswith(("_", "."))
+                ]
+            line = f"- **{meta.name}**: {meta.description}"
+            if script_names:
+                line += f" Public scripts: {', '.join(script_names)}."
+            parts.append(line)
+            if name in expanded:
+                info = self.activate(name)
+                parts.append(f"\n### Expanded Skill: {name}")
+                parts.append(info.instructions)
+        return "\n".join(parts)
+
     def get_all_commands(self) -> list[tuple[SkillMetadata, SkillCommand]]:
         """Return all skill-declared channel commands with their parent metadata."""
         result = []

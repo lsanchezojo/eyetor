@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, AsyncIterator
+from typing import AsyncIterator
 
 from eyetor.models.messages import (
     CompletionResult,
-    FunctionCall,
     Message,
     StreamingResponse,
     TokenUsage,
-    ToolCall,
 )
 from eyetor.models.tools import ToolDefinition
 from eyetor.providers.base import BaseProvider
+from eyetor.providers.openrouter import _parse_completion_response
 from eyetor.streaming.parsers import extract_delta_content, extract_usage, parse_sse
 
 logger = logging.getLogger(__name__)
@@ -75,43 +74,3 @@ class GeminiProvider(BaseProvider):
 
         return StreamingResponse(_stream_tokens(), usage)
 
-
-def _parse_completion_response(data: dict[str, Any]) -> CompletionResult:
-    """Parse a non-streaming /chat/completions response into a CompletionResult."""
-    choice = data["choices"][0]
-    msg = choice["message"]
-    role = msg.get("role", "assistant")
-    content = msg.get("content")
-    raw_tool_calls = msg.get("tool_calls")
-
-    tool_calls: list[ToolCall] | None = None
-    if raw_tool_calls:
-        tool_calls = [
-            ToolCall(
-                id=tc["id"],
-                function=FunctionCall(
-                    name=tc["function"]["name"],
-                    arguments=tc["function"]["arguments"],
-                ),
-            )
-            for tc in raw_tool_calls
-        ]
-
-    message = Message(role=role, content=content, tool_calls=tool_calls)
-
-    raw_usage = data.get("usage")
-    usage = None
-    if raw_usage:
-        usage = TokenUsage(
-            prompt_tokens=raw_usage.get("prompt_tokens", 0),
-            completion_tokens=raw_usage.get("completion_tokens", 0),
-            total_tokens=raw_usage.get("total_tokens", 0),
-            cost=raw_usage.get("cost", 0.0),
-        )
-
-    return CompletionResult(
-        message=message,
-        usage=usage,
-        model=data.get("model"),
-        finish_reason=choice.get("finish_reason"),
-    )

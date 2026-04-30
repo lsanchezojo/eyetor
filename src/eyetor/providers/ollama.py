@@ -69,3 +69,15 @@ class OllamaProvider(BaseProvider):
                             yield text
 
         return StreamingResponse(_stream_tokens(), None)
+
+    def _build_payload(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        temperature: float,
+        stream: bool = False,
+    ) -> dict:
+        payload = super()._build_payload(messages, tools, temperature, stream)
+        if self.options:
+            payload["options"] = self.options
+        return payload

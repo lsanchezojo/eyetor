@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -23,39 +22,16 @@ from eyetor.models.agents import AgentConfig
 from eyetor.models.messages import Message
 from eyetor.models.tools import ToolDefinition, ToolRegistry
 from eyetor.providers.base import BaseProvider
+from eyetor.utils.json import extract_json_object
 
 logger = logging.getLogger(__name__)
-
-# Regex to extract JSON objects from free-form text
-_JSON_BLOCK_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
 
 
 def _extract_json(text: str) -> dict | None:
     """Try to parse JSON from text, with fallback to embedded JSON extraction."""
-    text = text.strip()
-    # Try direct parse first
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        pass
-    # Strip markdown code fences if present
-    if text.startswith("```"):
-        lines = text.splitlines()
-        inner = "\n".join(
-            l for l in lines if not l.strip().startswith("```")
-        )
-        try:
-            return json.loads(inner.strip())
-        except (json.JSONDecodeError, ValueError):
-            pass
-    # Search for embedded JSON objects
-    for match in _JSON_BLOCK_RE.finditer(text):
-        try:
-            candidate = json.loads(match.group())
-            if isinstance(candidate, dict) and ("action" in candidate or "worker" in candidate):
-                return candidate
-        except (json.JSONDecodeError, ValueError):
-            continue
+    candidate = extract_json_object(text)
+    if candidate and ("action" in candidate or "worker" in candidate):
+        return candidate
     return None
 
 

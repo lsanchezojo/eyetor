@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import json
+import uuid
 from typing import Any, AsyncIterator
 
 from eyetor.models.messages import (
@@ -96,16 +98,29 @@ def _parse_completion_response(data: dict[str, Any]) -> CompletionResult:
 
     tool_calls: list[ToolCall] | None = None
     if raw_tool_calls:
-        tool_calls = [
-            ToolCall(
-                id=tc["id"],
-                function=FunctionCall(
-                    name=tc["function"]["name"],
-                    arguments=tc["function"]["arguments"],
-                ),
+        parsed: list[ToolCall] = []
+        for tc in raw_tool_calls:
+            function = tc.get("function") if isinstance(tc, dict) else None
+            if not isinstance(function, dict) or not function.get("name"):
+                logger.warning("Ignoring malformed tool_call without function.name: %r", tc)
+                continue
+            arguments = function.get("arguments", "")
+            if isinstance(arguments, (dict, list)):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            elif arguments is None:
+                arguments = ""
+            elif not isinstance(arguments, str):
+                arguments = str(arguments)
+            parsed.append(
+                ToolCall(
+                    id=str(tc.get("id") or uuid.uuid4().hex[:24]),
+                    function=FunctionCall(
+                        name=str(function["name"]),
+                        arguments=arguments,
+                    ),
+                )
             )
-            for tc in raw_tool_calls
-        ]
+        tool_calls = parsed or None
 
     message = Message(role=role, content=content, tool_calls=tool_calls)
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import AsyncIterator, TYPE_CHECKING
+from typing import Any, AsyncIterator, TYPE_CHECKING
 
 from eyetor.chat.session import ChatSession
 from eyetor.models.agents import AgentConfig
@@ -63,6 +63,22 @@ class SessionManager:
         self._routing_votes: int = 1
         if root_config and root_config.routing.enabled and root_config.routing.routes:
             self._init_routing(root_config)
+
+    def _provider_targets(self) -> list[Any]:
+        targets: list[Any] = []
+
+        def collect(provider: Any) -> None:
+            if provider in targets:
+                return
+            targets.append(provider)
+            inner = getattr(provider, "_inner", None)
+            if inner is not None:
+                collect(inner)
+            for child in getattr(provider, "_providers", []) or []:
+                collect(child)
+
+        collect(self._provider)
+        return targets
 
     def _init_routing(self, root_config: "VectorConfig") -> None:
         """Initialize routing classifier from config."""
@@ -170,13 +186,27 @@ class SessionManager:
         """
         from eyetor.workflows.router import classify
 
-        return await classify(
-            user_input=user_input,
-            routes=self._routing_routes,
-            provider=self._provider,
-            n_votes=self._routing_votes,
-            history=history,
-        )
+        profile = self._root_config.profiles.classifier if self._root_config else None
+        temperature = 0.0 if not profile or profile.temperature is None else profile.temperature
+        saved: list[tuple[Any, dict, dict]] = []
+        if profile and (profile.extra_body or profile.options):
+            for target in self._provider_targets():
+                saved.append((target, dict(target.extra_body), dict(target.options)))
+                target.extra_body = {**target.extra_body, **profile.extra_body}
+                target.options = {**target.options, **profile.options}
+        try:
+            return await classify(
+                user_input=user_input,
+                routes=self._routing_routes,
+                provider=self._provider,
+                n_votes=self._routing_votes,
+                temperature=temperature,
+                history=history,
+            )
+        finally:
+            for target, extra_body, options in saved:
+                target.extra_body = extra_body
+                target.options = options
 
     def get_or_create(self, session_id: str) -> ChatSession:
         """Return the existing session or create a new one."""

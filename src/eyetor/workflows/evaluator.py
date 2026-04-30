@@ -6,13 +6,13 @@ If not PASS, Generator receives feedback and retries (up to max_rounds).
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 
 from eyetor.agents.base import BaseAgent
 from eyetor.models.agents import AgentConfig
 from eyetor.providers.base import BaseProvider
+from eyetor.utils.json import extract_json_object
 
 logger = logging.getLogger(__name__)
 
@@ -165,14 +165,17 @@ class EvaluatorOptimizer:
 
     def _parse_eval(self, raw: str) -> tuple[str, float, str]:
         """Parse evaluator JSON response. Returns (verdict, score, feedback)."""
-        try:
-            data = json.loads(raw)
+        data = extract_json_object(raw)
+        if data:
+            try:
+                score = float(data.get("score", 0))
+            except (ValueError, TypeError):
+                score = 0.0
             return (
                 str(data.get("verdict", "FAIL")).upper(),
-                float(data.get("score", 0)),
+                score,
                 str(data.get("feedback", "")),
             )
-        except (json.JSONDecodeError, ValueError, TypeError):
-            # Best-effort: check if PASS or FAIL appears in text
-            verdict = "PASS" if "PASS" in raw.upper() else "FAIL"
-            return verdict, 0.0, raw
+        # Best-effort: check if PASS or FAIL appears in text
+        verdict = "PASS" if "PASS" in raw.upper() else "FAIL"
+        return verdict, 0.0, raw

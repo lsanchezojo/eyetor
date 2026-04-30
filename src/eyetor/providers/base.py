@@ -43,12 +43,28 @@ class BaseProvider(ABC):
         api_key: str | None = None,
         ssl_verify: bool | str = True,
         temperature: float = 0.7,
+        max_tokens: int | None = None,
+        num_predict: int | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
+        stop: list[str] | None = None,
+        extra_body: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.ssl_verify = ssl_verify
         self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.num_predict = num_predict
+        self.top_p = top_p
+        self.top_k = top_k
+        self.repeat_penalty = repeat_penalty
+        self.stop = stop
+        self.extra_body = extra_body or {}
+        self.options = options or {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -109,6 +125,17 @@ class BaseProvider(ABC):
         }
         if tools:
             payload["tools"] = [t.to_openai_format() for t in tools]
+        optional_fields = {
+            "max_tokens": self.max_tokens,
+            "num_predict": self.num_predict,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "repeat_penalty": self.repeat_penalty,
+            "stop": self.stop,
+        }
+        for key, value in optional_fields.items():
+            if value is not None:
+                payload[key] = value
         return payload
 
     def _build_headers(self) -> dict[str, str]:

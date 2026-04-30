@@ -53,6 +53,14 @@ def create_provider(config: ProviderConfig) -> BaseProvider:
         "model": config.model,
         "ssl_verify": config.ssl_verify,
         "temperature": config.temperature,
+        "max_tokens": config.max_tokens,
+        "num_predict": config.num_predict,
+        "top_p": config.top_p,
+        "top_k": config.top_k,
+        "repeat_penalty": config.repeat_penalty,
+        "stop": config.stop,
+        "extra_body": config.extra_body,
+        "options": config.options,
     }
     if config.type == "llamacpp":
         kwargs["thinking"] = config.thinking

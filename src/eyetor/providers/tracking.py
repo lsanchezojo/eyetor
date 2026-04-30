@@ -44,6 +44,14 @@ class TrackingProvider(BaseProvider):
             api_key=inner.api_key,
             ssl_verify=inner.ssl_verify,
             temperature=inner.temperature,
+            max_tokens=inner.max_tokens,
+            num_predict=inner.num_predict,
+            top_p=inner.top_p,
+            top_k=inner.top_k,
+            repeat_penalty=inner.repeat_penalty,
+            stop=inner.stop,
+            extra_body=inner.extra_body,
+            options=inner.options,
         )
         self._inner = inner
         self._tracker = tracker
