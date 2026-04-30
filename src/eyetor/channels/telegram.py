@@ -576,36 +576,7 @@ class TelegramChannel(BaseChannel):
         )
         logger.debug("Vision description: %s", description[:300])
 
-        user_text = caption.strip()
-        # The image has already been processed by the vision model; its text
-        # description is the authoritative source for anything visible in the
-        # image. Do NOT leak the file path into the prompt — small local
-        # models see a path and reflexively try to read it with a filesystem
-        # skill, which returns raw JPG bytes and wastes a loop iteration.
-        vision_guard = (
-            "El análisis de la imagen de arriba es la fuente autoritativa de "
-            "su contenido. No intentes abrir ni leer el fichero de imagen con "
-            "herramientas de filesystem ni con ninguna otra — ya ha sido "
-            "procesado por el modelo de visión."
-        )
-        if user_text:
-            prompt = (
-                f"El usuario ha enviado una imagen con este mensaje: «{user_text}»\n\n"
-                f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
-                f"{vision_guard}\n\n"
-                f"Responde a lo que pide el usuario usando ese análisis como contexto. "
-                f"Si necesitas información que no está en el análisis, usa las "
-                f"herramientas relevantes (web, knowledge base, etc.)."
-            )
-        else:
-            prompt = (
-                f"El usuario ha enviado una imagen sin mensaje adicional.\n\n"
-                f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
-                f"{vision_guard}\n\n"
-                f"Responde al usuario basándote en el contenido descrito. "
-                f"Si necesitas completar con información externa, usa las "
-                f"herramientas relevantes."
-            )
+        prompt = _build_image_prompt(description, caption, img_path)
 
         await self._stream_session_to_placeholder(msg, placeholder, prompt)
 
@@ -764,6 +735,40 @@ async def _replace_with_friendly(placeholder, msg, exc: BaseException) -> None:
 def _format_exc(exc: BaseException) -> str:
     msg = str(exc).strip()
     return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+
+
+def _build_image_prompt(description: str, caption: str, img_path: Path) -> str:
+    """Build the main-agent prompt for an already-described image attachment."""
+    user_text = caption.strip()
+    attachment_context = (
+        "Archivo local del adjunto ya guardado para herramientas que procesen "
+        f"adjuntos o imágenes: {img_path}"
+    )
+    vision_guard = (
+        "El análisis de la imagen de arriba es la fuente autoritativa de su "
+        "contenido visible. No intentes inspeccionar el fichero con herramientas "
+        "genéricas de lectura de archivos para entender la imagen; usa la ruta solo como "
+        "entrada de una herramienta registrada que procese adjuntos o imágenes."
+    )
+    if user_text:
+        return (
+            f"El usuario ha enviado una imagen con este mensaje: «{user_text}»\n\n"
+            f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
+            f"{attachment_context}\n\n"
+            f"{vision_guard}\n\n"
+            f"Responde a lo que pide el usuario usando ese análisis como contexto. "
+            f"Si una herramienta registrada necesita el archivo original del "
+            f"adjunto, usa la ruta indicada arriba."
+        )
+    return (
+        f"El usuario ha enviado una imagen sin mensaje adicional.\n\n"
+        f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
+        f"{attachment_context}\n\n"
+        f"{vision_guard}\n\n"
+        f"Responde al usuario basándote en el contenido descrito. Si una "
+        f"herramienta registrada necesita el archivo original del adjunto, usa "
+        f"la ruta indicada arriba."
+    )
 
 
 async def _describe_image(
