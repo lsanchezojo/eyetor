@@ -848,7 +848,7 @@ async def _describe_image(
                 ],
             }
         ],
-        "max_tokens": 2048,
+        "max_tokens": 4096,
         "temperature": 0.1,
     }
 
@@ -858,7 +858,32 @@ async def _describe_image(
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        try:
+            message = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(
+                f"Vision API: respuesta sin choices/message: {data!r}"
+            ) from exc
+
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+
+        reasoning = message.get("reasoning")
+        if isinstance(reasoning, str) and reasoning.strip():
+            logger.warning(
+                "Vision content vacío; usando reasoning como descripción "
+                "(finish_reason=%s)",
+                data["choices"][0].get("finish_reason"),
+            )
+            return reasoning
+
+        logger.error("Vision API devolvió content y reasoning vacíos: %r", data)
+        raise RuntimeError(
+            "El modelo de visión no devolvió descripción "
+            f"(finish_reason={data['choices'][0].get('finish_reason')!r}). "
+            "Reintenta el envío."
+        )
 
 
 _whisper_model = None  # Module-level cache — loaded once on first use

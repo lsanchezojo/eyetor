@@ -10,7 +10,7 @@ providers:
     type: ollama
     base_url: http://localhost:11434/v1
     api_key: ${OLLAMA_API_KEY}   # optional; useful when Ollama is behind a local proxy
-    model: llama3.2
+    model: qwen3.5:cloud   # remote Qwen3.5 served by Ollama Cloud — high-capacity fallback that doesn't compete for local VRAM
 
   llamacpp:
     type: llamacpp
@@ -19,7 +19,7 @@ providers:
     model: default
     temperature: 0.5
     thinking: true   # set to true to enable reasoning channel (Gemma-4, QwQ, etc.)
-    request_timeout: 180   # cap a single /chat/completions call; aligned with sessions.budget.max_wall_seconds. Auxiliary calls (classifier, synthesis) pass thinking=false to stay under the cap.
+    request_timeout: 360   # cap a single /chat/completions call; aligned with profiles.tool_use.max_wall_seconds. Auxiliary calls (classifier, synthesis) pass thinking=false to stay under the cap.
 
   llamacpp-vision:
     type: llamacpp
@@ -43,7 +43,7 @@ profiles:
     temperature: 0.3
   tool_use:
     max_tool_calls: 6
-    max_wall_seconds: 180
+    max_wall_seconds: 360
   classifier:
     temperature: 0.0
     thinking: false
