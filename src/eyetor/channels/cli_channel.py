@@ -97,8 +97,7 @@ class CliChannel(BaseChannel):
                     providers = self._manager.list_providers()
                     current = session.provider
                     current_model = getattr(current, "model", "?")
-                    # If wrapped in TrackingProvider, get inner name
-                    provider_name = getattr(current, "_provider_name", None) or "?"
+                    provider_name = _describe_provider(current)
                     lines = [
                         f"[bold]Proveedor actual:[/bold] [cyan]{provider_name}[/cyan] (modelo: {current_model})\n"
                     ]
@@ -159,6 +158,26 @@ class CliChannel(BaseChannel):
             self._console.print(
                 f"[{role_color}]{msg.role}[/{role_color}]: {msg.content or '[tool call]'}"
             )
+
+
+def _describe_provider(provider) -> str:
+    """Best-effort human-readable name for the active provider.
+
+    - TrackingProvider exposes ``_provider_name``.
+    - FallbackProvider exposes ``_providers`` (each wrapped); list them as a chain.
+    - Anything else falls back to the class name.
+    """
+    name = getattr(provider, "_provider_name", None)
+    if name:
+        return name
+    inner = getattr(provider, "_providers", None)
+    if inner:
+        names = [
+            getattr(p, "_provider_name", None) or type(p).__name__
+            for p in inner
+        ]
+        return "fallback(" + " → ".join(names) + ")"
+    return type(provider).__name__
 
 
 def _collect_image_paths(buffer: str, session) -> list[str]:
