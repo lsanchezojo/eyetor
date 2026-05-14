@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import getpass
 import json
 import logging
 import re
@@ -16,11 +15,6 @@ from eyetor.channels.base import BaseChannel
 from eyetor.chat.manager import SessionManager
 
 logger = logging.getLogger(__name__)
-
-
-def _get_cli_session_id() -> str:
-    username = getpass.getuser()
-    return f"cli-{username}"
 
 
 _IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(.*?)\]")
@@ -43,9 +37,11 @@ class CliChannel(BaseChannel):
     def __init__(
         self,
         session_manager: SessionManager,
+        session_id: str,
         skill_reg=None,
     ) -> None:
         self._manager = session_manager
+        self._session_id = session_id
         self._skill_reg = skill_reg
         self._console = Console()
         self._running = False
@@ -55,10 +51,11 @@ class CliChannel(BaseChannel):
         self._running = True
         self._console.print("[bold green]Eyetor[/bold green] — Multi-agent AI system")
         self._console.print(
+            f"Sesión: [cyan]{self._session_id}[/cyan]   "
             "Type [bold]/help[/bold] for commands, [bold]/exit[/bold] to quit.\n"
         )
 
-        session = self._manager.get_or_create(_get_cli_session_id())
+        session = self._manager.get_or_create(self._session_id)
 
         while self._running:
             try:

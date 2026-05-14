@@ -9,36 +9,61 @@ Multi-agent AI system based on Anthropic's agent patterns. Runs as a background 
 
 ## Installation
 
+Eyetor se instala en un entorno virtual (`venv`) dentro del propio repositorio. Esto aísla sus dependencias y permite que el servicio systemd apunte a un intérprete fijo.
+
 ```bash
-# Clone and enter the repo
+# 1. Clone and enter the repo
 git clone <repo>
 cd eyetor
 
-# Copy and configure environment
+# 2. Copy and configure environment
 cp .env.example .env
+# (edit .env with your tokens / API keys)
 
-# Install core dependencies + Telegram support
+# 3. Create and activate the virtual environment
+python3 -m venv .venv
+source .venv/bin/activate            # bash/zsh
+# source .venv/bin/activate.fish     # fish
+
+# 4. Upgrade pip tooling (recommended)
+pip install --upgrade pip wheel
+
+# 5. Install Eyetor in editable mode + Telegram support
 pip install -e ".[telegram]"
 ```
+
+After installation the `eyetor` command is available at `.venv/bin/eyetor` (and on `PATH` while the venv is activated).
 
 **Dependencies:**
 - Core: `httpx`, `pyyaml`, `pydantic`, `rich`, `click`, `apscheduler`
 - Optional (telegram): `aiogram`
+- Optional (knowledge): `pypdf`, `python-docx`, `openpyxl`, `python-pptx`
+- Optional (knowledge-vector): `fastembed`, `sqlite-vec`
+
+To install knowledge-base extras too:
+
+```bash
+pip install -e ".[telegram,knowledge-full]"
+```
 
 ## Development
 
-After modifying source code in `src/eyetor/`, reinstall to apply changes:
+Editable install (`-e`) means changes to `src/eyetor/` take effect on the next process start without reinstalling. Reinstall only when:
+
+- You create new modules
+- You change package/module structure (entry points, etc.)
+- You pull updates that add new dependencies
 
 ```bash
-pip install -e .
+source .venv/bin/activate
+pip install -e ".[telegram]"
 ```
 
-The `-e` flag (editable mode) means changes to the source are reflected immediately without reinstall — useful during development.
+If the service is running, restart it to pick up the new code:
 
-Reinstall when:
-- You create new modules
-- You change module structure
-- You pull updates via git
+```bash
+systemctl --user restart eyetor
+```
 
 ## Configuration
 
@@ -132,13 +157,15 @@ WHISPER_BASE_URL=http://localhost:8000   # optional: local whisper server
 OPENAI_API_KEY=sk-...                    # optional: OpenAI Whisper API
 ```
 
-## Deploying as a systemd service
+## Deploying as a systemd user service
 
-The service runs `eyetor start` without a tty, so only Telegram (or other non-interactive channels) start.
+This is the recommended way to run Eyetor permanently: a **systemd user service** that points to the venv-installed binary, auto-starts on every reboot and restarts on failure. The service runs `eyetor start` without a tty, so only Telegram (or other non-interactive channels) start.
 
-**1. Create the service unit**
+> **Prerequisite:** the venv must already be created and Eyetor installed in it (see [Installation](#installation)).
 
-Create `~/.config/systemd/user/eyetor.service`:
+### 1. Create the service unit
+
+Save the following file as `~/.config/systemd/user/eyetor.service`. Replace `/home/<user>/dev/workspace/eyetor` with the absolute path to **your** clone.
 
 ```ini
 [Unit]
@@ -148,9 +175,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/path/to/eyetor
-EnvironmentFile=/path/to/eyetor/.env
-ExecStart=/home/<user>/.local/bin/eyetor start
+WorkingDirectory=/home/<user>/dev/workspace/eyetor
+EnvironmentFile=/home/<user>/dev/workspace/eyetor/.env
+ExecStart=/home/<user>/dev/workspace/eyetor/.venv/bin/eyetor start
 Restart=on-failure
 RestartSec=10s
 
@@ -158,28 +185,69 @@ RestartSec=10s
 WantedBy=default.target
 ```
 
-Replace `/path/to/eyetor` with the absolute path to the project and `<user>` with your username.
+Key points:
 
-**2. Enable and start**
+- `ExecStart` points to `.venv/bin/eyetor`, the entry point installed inside the project's virtualenv — no need to activate the venv from systemd.
+- `EnvironmentFile` loads variables from `.env` (Telegram token, API keys, etc.). Make sure `.env` exists at that path.
+- `WorkingDirectory` is the project root so relative paths in `config/default.yaml` (e.g. `./skills`, `./plugins`) resolve correctly.
+
+### 2. Reload, enable and start
 
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now eyetor.service
 ```
 
-**3. Persist across logouts**
+`enable --now` both enables the unit (so it starts on every login) and starts it immediately.
+
+### 3. Persist across logouts and reboots (lingering)
+
+By default, user services stop when the user logs out and only start on login. To make Eyetor start on every boot **without requiring a login session**, enable lingering for your user (this is the only step that needs `sudo`):
 
 ```bash
-loginctl enable-linger $USER
+sudo loginctl enable-linger $USER
 ```
 
-**Useful commands**
+Verify:
 
 ```bash
-journalctl --user -u eyetor -f          # live logs
-systemctl --user status eyetor          # status
-systemctl --user restart eyetor         # restart after config changes
-systemctl --user disable --now eyetor   # stop and disable
+loginctl show-user $USER | grep Linger      # → Linger=yes
+```
+
+### 4. Verify it's running
+
+```bash
+systemctl --user status eyetor              # should show: active (running)
+journalctl --user -u eyetor -n 30           # last 30 log lines
+```
+
+### Useful commands
+
+```bash
+journalctl --user -u eyetor -f          # live logs (follow)
+systemctl --user status eyetor          # current status
+systemctl --user restart eyetor         # restart after code/config changes
+systemctl --user stop eyetor            # stop (will not restart until reboot/login)
+systemctl --user disable --now eyetor   # stop and disable auto-start
+```
+
+### Updating a running deployment
+
+```bash
+cd /path/to/eyetor
+git pull
+source .venv/bin/activate
+pip install -e ".[telegram]"            # only needed if dependencies changed
+systemctl --user restart eyetor
+```
+
+### Uninstalling the service
+
+```bash
+systemctl --user disable --now eyetor
+rm ~/.config/systemd/user/eyetor.service
+systemctl --user daemon-reload
+sudo loginctl disable-linger $USER      # optional
 ```
 
 ## Scheduled tasks

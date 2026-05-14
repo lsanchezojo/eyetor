@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from eyetor._sqlite_util import apply_concurrency_pragmas
+
 
 @dataclass
 class Memory:
@@ -43,6 +45,7 @@ class MemoryStore:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        apply_concurrency_pragmas(self._conn)
         self._conn.executescript(_DDL)
         self._conn.commit()
 

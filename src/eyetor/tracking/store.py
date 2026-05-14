@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from eyetor._sqlite_util import apply_concurrency_pragmas
+
 logger = logging.getLogger(__name__)
 
 
@@ -79,6 +81,7 @@ class TrackingStore:
         """Open (or reopen) the database and ensure the schema exists."""
         conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        apply_concurrency_pragmas(conn)
         conn.executescript(_DDL)
         conn.commit()
         self._apply_migrations(conn)

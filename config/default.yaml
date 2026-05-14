@@ -4,12 +4,15 @@ providers:
     ssl_verify: false
     base_url: https://openrouter.ai/api/v1
     api_key: ${OPENROUTER_API_KEY}
-    model: stepfun/step-3.5-flash
+    model: nvidia/nemotron-3-super-120b-a12b:free #stepfun/step-3.5-flash
 
   ollama:
     type: ollama
     base_url: http://localhost:11434/v1
-    model: llama3.2
+    # variante con num_ctx=8192 y num_gpu=20 para que no haga OOM en cómputo
+    # sobre la iGPU 890M. Modelfile en /tmp/eyetor.Modelfile, regenerable con:
+    #   ollama create qwen3.6:35b-eyetor -f /tmp/eyetor.Modelfile
+    model: qwen3.6:35b-a3b-q4_K_M
 
   llamacpp:
     type: llamacpp
@@ -30,7 +33,7 @@ providers:
     model: gemini-2.0-flash
 
 fallback:
-  fallback_chain: [llamacpp, openrouter, gemini]
+  fallback_chain: [ollama, openrouter, gemini]
   retry_on: [timeout, connection_error, "500", "502", "503", "529"]
 
 skills_dirs:

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import getpass
 import json
 import logging
+import os
 import signal
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -39,6 +42,21 @@ def _load_cfg(config_path: str | None):
 
     path = Path(config_path) if config_path else None
     return load_config(path)
+
+
+def _default_cli_session_id() -> str:
+    """Default CLI session id: stable while the parent shell lives."""
+    return f"cli-{getpass.getuser()}-{os.getppid()}"
+
+
+def _resolve_cli_session_id(session_flag: str | None) -> str:
+    """Resolve the CLI session id (precedence: --session > $EYETOR_SESSION > default)."""
+    if session_flag:
+        return session_flag
+    env = os.environ.get("EYETOR_SESSION")
+    if env:
+        return env
+    return _default_cli_session_id()
 
 
 def _resolve_provider(cfg, provider, model, tracker, cost_estimator):
@@ -114,14 +132,28 @@ def cli(ctx: click.Context, config: str | None, log_level: str | None) -> None:
     default=None,
     help="Enable/disable host skills (shell, filesystem, browser). Default from config.",
 )
+@click.option(
+    "--session",
+    "session_id",
+    default=None,
+    help=(
+        "Persistent CLI session id. Resumes if it already exists. "
+        "Precedence: --session > $EYETOR_SESSION > cli-<user>-<ppid>."
+    ),
+)
 @click.pass_context
 def start(
-    ctx: click.Context, provider: str | None, model: str | None, host_tools: bool | None
+    ctx: click.Context,
+    provider: str | None,
+    model: str | None,
+    host_tools: bool | None,
+    session_id: str | None,
 ) -> None:
     """Start the agent — launches all configured channels (CLI and/or Telegram)."""
     import sys
 
     cfg = ctx.obj["cfg"]
+    resolved_session_id = _resolve_cli_session_id(session_id)
 
     # --host-tools flag overrides config; config default is True
     use_host_tools = (
@@ -142,9 +174,12 @@ def start(
         from eyetor.skills.executor import run_script, DEFAULT_TIMEOUT
         from eyetor.tracking.usage import UsageTracker
         from eyetor.tracking.pricing import CostEstimator
-        from eyetor.runtime import write_snapshot
+        from eyetor.runtime import runtime_path, write_snapshot
 
-        write_snapshot(cfg)
+        # In interactive (CLI) mode the systemd service is usually the snapshot
+        # owner — only write it if no snapshot exists yet, to avoid races.
+        if not interactive or not runtime_path().exists():
+            write_snapshot(cfg)
 
         tracker = UsageTracker.from_config(cfg.tracking)
         cost_estimator = CostEstimator()
@@ -192,7 +227,6 @@ def start(
             )
 
         # Inject current date/time so the model knows "today"
-        from datetime import datetime
         from zoneinfo import ZoneInfo
         _DAYS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
         _MONTHS_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
@@ -593,10 +627,12 @@ def start(
             temperature=prov.temperature,
         )
 
-        # Scheduler (shared across all channels)
+        # Scheduler (shared across all channels). Only the non-interactive
+        # "server" instance owns APScheduler — interactive CLIs would
+        # duplicate every job otherwise.
         scheduler = None
         sched_cfg = cfg.scheduler
-        if sched_cfg.enabled:
+        if sched_cfg.enabled and not interactive:
             from eyetor.scheduler.store import SchedulerStore
             from eyetor.scheduler.channel import SchedulerChannel
 
@@ -641,7 +677,13 @@ def start(
                 tracker=tracker,
                 cost_estimator=cost_estimator,
             )
-            channels.append(CliChannel(session_mgr_cli, skill_reg=skill_reg))
+            channels.append(
+                CliChannel(
+                    session_mgr_cli,
+                    session_id=resolved_session_id,
+                    skill_reg=skill_reg,
+                )
+            )
 
         tg_cfg = cfg.channels.telegram
         if tg_cfg.enabled and tg_cfg.bot_token and not interactive:
@@ -1414,6 +1456,131 @@ def kb_status(ctx: click.Context) -> None:
         table.add_row(k, str(v))
     console.print(table)
     console.print(f"[dim]Workspaces: {', '.join(km.list_workspaces()) or '-'}[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# eyetor sessions
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def sessions() -> None:
+    """Manage persistent CLI/agent sessions (JSONL on disk)."""
+
+
+def _sessions_dir(cfg) -> Path:
+    return Path(cfg.sessions.dir).expanduser()
+
+
+def _iter_session_files(cfg) -> list[Path]:
+    d = _sessions_dir(cfg)
+    if not d.exists():
+        return []
+    return sorted(d.glob("*.jsonl"))
+
+
+def _ppid_alive(ppid: int) -> bool:
+    """True if /proc/<ppid> still exists (Linux); falls back to kill(0) elsewhere."""
+    proc = Path(f"/proc/{ppid}")
+    if proc.exists():
+        return True
+    if proc.parent.exists():  # /proc exists, just no entry — dead
+        return False
+    try:
+        os.kill(ppid, 0)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+@sessions.command("list")
+@click.pass_context
+def sessions_list(ctx: click.Context) -> None:
+    """List persisted sessions in the configured sessions directory."""
+    cfg = ctx.obj["cfg"]
+    files = _iter_session_files(cfg)
+    if not files:
+        console.print(
+            f"[yellow]No sessions in {_sessions_dir(cfg)}.[/yellow]"
+        )
+        return
+    current = _default_cli_session_id()
+    table = Table(title=f"Sessions in {_sessions_dir(cfg)}")
+    table.add_column("", width=1)
+    table.add_column("Name", style="bold cyan")
+    table.add_column("Size", justify="right")
+    table.add_column("Modified", style="dim")
+    for f in files:
+        name = f.stem
+        marker = "*" if name == current else " "
+        size = f.stat().st_size
+        mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        if size >= 1024 * 1024:
+            size_s = f"{size / 1024 / 1024:.1f} MB"
+        elif size >= 1024:
+            size_s = f"{size / 1024:.1f} KB"
+        else:
+            size_s = f"{size} B"
+        table.add_row(marker, name, size_s, mtime)
+    console.print(table)
+    console.print(
+        "[dim]'*' = sesión que este proceso usaría por defecto "
+        f"({current}).[/dim]"
+    )
+
+
+@sessions.command("rm")
+@click.argument("name")
+@click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation.")
+@click.pass_context
+def sessions_rm(ctx: click.Context, name: str, yes: bool) -> None:
+    """Delete a persisted session JSONL by name (no extension)."""
+    cfg = ctx.obj["cfg"]
+    path = _sessions_dir(cfg) / f"{name}.jsonl"
+    if not path.exists():
+        console.print(f"[red]Session '{name}' not found ({path}).[/red]")
+        sys.exit(1)
+    if not yes:
+        if not click.confirm(f"Delete {path}?", default=False):
+            console.print("[dim]Cancelled.[/dim]")
+            return
+    path.unlink()
+    console.print(f"[green]Deleted {path}.[/green]")
+
+
+@sessions.command("prune")
+@click.option("--dry-run", is_flag=True, default=False, help="Only list, do not delete.")
+@click.pass_context
+def sessions_prune(ctx: click.Context, dry_run: bool) -> None:
+    """Delete `cli-<user>-<ppid>` sessions whose ppid no longer exists."""
+    cfg = ctx.obj["cfg"]
+    user = getpass.getuser()
+    prefix = f"cli-{user}-"
+    candidates: list[tuple[Path, int]] = []
+    for f in _iter_session_files(cfg):
+        name = f.stem
+        if not name.startswith(prefix):
+            continue
+        ppid_part = name[len(prefix):]
+        if not ppid_part.isdigit():
+            continue
+        ppid = int(ppid_part)
+        if not _ppid_alive(ppid):
+            candidates.append((f, ppid))
+    if not candidates:
+        console.print("[dim]No orphaned sessions found.[/dim]")
+        return
+    table = Table(title="Orphaned sessions" + (" (dry-run)" if dry_run else ""))
+    table.add_column("File")
+    table.add_column("ppid", justify="right")
+    for path, ppid in candidates:
+        table.add_row(str(path), str(ppid))
+    console.print(table)
+    if dry_run:
+        return
+    for path, _ in candidates:
+        path.unlink(missing_ok=True)
+    console.print(f"[green]Deleted {len(candidates)} session(s).[/green]")
 
 
 # ---------------------------------------------------------------------------

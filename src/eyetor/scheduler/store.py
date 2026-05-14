@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from eyetor._sqlite_util import apply_concurrency_pragmas
+
 
 @dataclass
 class ScheduledTask:
@@ -50,6 +52,7 @@ class SchedulerStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        apply_concurrency_pragmas(self._conn)
         self._conn.execute(_CREATE_TABLE)
         self._conn.commit()
 

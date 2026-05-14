@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -121,21 +120,20 @@ class KnowledgeManager:
     async def index_all(
         self, *, force: bool = False, prune: bool = True
     ) -> dict[str, IndexReport]:
+        # Workspaces are indexed sequentially: index_workspace dispatches to
+        # asyncio.to_thread, and KnowledgeStore holds a single sqlite3
+        # connection. Two threads writing through the same connection raise
+        # SQLITE_MISUSE ("bad parameter or other API misuse"), so we serialize.
         if not self.workspaces:
             return {}
-        tasks = {
-            name: asyncio.create_task(
-                self.indexer.index_workspace(spec, force=force, prune=prune)
-            )
-            for name, spec in self.workspaces.items()
-        }
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
         out: dict[str, IndexReport] = {}
-        for name, res in zip(tasks.keys(), results):
-            if isinstance(res, BaseException):
-                logger.warning("kb: workspace %s failed: %s", name, res)
-                continue
-            out[name] = res
+        for name, spec in self.workspaces.items():
+            try:
+                out[name] = await self.indexer.index_workspace(
+                    spec, force=force, prune=prune
+                )
+            except Exception as exc:
+                logger.warning("kb: workspace %s failed: %s", name, exc)
         return out
 
     # ------------------------------------------------------------------
