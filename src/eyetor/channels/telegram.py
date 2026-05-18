@@ -51,10 +51,12 @@ class TelegramChannel(BaseChannel):
         scheduler=None,
         tracker: "UsageTracker | None" = None,
         full_config: "VectorConfig | None" = None,
+        agent_reg=None,
     ) -> None:
         self._manager = session_manager
         self._config = config
         self._skill_reg = skill_reg
+        self._agent_reg = agent_reg
         self._scheduler = scheduler
         self._tracker = tracker
         self._dp = None
@@ -144,6 +146,12 @@ class TelegramChannel(BaseChannel):
             if not _is_authorized(msg):
                 return
             await msg.answer(_format_skills_text(self._skill_reg), parse_mode="HTML")
+
+        @dp.message(Command("agents"))
+        async def cmd_agents(msg: Message) -> None:
+            if not _is_authorized(msg):
+                return
+            await msg.answer(_format_agents_text(self._agent_reg), parse_mode="HTML")
 
         @dp.message(Command("tasks"))
         async def cmd_tasks(msg: Message) -> None:
@@ -276,6 +284,7 @@ class TelegramChannel(BaseChannel):
                 "Eyetor commands:\n"
                 "/reset — start a new conversation\n"
                 "/skills — list available skills\n"
+                "/agents — list loaded subagent definitions\n"
                 "/tools — list registered tools\n"
                 "/model — list or change LLM provider\n"
                 "/tasks — list scheduled tasks\n"
@@ -470,6 +479,7 @@ class TelegramChannel(BaseChannel):
             BotCommand(command="start", description="Start the bot"),
             BotCommand(command="reset", description="Start a new conversation"),
             BotCommand(command="skills", description="List available skills"),
+            BotCommand(command="agents", description="List loaded subagent definitions"),
             BotCommand(command="tasks", description="List scheduled tasks"),
             BotCommand(command="usage", description="Show token usage and costs"),
             BotCommand(command="tools", description="List registered tools"),
@@ -1139,6 +1149,19 @@ def _format_skills_text(skill_reg) -> str:
     lines = ["<b>Available skills:</b>"]
     for m in metadata:
         lines.append(f"  <code>{m.name}</code> — {m.description}")
+    return "\n".join(lines)
+
+
+def _format_agents_text(agent_reg) -> str:
+    """Return a plain-text subagent list with descriptions for Telegram (HTML)."""
+    if agent_reg is None:
+        return "No agents configured."
+    agents = agent_reg.all()
+    if not agents:
+        return "No agents configured."
+    lines = ["<b>Available agents:</b>"]
+    for a in agents:
+        lines.append(f"  <code>{a.name}</code> — {a.description}")
     return "\n".join(lines)
 
 

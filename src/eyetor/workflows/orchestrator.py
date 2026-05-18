@@ -19,6 +19,7 @@ from typing import Literal
 
 from eyetor.agents.tool_agent import ToolAgent
 from eyetor.agents.base import BaseAgent
+from eyetor.agents.registry import AgentRegistry
 from eyetor.models.agents import AgentConfig
 from eyetor.models.messages import Message
 from eyetor.models.tools import ToolDefinition, ToolRegistry
@@ -61,11 +62,40 @@ def _extract_json(text: str) -> dict | None:
 
 @dataclass
 class WorkerDefinition:
-    """Definition of a worker agent."""
+    """Inline worker definition built in code.
+
+    Prefer declaring agents as ``<name>.md`` files and passing their names to
+    ``OrchestratorWorkflow`` along with an :class:`AgentRegistry`. This class
+    is kept for callers that construct workers programmatically.
+    """
 
     name: str
     system_prompt: str
     provider: BaseProvider | None = None  # Falls back to orchestrator's provider
+    model: str = ""           # Falls back to orchestrator's model
+    temperature: float | None = None  # Falls back to orchestrator's temperature
+
+
+def _workers_from_registry(
+    names: list[str], registry: AgentRegistry
+) -> list[WorkerDefinition]:
+    """Resolve agent names from the registry into worker definitions."""
+    workers: list[WorkerDefinition] = []
+    for name in names:
+        if not registry.has(name):
+            available = ", ".join(registry.list_names()) or "<none>"
+            raise KeyError(
+                f"Orchestrator worker '{name}' not found in agents registry "
+                f"(available: {available})"
+            )
+        definition = registry.get(name)
+        workers.append(WorkerDefinition(
+            name=definition.name,
+            system_prompt=definition.system_prompt,
+            model=definition.model,
+            temperature=definition.temperature,
+        ))
+    return workers
 
 
 @dataclass
@@ -124,14 +154,26 @@ class OrchestratorWorkflow:
     def __init__(
         self,
         orchestrator_provider: BaseProvider,
-        workers: list[WorkerDefinition],
+        workers: list[WorkerDefinition] | list[str],
         model: str = "",
         temperature: float = 0.0,
         max_iterations: int = 10,
         protocol: Literal["tool_calling", "text", "auto"] = "auto",
+        agent_registry: AgentRegistry | None = None,
     ) -> None:
+        # Resolve worker names against the agent registry when given as strings.
+        if workers and isinstance(workers[0], str):
+            if agent_registry is None:
+                raise ValueError(
+                    "OrchestratorWorkflow: workers were given as names but no "
+                    "agent_registry was provided"
+                )
+            resolved = _workers_from_registry(list(workers), agent_registry)  # type: ignore[arg-type]
+        else:
+            resolved = list(workers)  # type: ignore[arg-type]
+
         self._provider = orchestrator_provider
-        self._workers = {w.name: w for w in workers}
+        self._workers = {w.name: w for w in resolved}
         self._model = model or orchestrator_provider.model
         self._temperature = temperature
         self._max_iterations = max_iterations
@@ -363,13 +405,17 @@ class OrchestratorWorkflow:
 
         provider = worker.provider or self._provider
         observer = WorkerObserver()
+        worker_model = worker.model or self._model
+        worker_temperature = (
+            worker.temperature if worker.temperature is not None else self._temperature
+        )
         agent = BaseAgent(
             config=AgentConfig(
                 name=worker_name,
                 provider="",
-                model=self._model,
+                model=worker_model,
                 system_prompt=worker.system_prompt,
-                temperature=self._temperature,
+                temperature=worker_temperature,
             ),
             provider=provider,
         )

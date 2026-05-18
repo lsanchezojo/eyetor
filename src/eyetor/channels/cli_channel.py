@@ -25,6 +25,7 @@ _HELP = """
   /reset             — clear conversation history
   /history           — show conversation history
   /skills            — list available skills with descriptions
+  /agents            — list loaded subagent definitions
   /tools             — list registered tools
   /model [name] [m]  — list or change provider (and optionally model)
   /exit              — quit
@@ -39,10 +40,12 @@ class CliChannel(BaseChannel):
         session_manager: SessionManager,
         session_id: str,
         skill_reg=None,
+        agent_reg=None,
     ) -> None:
         self._manager = session_manager
         self._session_id = session_id
         self._skill_reg = skill_reg
+        self._agent_reg = agent_reg
         self._console = Console()
         self._running = False
 
@@ -83,6 +86,9 @@ class CliChannel(BaseChannel):
                 continue
             elif user_input.lower() == "/skills":
                 self._console.print(_format_skills(self._skill_reg))
+                continue
+            elif user_input.lower() == "/agents":
+                self._console.print(_format_agents(self._agent_reg))
                 continue
             elif user_input.lower() == "/tools":
                 self._console.print(_format_tools(session.tool_registry))
@@ -214,6 +220,19 @@ def _format_skills(skill_reg) -> str:
     lines = ["[bold]Available skills:[/bold]"]
     for m in metadata:
         lines.append(f"  [cyan]{m.name}[/cyan] — {m.description}")
+    return "\n".join(lines)
+
+
+def _format_agents(agent_reg) -> str:
+    """Return a formatted subagent list with descriptions for display."""
+    if agent_reg is None:
+        return "[dim]No agents configured.[/dim]"
+    agents = agent_reg.all()
+    if not agents:
+        return "[dim]No agents configured.[/dim]"
+    lines = ["[bold]Available agents:[/bold]"]
+    for a in agents:
+        lines.append(f"  [cyan]{a.name}[/cyan] — {a.description}")
     return "\n".join(lines)
 
 

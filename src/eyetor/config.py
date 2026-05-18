@@ -71,7 +71,12 @@ class ChannelsConfig(BaseModel):
 
 
 class OrchestratorWorkerConfig(BaseModel):
-    """Configuration for a single orchestrator worker."""
+    """Inline definition of an orchestrator worker (legacy/inline form).
+
+    Prefer declaring workers as ``<name>.md`` files under ``agents_dirs`` and
+    referencing them by name in ``OrchestratorConfig.workers``. This inline
+    form is kept for callers that build workers programmatically.
+    """
 
     provider: str
     model: str
@@ -79,11 +84,16 @@ class OrchestratorWorkerConfig(BaseModel):
 
 
 class OrchestratorConfig(BaseModel):
-    """Configuration for orchestrator auto-delegation."""
+    """Configuration for orchestrator auto-delegation.
+
+    ``workers`` is a list of agent names resolved against the
+    :class:`AgentRegistry` populated from ``agents_dirs``. Each name must
+    correspond to a ``<name>.md`` file in one of those directories.
+    """
 
     auto_delegate: bool = False
     protocol: Literal["tool_calling", "text", "auto"] = "auto"
-    workers: dict[str, OrchestratorWorkerConfig] = {}
+    workers: list[str] = []
 
 
 class RouteConfig(BaseModel):
@@ -234,6 +244,7 @@ class VectorConfig(BaseModel):
     fallback: FallbackConfig = FallbackConfig()
     skills_dirs: list[str] = ["./skills"]
     plugins_dirs: list[str] = []
+    agents_dirs: list[str] = ["./agents", "~/.eyetor/agents"]
     agent_instructions: str = "~/.eyetor/AGENTS.md"
     memory_db_path: str = "~/.eyetor/memory.db"
     tracking: TrackingConfig = TrackingConfig()

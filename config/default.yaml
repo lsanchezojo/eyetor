@@ -93,9 +93,24 @@ scheduler:
 #       system_prompt: "You are a friendly conversational assistant. Be concise."
 
 orchestrator:
-  auto_delegate: false
+  # When true and at least one valid worker is configured, the main chat
+  # agent gets a `delegate` tool that routes subtasks to named subagents
+  # loaded from ``agents_dirs``. Disabled by default.
+  auto_delegate: true
   protocol: auto        # tool_calling | text | auto (tries tool_calling, falls back to text)
-  workers: {}
+  # Workers are referenced by name; each name must match an ``<name>.md``
+  # file in one of the directories listed in ``agents_dirs``. Unknown
+  # names are skipped at startup with a warning.
+  workers:
+    - researcher
+    - sysadmin
+
+# Directories scanned for subagent definitions (``<name>.md`` files with
+# YAML frontmatter + Markdown body used as the system prompt). Earlier
+# entries are overridden by later ones on name conflict.
+agents_dirs:
+  - ./agents
+  - ~/.eyetor/agents
 
 image_providers:
   gemini-flash:

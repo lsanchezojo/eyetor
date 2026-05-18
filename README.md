@@ -127,9 +127,9 @@ eyetor providers test
 
 When run from a terminal, `eyetor start` opens an interactive CLI session. If Telegram is enabled in config, the bot starts simultaneously in the same process. When run without a terminal (e.g. as a systemd service), only the configured background channels start.
 
-**CLI commands:** `/reset`, `/history`, `/skills`, `/tools`, `/model`, `/help`, `/exit`
+**CLI commands:** `/reset`, `/history`, `/skills`, `/agents`, `/tools`, `/model`, `/help`, `/exit`
 
-**Telegram bot commands:** `/start`, `/reset`, `/skills`, `/tools`, `/model`, `/tasks`, `/usage`, `/help` + any commands declared by skills (see [Skill commands](#skill-commands))
+**Telegram bot commands:** `/start`, `/reset`, `/skills`, `/agents`, `/tools`, `/model`, `/tasks`, `/usage`, `/help` + any commands declared by skills (see [Skill commands](#skill-commands))
 
 ### Image descriptions (Telegram)
 
@@ -492,6 +492,81 @@ Requires a Google Cloud project with the Calendar, Gmail, and Tasks APIs enabled
    pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
    ```
 4. On first use the agent will trigger a browser OAuth flow — the token is saved automatically for subsequent runs
+
+## Subagents
+
+Subagents are specialised worker agents the orchestrator can delegate to. Each one lives in its own Markdown file with YAML frontmatter (metadata) and a body that becomes its system prompt. The format is inspired by Anthropic's Agent SDK subagent definitions.
+
+### File format
+
+`agents/<name>.md`:
+
+```markdown
+---
+name: researcher
+description: Investigates topics thoroughly and returns verifiable facts.
+temperature: 0.3      # optional — falls back to the orchestrator's temperature
+# provider: openrouter # optional override — defaults to the orchestrator's provider
+# model: anthropic/claude-...  # optional override
+---
+
+You are a meticulous researcher. For every subtask:
+
+1. Identify the key claims to verify.
+2. Return facts as a numbered list with sources where possible.
+3. Mark unconfirmed claims explicitly as `(uncertain)`.
+4. If you cannot answer, say so in one sentence — do not invent.
+```
+
+**Frontmatter fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Must match the filename stem (lowercase + `-`/`_`) |
+| `description` | yes | One-line summary shown in `/agents` and in the orchestrator prompt |
+| `provider` | no | Provider name from `providers:` — overrides the orchestrator's provider |
+| `model` | no | Model identifier — overrides the orchestrator's model |
+| `temperature` | no | Float — overrides the orchestrator's temperature |
+
+The Markdown body (after the closing `---`) is the agent's full system prompt — write long, multi-paragraph instructions without needing to escape YAML.
+
+### Discovery
+
+Agents are scanned at startup from every directory listed in `agents_dirs`:
+
+```yaml
+agents_dirs:
+  - ./agents             # versioned with the repo
+  - ~/.eyetor/agents     # private / per-machine
+```
+
+Later directories override earlier ones on name collision. Use `/agents` in CLI or Telegram to list discovered agents with their descriptions.
+
+### Activating delegation from chat
+
+Set `auto_delegate: true` and list the workers you want available:
+
+```yaml
+orchestrator:
+  auto_delegate: true
+  protocol: auto
+  workers:
+    - researcher
+    - sysadmin
+```
+
+When `auto_delegate` is on and at least one configured worker is found in `agents_dirs`, the main chat agent gets a `delegate` tool. The agent decides when to call it — typically when a subtask clearly matches one specialist (e.g. "research X", "fix this systemd unit"). Each call instantiates the subagent on the fly with its own system prompt, model, and temperature; the worker returns a single response which the main agent summarises into its reply.
+
+Workers cannot see the main conversation — the main agent must include the necessary context in the `task` argument. This isolation is the point: each subagent has a focused prompt and a fresh context window.
+
+**Unknown workers are skipped** at startup with a warning. If none of the configured workers are valid (or if `workers: []` is empty), the `delegate` tool is not registered and the main agent behaves normally.
+
+### Built-in examples
+
+| Agent | Description |
+|-------|-------------|
+| `researcher` | Investigates topics and returns verifiable facts with sources |
+| `sysadmin` | Linux system administration — diagnostics, commands, destructive-op warnings |
 
 ## Usage tracking
 
