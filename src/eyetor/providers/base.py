@@ -81,6 +81,10 @@ class BaseProvider(ABC):
             "temperature": temperature,
             "stream": stream,
         }
+        if stream:
+            # Ask OpenAI-compatible servers to emit a usage block in the final
+            # SSE chunk so streaming token counts are real, not estimated.
+            payload["stream_options"] = {"include_usage": True}
         if tools:
             payload["tools"] = [t.to_openai_format() for t in tools]
         return payload

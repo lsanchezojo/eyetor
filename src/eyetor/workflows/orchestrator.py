@@ -24,6 +24,7 @@ from eyetor.models.agents import AgentConfig
 from eyetor.models.messages import Message
 from eyetor.models.tools import ToolDefinition, ToolRegistry
 from eyetor.providers.base import BaseProvider
+from eyetor.tracking.context import tracking_context
 
 logger = logging.getLogger(__name__)
 
@@ -263,7 +264,8 @@ class OrchestratorWorkflow:
             provider=self._provider,
             tool_registry=registry,
         )
-        result = await agent.run(task)
+        with tracking_context(phase="routing", skip_limit_flag=True):
+            result = await agent.run(task)
         return OrchestratorResult(
             final_output=result.final_output,
             delegations=list(self._delegations),
@@ -295,11 +297,14 @@ class OrchestratorWorkflow:
         while iterations < self._max_iterations:
             iterations += 1
 
-            result = await self._provider.complete(
-                messages=messages,
-                tools=None,
-                temperature=self._temperature,
-            )
+            with tracking_context(
+                phase="routing", agent="orchestrator", skip_limit_flag=True
+            ):
+                result = await self._provider.complete(
+                    messages=messages,
+                    tools=None,
+                    temperature=self._temperature,
+                )
             response_text = result.message.content or ""
             messages.append(Message(role="assistant", content=response_text))
 
@@ -419,7 +424,8 @@ class OrchestratorWorkflow:
             ),
             provider=provider,
         )
-        result = await agent.run(subtask)
+        with tracking_context(phase="agent", skip_limit_flag=True):
+            result = await agent.run(subtask)
         observer.on_done(result.final_output)
         delegation = {
             "worker": worker_name,

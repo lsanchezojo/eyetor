@@ -225,16 +225,23 @@ class ConversationCompactor:
         return pruned
 
     async def _summarize(self, history: list[Message], provider: BaseProvider) -> str:
-        """Call LLM to summarize conversation history."""
-        raw_provider = getattr(provider, "_inner", provider)
+        """Call LLM to summarize conversation history.
+
+        Goes through the (tracked) provider so the call is recorded with
+        phase=compaction. ``skip_limit_flag`` keeps a maxed-out daily limit
+        from wedging an in-progress conversation, while the real cost is still
+        recorded (it reconciles with the provider's own bill).
+        """
+        from eyetor.tracking.context import tracking_context
 
         prompt = f"{PROMPT_SUMMARY}\n\n---\n\n{self._serialize_for_summary(history)}"
 
-        result = await raw_provider.complete(
-            messages=[Message(role="user", content=prompt)],
-            tools=None,
-            temperature=0.0,
-        )
+        with tracking_context(phase="compaction", skip_limit_flag=True):
+            result = await provider.complete(
+                messages=[Message(role="user", content=prompt)],
+                tools=None,
+                temperature=0.0,
+            )
 
         return result.message.content or ""
 

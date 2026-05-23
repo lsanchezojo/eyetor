@@ -31,8 +31,16 @@ class FallbackProvider(BaseProvider):
         retry_on: set[str] | None = None,
     ) -> None:
         first = providers[0]
+        # IMPORTANT: forward ``temperature`` from the first inner provider.
+        # Without this, ``BaseProvider.__init__`` defaults to 0.7 and
+        # ``FallbackProvider.temperature`` silently overrides the configured
+        # value when callers do ``temperature=prov.temperature`` (e.g.
+        # ``cli._run_start`` building the ``AgentConfig``).
         super().__init__(
-            base_url=first.base_url, model=first.model, api_key=first.api_key
+            base_url=first.base_url,
+            model=first.model,
+            api_key=first.api_key,
+            temperature=first.temperature,
         )
         self._providers = providers
         self._retry_on = retry_on or (_RETRYABLE_ERRORS | _RETRYABLE_STATUS)

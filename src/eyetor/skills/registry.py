@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import logging
 from pathlib import Path
 
@@ -64,7 +65,53 @@ class SkillRegistry:
         return self.activate(name).scripts
 
     def build_skills_context(self, skill_names: list[str]) -> str:
-        """Build a system prompt section for the given activated skills."""
+        """Build a compact system prompt section for the given activated skills.
+
+        Full ``SKILL.md`` files are intentionally not injected here: doing so
+        adds thousands of prompt tokens to every turn, even for simple chat.
+        The compact context preserves tool names, script names and script usage
+        summaries; the model can call ``--help`` or the relevant skill command
+        for uncommon details.
+        """
+        if not skill_names:
+            return ""
+        parts = [
+            "## Available Skills",
+            (
+                "> **Skill tool call format:** pass only subcommands and flags in `args`. "
+                "Code blocks in skill docs show manual shell usage (with script paths or "
+                "variables like `$PWCLI`) — omit those prefixes when calling the tool."
+            ),
+            (
+                "Use the skill tool named `skill_<skill_name>` and pass only the "
+                "script/subcommand and flags in `args`."
+            ),
+        ]
+        for name in skill_names:
+            try:
+                meta = self.get_metadata(name)
+                scripts = self.list_scripts(name)
+                parts.append(f"\n### Skill: {name}")
+                parts.append(meta.description)
+                if meta.commands:
+                    cmds = ", ".join(
+                        f"/{c.name} ({c.description})" for c in meta.commands
+                    )
+                    parts.append(f"Telegram commands: {cmds}")
+                if scripts:
+                    parts.append("Scripts:")
+                    for script in scripts:
+                        usage = _script_usage_summary(script)
+                        if usage:
+                            parts.append(f"- {script.name}: {usage}")
+                        else:
+                            parts.append(f"- {script.name}")
+            except KeyError:
+                logger.warning("Skill not found in registry: %s", name)
+        return "\n".join(parts)
+
+    def build_full_skills_context(self, skill_names: list[str]) -> str:
+        """Build a full system prompt section with complete SKILL.md bodies."""
         if not skill_names:
             return ""
         parts = [
@@ -100,3 +147,39 @@ class SkillRegistry:
         for meta in self._metadata.values():
             lines.append(f"- **{meta.name}**: {meta.description}")
         return "\n".join(lines)
+
+
+def _script_usage_summary(script: Path, max_chars: int = 500) -> str:
+    """Extract a compact usage hint from a script module docstring."""
+    if script.suffix != ".py":
+        return ""
+    try:
+        doc = ast.get_docstring(ast.parse(script.read_text(encoding="utf-8")))
+    except Exception:
+        return ""
+    if not doc:
+        return ""
+
+    lines = [line.rstrip() for line in doc.splitlines()]
+    selected: list[str] = []
+    in_usage = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower() in {"usage:", "subcommands:"}:
+            in_usage = True
+            selected.append(stripped)
+            continue
+        if in_usage:
+            if not stripped:
+                if selected:
+                    break
+                continue
+            selected.append(stripped)
+
+    if not selected:
+        selected = [line.strip() for line in lines[:3] if line.strip()]
+
+    text = " ".join(selected)
+    if len(text) > max_chars:
+        return text[: max_chars - 3].rstrip() + "..."
+    return text

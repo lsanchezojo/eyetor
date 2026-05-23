@@ -75,7 +75,7 @@ scripts/fs.py info --path "/path/to/file.txt"
 ```
 
 ## Notes
-- Paths can be absolute or relative (relative to CWD)
+- Relative paths (and `.`) resolve against eyetor's data directory `~/.eyetor`, not the skill's own folder. `.` means `~/.eyetor`. Use an absolute path for any other location.
 - Windows paths work: `C:/Users/user/Documents/file.txt`
 - For large files, use `--lines` to read a specific range
 - `delete --recursive` removes entire directory trees — use with care

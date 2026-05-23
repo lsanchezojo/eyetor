@@ -10,6 +10,7 @@ from eyetor.models.agents import AgentConfig, AgentResult
 from eyetor.models.messages import Message, ToolCall
 from eyetor.models.tools import ToolRegistry
 from eyetor.providers.base import BaseProvider
+from eyetor.tracking.context import effective_phase, tracking_context
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +56,14 @@ class ToolAgent:
 
         while iterations < self.config.max_iterations:
             iterations += 1
-            result = await self.provider.complete(
-                messages=messages,
-                tools=tool_defs if tool_defs else None,
-                temperature=self.config.temperature,
-            )
+            with tracking_context(
+                agent=self.config.name, phase=effective_phase("agent")
+            ):
+                result = await self.provider.complete(
+                    messages=messages,
+                    tools=tool_defs if tool_defs else None,
+                    temperature=self.config.temperature,
+                )
             response = result.message
             messages.append(response)
 
@@ -104,11 +108,14 @@ class ToolAgent:
                         "Do NOT call any more tools."
                     ),
                 ))
-                result = await self.provider.complete(
-                    messages=messages,
-                    tools=None,
-                    temperature=self.config.temperature,
-                )
+                with tracking_context(
+                    agent=self.config.name, phase=effective_phase("agent")
+                ):
+                    result = await self.provider.complete(
+                        messages=messages,
+                        tools=None,
+                        temperature=self.config.temperature,
+                    )
                 forced = result.message
                 messages.append(forced)
                 return AgentResult(

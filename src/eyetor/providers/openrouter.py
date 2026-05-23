@@ -56,11 +56,10 @@ class OpenRouterProvider(BaseProvider):
         temperature: float = 0.0,
     ) -> StreamingResponse:
         payload = self._build_payload(messages, tools, temperature, stream=True)
-        chunks: list[str] = []
-        usage: TokenUsage | None = None
+        sr = StreamingResponse(iter([]), None)  # placeholder, replaced below
 
         async def _stream_tokens() -> AsyncIterator[str]:
-            nonlocal usage
+            usage: TokenUsage | None = None
             async with self._client(timeout=120.0) as client:
                 async with client.stream(
                     "POST",
@@ -72,13 +71,17 @@ class OpenRouterProvider(BaseProvider):
                     async for chunk in parse_sse(response):
                         text = extract_delta_content(chunk)
                         if text:
-                            chunks.append(text)
                             yield text
                         extracted = extract_usage(chunk)
                         if extracted:
                             usage = extracted
+            # After stream exhaustion, attach real usage to the response
+            # object so callers reading `.usage` see the final-chunk values.
+            if usage is not None:
+                sr._usage = usage
 
-        return StreamingResponse(_stream_tokens(), usage)
+        sr._iterator = _stream_tokens()
+        return sr
 
 
 def _parse_completion_response(data: dict[str, Any]) -> CompletionResult:

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from eyetor.agents.base import BaseAgent
 from eyetor.models.agents import AgentConfig
 from eyetor.providers.base import BaseProvider
+from eyetor.tracking.context import tracking_context
 
 logger = logging.getLogger(__name__)
 
@@ -87,12 +88,16 @@ async def classify(
         result = await agent.run(user_input)
         return _parse_classification(result.final_output, routes)
 
-    if n_votes <= 1:
-        route_name, reasoning = await _single_classify()
-        return route_name, reasoning, 1.0
+    with tracking_context(phase="routing", skip_limit_flag=True):
+        if n_votes <= 1:
+            route_name, reasoning = await _single_classify()
+            return route_name, reasoning, 1.0
 
-    # Voting: run classifier n_votes times in parallel
-    results = await asyncio.gather(*[_single_classify() for _ in range(n_votes)])
+        # Voting: run classifier n_votes times in parallel (child tasks copy
+        # the context, so each vote records phase=routing).
+        results = await asyncio.gather(
+            *[_single_classify() for _ in range(n_votes)]
+        )
 
     # Count route votes
     route_names = [r[0] for r in results]

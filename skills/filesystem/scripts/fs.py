@@ -36,8 +36,24 @@ def _err(msg: str) -> None:
     sys.exit(1)
 
 
+def _resolve(path: str) -> Path:
+    """Resolve a user-supplied path.
+
+    Absolute paths (and ``~``) are used as-is. Relative paths — including
+    ``.`` — are resolved against eyetor's data directory, NOT the script's
+    own working directory (which the skill executor sets to this scripts/
+    folder). Base is ``$EYETOR_FS_BASE`` if set, else ``~/.eyetor``.
+    """
+    p = Path(path).expanduser()
+    if p.is_absolute():
+        return p
+    base_env = os.environ.get("EYETOR_FS_BASE", "").strip()
+    base = Path(base_env).expanduser() if base_env else Path.home() / ".eyetor"
+    return (base / p).resolve()
+
+
 def cmd_read(path: str, lines: str | None) -> None:
-    p = Path(path)
+    p = _resolve(path)
     if not p.exists():
         _err(f"File not found: {path}")
     if not p.is_file():
@@ -57,7 +73,7 @@ def cmd_read(path: str, lines: str | None) -> None:
 
 
 def cmd_write(path: str, content: str) -> None:
-    p = Path(path)
+    p = _resolve(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     try:
         p.write_text(content, encoding="utf-8")
@@ -67,7 +83,7 @@ def cmd_write(path: str, content: str) -> None:
 
 
 def cmd_append(path: str, content: str) -> None:
-    p = Path(path)
+    p = _resolve(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     try:
         with p.open("a", encoding="utf-8") as f:
@@ -78,7 +94,7 @@ def cmd_append(path: str, content: str) -> None:
 
 
 def cmd_list(path: str, pattern: str | None) -> None:
-    p = Path(path)
+    p = _resolve(path)
     if not p.exists():
         _err(f"Path not found: {path}")
     entries = []
@@ -96,7 +112,7 @@ def cmd_list(path: str, pattern: str | None) -> None:
 
 
 def cmd_find(path: str, name: str) -> None:
-    p = Path(path)
+    p = _resolve(path)
     if not p.exists():
         _err(f"Path not found: {path}")
     matches = [str(f) for f in p.rglob(name)]
@@ -104,7 +120,7 @@ def cmd_find(path: str, name: str) -> None:
 
 
 def cmd_grep(path: str, pattern: str, ext: str | None) -> None:
-    p = Path(path)
+    p = _resolve(path)
     if not p.exists():
         _err(f"Path not found: {path}")
     results = []
@@ -128,7 +144,7 @@ def cmd_grep(path: str, pattern: str, ext: str | None) -> None:
 
 
 def cmd_delete(path: str, recursive: bool) -> None:
-    p = Path(path)
+    p = _resolve(path)
     if not p.exists():
         _err(f"Path not found: {path}")
     try:
@@ -145,7 +161,7 @@ def cmd_delete(path: str, recursive: bool) -> None:
 
 
 def cmd_move(src: str, dst: str) -> None:
-    s, d = Path(src), Path(dst)
+    s, d = _resolve(src), _resolve(dst)
     if not s.exists():
         _err(f"Source not found: {src}")
     try:
@@ -157,7 +173,7 @@ def cmd_move(src: str, dst: str) -> None:
 
 
 def cmd_mkdir(path: str) -> None:
-    p = Path(path)
+    p = _resolve(path)
     try:
         p.mkdir(parents=True, exist_ok=True)
         _ok({"created": str(p.resolve())})
@@ -166,7 +182,7 @@ def cmd_mkdir(path: str) -> None:
 
 
 def cmd_info(path: str) -> None:
-    p = Path(path)
+    p = _resolve(path)
     if not p.exists():
         _err(f"Path not found: {path}")
     stat = p.stat()

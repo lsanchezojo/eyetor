@@ -18,6 +18,11 @@ current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 
 
+def _messages_text(messages: list[Message]) -> str:
+    """Compact role-tagged serialization of a request, for the prompt digest."""
+    return "\n".join(f"{m.role}:{m.content or ''}" for m in messages)
+
+
 class UsageLimitExceeded(Exception):
     """Raised when a provider's daily usage limit has been reached."""
 
@@ -56,7 +61,11 @@ class TrackingProvider(BaseProvider):
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
     ) -> CompletionResult:
-        if not self._tracker.check_limits(self._provider_name):
+        from eyetor.tracking import context as ctx
+
+        if not ctx.skip_limit.get() and not self._tracker.check_limits(
+            self._provider_name
+        ):
             raise UsageLimitExceeded(
                 f"Daily usage limit reached for provider '{self._provider_name}'."
             )
@@ -82,7 +91,7 @@ class TrackingProvider(BaseProvider):
             )
 
         self._tracker.record(
-            session_id=current_session_id.get(),
+            session_id=ctx.current_session_id.get(),
             provider=self._provider_name,
             model=result.model or self._inner.model,
             prompt_tokens=prompt_tokens,
@@ -91,6 +100,14 @@ class TrackingProvider(BaseProvider):
             duration_ms=duration_ms,
             speed_tps=round(speed_tps, 1),
             finish_reason=result.finish_reason or "",
+            agent=ctx.current_agent.get(),
+            phase=ctx.current_phase.get(),
+            channel=ctx.current_channel.get(),
+            trace_id=ctx.current_trace_id.get(),
+            tool_count=len(result.message.tool_calls or []),
+            msg_count=len(messages),
+            prompt_digest=ctx.make_digest(_messages_text(messages)),
+            response_digest=ctx.make_digest(result.message.content or ""),
         )
 
         return result
@@ -101,10 +118,23 @@ class TrackingProvider(BaseProvider):
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
     ) -> StreamingResponse:
-        if not self._tracker.check_limits(self._provider_name):
+        from eyetor.tracking import context as ctx
+
+        if not ctx.skip_limit.get() and not self._tracker.check_limits(
+            self._provider_name
+        ):
             raise UsageLimitExceeded(
                 f"Daily usage limit reached for provider '{self._provider_name}'."
             )
+
+        # Snapshot the tracking context NOW: the recording happens in the
+        # generator's finally, which the consumer drives after any wrapping
+        # `tracking_context` has already exited and reset the vars.
+        snap_session = ctx.current_session_id.get()
+        snap_agent = ctx.current_agent.get()
+        snap_phase = ctx.current_phase.get()
+        snap_channel = ctx.current_channel.get()
+        snap_trace = ctx.current_trace_id.get()
 
         t0 = time.monotonic()
         resp = await self._inner.stream(messages, tools, temperature)
@@ -122,8 +152,21 @@ class TrackingProvider(BaseProvider):
                     recorded = True
                     duration_s = time.monotonic() - t0
                     duration_ms = int(duration_s * 1000)
+                    joined = "".join(tokens)
                     prompt_tokens = resp.usage.prompt_tokens if resp.usage else 0
-                    completion_tokens = len("".join(tokens))
+                    if resp.usage and resp.usage.completion_tokens:
+                        completion_tokens = resp.usage.completion_tokens
+                    else:
+                        # Last-resort fallback: this is a CHARACTER count, not
+                        # a token count — only used when the provider returned
+                        # no usage block even with stream_options.include_usage.
+                        completion_tokens = len(joined)
+                        logger.debug(
+                            "stream(): no usage from provider '%s'; "
+                            "using char-count fallback (%d)",
+                            self._provider_name,
+                            completion_tokens,
+                        )
                     speed_tps = (
                         completion_tokens / duration_s if duration_s > 0 else 0.0
                     )
@@ -140,7 +183,7 @@ class TrackingProvider(BaseProvider):
                         )
 
                     self._tracker.record(
-                        session_id=current_session_id.get(),
+                        session_id=snap_session,
                         provider=self._provider_name,
                         model=self._inner.model,
                         prompt_tokens=prompt_tokens,
@@ -149,6 +192,14 @@ class TrackingProvider(BaseProvider):
                         duration_ms=duration_ms,
                         speed_tps=round(speed_tps, 1),
                         finish_reason="",
+                        agent=snap_agent,
+                        phase=snap_phase,
+                        channel=snap_channel,
+                        trace_id=snap_trace,
+                        tool_count=0,
+                        msg_count=len(messages),
+                        prompt_digest=ctx.make_digest(_messages_text(messages)),
+                        response_digest=ctx.make_digest(joined),
                     )
 
         return StreamingResponse(_stream_and_track(), resp.usage)

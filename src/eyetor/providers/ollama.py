@@ -5,11 +5,16 @@ from __future__ import annotations
 import logging
 from typing import AsyncIterator
 
-from eyetor.models.messages import CompletionResult, Message, StreamingResponse
+from eyetor.models.messages import (
+    CompletionResult,
+    Message,
+    StreamingResponse,
+    TokenUsage,
+)
 from eyetor.models.tools import ToolDefinition
 from eyetor.providers.base import BaseProvider
 from eyetor.providers.openrouter import _parse_completion_response
-from eyetor.streaming.parsers import extract_delta_content, parse_sse
+from eyetor.streaming.parsers import extract_delta_content, extract_usage, parse_sse
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +56,10 @@ class OllamaProvider(BaseProvider):
         temperature: float = 0.0,
     ) -> StreamingResponse:
         payload = self._build_payload(messages, tools, temperature, stream=True)
+        sr = StreamingResponse(iter([]), None)  # placeholder, replaced below
 
         async def _stream_tokens() -> AsyncIterator[str]:
+            usage: TokenUsage | None = None
             async with self._client(timeout=300.0) as client:
                 async with client.stream(
                     "POST",
@@ -65,5 +72,13 @@ class OllamaProvider(BaseProvider):
                         text = extract_delta_content(chunk)
                         if text:
                             yield text
+                        extracted = extract_usage(chunk)
+                        if extracted:
+                            usage = extracted
+            # After stream exhaustion, attach real usage (if the server
+            # emitted a usage block with stream_options.include_usage).
+            if usage is not None:
+                sr._usage = usage
 
-        return StreamingResponse(_stream_tokens(), None)
+        sr._iterator = _stream_tokens()
+        return sr

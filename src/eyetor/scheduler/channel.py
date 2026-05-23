@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from eyetor.channels.base import BaseChannel
 from eyetor.scheduler.store import ScheduledTask, SchedulerStore
+from eyetor.tracking.context import current_channel
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +265,7 @@ class SchedulerChannel(BaseChannel):
             # weeks and drifts the prompt past the model's context window.
             session = self._session_mgr.get_or_create(task.session_id)
             session.reset()
+            current_channel.set("scheduler")
             response = await session.send_sync(task.prompt)
 
             await self._deliver(task, response)

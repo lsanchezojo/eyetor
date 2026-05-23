@@ -28,6 +28,14 @@ class UsageRecord:
     duration_ms: int = 0
     speed_tps: float = 0.0
     finish_reason: str = ""
+    agent: str = ""
+    phase: str = ""
+    channel: str = ""
+    tool_count: int = 0
+    msg_count: int = 0
+    trace_id: str = ""
+    prompt_digest: str = ""
+    response_digest: str = ""
 
 
 @dataclass
@@ -42,6 +50,8 @@ class UsageSummary:
     total_tokens: int
     estimated_cost: float
     avg_speed_tps: float = 0.0
+    agent: str = ""
+    phase: str = ""
 
 
 _DDL = """
@@ -56,7 +66,15 @@ CREATE TABLE IF NOT EXISTS usage (
     timestamp         TEXT    NOT NULL,
     duration_ms       INTEGER NOT NULL DEFAULT 0,
     speed_tps         REAL    NOT NULL DEFAULT 0.0,
-    finish_reason     TEXT    NOT NULL DEFAULT ''
+    finish_reason     TEXT    NOT NULL DEFAULT '',
+    agent             TEXT    NOT NULL DEFAULT '',
+    phase             TEXT    NOT NULL DEFAULT '',
+    channel           TEXT    NOT NULL DEFAULT '',
+    tool_count        INTEGER NOT NULL DEFAULT 0,
+    msg_count         INTEGER NOT NULL DEFAULT 0,
+    trace_id          TEXT    NOT NULL DEFAULT '',
+    prompt_digest     TEXT    NOT NULL DEFAULT '',
+    response_digest   TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage(timestamp);
 CREATE INDEX IF NOT EXISTS idx_usage_provider  ON usage(provider);
@@ -66,6 +84,16 @@ _MIGRATIONS = [
     "ALTER TABLE usage ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE usage ADD COLUMN speed_tps REAL NOT NULL DEFAULT 0.0",
     "ALTER TABLE usage ADD COLUMN finish_reason TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE usage ADD COLUMN agent TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE usage ADD COLUMN phase TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE usage ADD COLUMN channel TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE usage ADD COLUMN tool_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE usage ADD COLUMN msg_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE usage ADD COLUMN trace_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE usage ADD COLUMN prompt_digest TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE usage ADD COLUMN response_digest TEXT NOT NULL DEFAULT ''",
+    "CREATE INDEX IF NOT EXISTS idx_usage_phase ON usage(phase)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_trace ON usage(trace_id)",
 ]
 
 
@@ -125,6 +153,15 @@ class TrackingStore:
         duration_ms: int = 0,
         speed_tps: float = 0.0,
         finish_reason: str = "",
+        *,
+        agent: str = "",
+        phase: str = "",
+        channel: str = "",
+        tool_count: int = 0,
+        msg_count: int = 0,
+        trace_id: str = "",
+        prompt_digest: str = "",
+        response_digest: str = "",
     ) -> None:
         """Insert a usage record."""
         params = (
@@ -138,12 +175,22 @@ class TrackingStore:
             duration_ms,
             speed_tps,
             finish_reason,
+            agent,
+            phase,
+            channel,
+            tool_count,
+            msg_count,
+            trace_id,
+            prompt_digest,
+            response_digest,
         )
         sql = """
             INSERT INTO usage (session_id, provider, model, prompt_tokens,
                                completion_tokens, estimated_cost, timestamp,
-                               duration_ms, speed_tps, finish_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               duration_ms, speed_tps, finish_reason,
+                               agent, phase, channel, tool_count, msg_count,
+                               trace_id, prompt_digest, response_digest)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         self._exec(sql, params)
         self._conn.commit()
@@ -208,18 +255,43 @@ class TrackingStore:
         provider: str | None = None,
         month_start_day: int = 1,
         month_start_hour: int = 0,
+        *,
+        agent: str | None = None,
+        phase: str | None = None,
+        group_by_agent: bool = False,
+        group_by_phase: bool = False,
     ) -> list[UsageSummary]:
-        """Aggregate usage by provider+model for the given period."""
+        """Aggregate usage by provider+model for the given period.
+
+        With no keyword args the SQL is identical to the legacy behaviour
+        (group by provider+model). ``group_by_agent``/``group_by_phase`` add
+        those columns to the GROUP BY; ``agent``/``phase`` filter the rows.
+        """
         since = self._period_since(period, month_start_day, month_start_hour)
         params: list = [since]
-        where_provider = ""
+        where = ""
         if provider:
-            where_provider = "AND provider = ?"
+            where += " AND provider = ?"
             params.append(provider)
+        if agent is not None:
+            where += " AND agent = ?"
+            params.append(agent)
+        if phase is not None:
+            where += " AND phase = ?"
+            params.append(phase)
+
+        extra_cols = ""
+        group_extra = ""
+        if group_by_agent:
+            extra_cols += ", agent"
+            group_extra += ", agent"
+        if group_by_phase:
+            extra_cols += ", phase"
+            group_extra += ", phase"
 
         rows = self._exec(
             f"""
-            SELECT provider, model,
+            SELECT provider, model{extra_cols},
                    COUNT(*) as calls,
                    SUM(prompt_tokens) as prompt_tokens,
                    SUM(completion_tokens) as completion_tokens,
@@ -227,8 +299,8 @@ class TrackingStore:
                    SUM(estimated_cost) as estimated_cost,
                    AVG(NULLIF(speed_tps, 0)) as avg_speed_tps
             FROM usage
-            WHERE timestamp >= ? {where_provider}
-            GROUP BY provider, model
+            WHERE timestamp >= ? {where}
+            GROUP BY provider, model{group_extra}
             ORDER BY total_tokens DESC
             """,
             params,
@@ -243,6 +315,8 @@ class TrackingStore:
                 total_tokens=r["total_tokens"] or 0,
                 estimated_cost=r["estimated_cost"] or 0.0,
                 avg_speed_tps=r["avg_speed_tps"] or 0.0,
+                agent=(r["agent"] if group_by_agent else ""),
+                phase=(r["phase"] if group_by_phase else ""),
             )
             for r in rows
         ]
@@ -265,7 +339,9 @@ class TrackingStore:
             f"""
             SELECT id, session_id, provider, model, prompt_tokens,
                    completion_tokens, estimated_cost, timestamp,
-                   duration_ms, speed_tps, finish_reason
+                   duration_ms, speed_tps, finish_reason,
+                   agent, phase, channel, tool_count, msg_count,
+                   trace_id, prompt_digest, response_digest
             FROM usage
             WHERE timestamp >= ? {where_provider}
             ORDER BY timestamp DESC
@@ -285,6 +361,14 @@ class TrackingStore:
                 duration_ms=r["duration_ms"] or 0,
                 speed_tps=r["speed_tps"] or 0.0,
                 finish_reason=r["finish_reason"] or "",
+                agent=r["agent"] or "",
+                phase=r["phase"] or "",
+                channel=r["channel"] or "",
+                tool_count=r["tool_count"] or 0,
+                msg_count=r["msg_count"] or 0,
+                trace_id=r["trace_id"] or "",
+                prompt_digest=r["prompt_digest"] or "",
+                response_digest=r["response_digest"] or "",
             )
             for r in rows
         ]
@@ -305,7 +389,9 @@ class TrackingStore:
             f"""
             SELECT id, session_id, provider, model, prompt_tokens,
                    completion_tokens, estimated_cost, timestamp,
-                   duration_ms, speed_tps, finish_reason
+                   duration_ms, speed_tps, finish_reason,
+                   agent, phase, channel, tool_count, msg_count,
+                   trace_id, prompt_digest, response_digest
             FROM usage {where}
             ORDER BY timestamp DESC
             LIMIT ?
@@ -325,6 +411,14 @@ class TrackingStore:
                 duration_ms=r["duration_ms"] or 0,
                 speed_tps=r["speed_tps"] or 0.0,
                 finish_reason=r["finish_reason"] or "",
+                agent=r["agent"] or "",
+                phase=r["phase"] or "",
+                channel=r["channel"] or "",
+                tool_count=r["tool_count"] or 0,
+                msg_count=r["msg_count"] or 0,
+                trace_id=r["trace_id"] or "",
+                prompt_digest=r["prompt_digest"] or "",
+                response_digest=r["response_digest"] or "",
             )
             for r in rows
         ]

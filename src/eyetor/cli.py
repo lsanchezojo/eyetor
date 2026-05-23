@@ -1029,9 +1029,11 @@ def run(
     async def _run():
         from eyetor.agents.base import BaseAgent
         from eyetor.models.agents import AgentConfig
+        from eyetor.tracking.context import current_channel
         from eyetor.tracking.usage import UsageTracker
         from eyetor.tracking.pricing import CostEstimator
 
+        current_channel.set("cli")
         tracker = UsageTracker.from_config(cfg.tracking)
         cost_estimator = CostEstimator()
         prov = _resolve_provider(cfg, provider, model, tracker, cost_estimator)
@@ -1047,7 +1049,10 @@ def run(
             provider=prov,
         )
         if stream:
-            async for token in agent.stream(input_text):
+            # BaseAgent.stream() is a coroutine returning a StreamingResponse;
+            # it must be awaited before async-iterating it.
+            response = await agent.stream(input_text)
+            async for token in response:
                 print(token, end="", flush=True)
             print()
         else:
@@ -1306,9 +1311,40 @@ def mcp_test(ctx: click.Context, server_name: str) -> None:
 @click.option(
     "--limit", "-n", default=20, help="Number of recent calls (with --detail)."
 )
+@click.option("--agent", default=None, help="Filter by agent name.")
+@click.option(
+    "--phase",
+    default=None,
+    type=click.Choice(
+        [
+            "main",
+            "loop_break",
+            "chain_plan",
+            "chain_execute",
+            "chain_synthesize",
+            "compaction",
+            "routing",
+            "agent",
+        ]
+    ),
+    help="Filter by call phase.",
+)
+@click.option(
+    "--by",
+    default="provider",
+    type=click.Choice(["provider", "agent", "phase"]),
+    help="Group the summary by this dimension.",
+)
 @click.pass_context
 def usage(
-    ctx: click.Context, period: str, provider: str | None, detail: bool, limit: int
+    ctx: click.Context,
+    period: str,
+    provider: str | None,
+    detail: bool,
+    limit: int,
+    agent: str | None,
+    phase: str | None,
+    by: str,
 ) -> None:
     """Show LLM usage and cost statistics."""
     cfg = ctx.obj["cfg"]
@@ -1318,6 +1354,10 @@ def usage(
 
     if detail:
         records = tracker.get_recent(limit=limit, provider=provider)
+        if agent is not None:
+            records = [r for r in records if r.agent == agent]
+        if phase is not None:
+            records = [r for r in records if r.phase == phase]
         if not records:
             console.print("[yellow]No usage records found.[/yellow]")
             return
@@ -1325,11 +1365,15 @@ def usage(
         table.add_column("Timestamp", style="dim")
         table.add_column("Provider", style="cyan")
         table.add_column("Model")
+        table.add_column("Agent")
+        table.add_column("Phase")
+        table.add_column("Chan", style="dim")
         table.add_column("Tokens", justify="right")
         table.add_column("Cost ($)", justify="right")
         table.add_column("Speed", justify="right")
-        table.add_column("Finish")
-        table.add_column("Session", style="dim")
+        table.add_column("Tools", justify="right")
+        table.add_column("Msgs", justify="right")
+        table.add_column("Trace", style="dim")
         for r in records:
             ts = r.timestamp[:19].replace("T", " ")
             tokens = f"{r.prompt_tokens} → {r.completion_tokens}"
@@ -1339,37 +1383,56 @@ def usage(
                 ts,
                 r.provider,
                 r.model,
+                r.agent or "—",
+                r.phase or "—",
+                r.channel or "—",
                 tokens,
                 cost,
                 speed,
-                r.finish_reason or "—",
-                r.session_id,
+                str(r.tool_count),
+                str(r.msg_count),
+                (r.trace_id or "")[:8] or "—",
             )
         console.print(table)
         return
 
-    summaries = tracker.get_summary(period=period, provider=provider)
+    summaries = tracker.get_summary(
+        period=period,
+        provider=provider,
+        agent=agent,
+        phase=phase,
+        group_by_agent=(by == "agent"),
+        group_by_phase=(by == "phase"),
+    )
     if not summaries:
         console.print(f"[yellow]No usage data for period '{period}'.[/yellow]")
         return
-    table = Table(title=f"Usage ({period})")
+    table = Table(title=f"Usage ({period}, by {by})")
     table.add_column("Provider", style="cyan")
     table.add_column("Model")
+    if by == "agent":
+        table.add_column("Agent")
+    if by == "phase":
+        table.add_column("Phase")
     table.add_column("Calls", justify="right")
     table.add_column("Prompt Tokens", justify="right")
     table.add_column("Completion Tokens", justify="right")
     table.add_column("Total Tokens", justify="right")
     table.add_column("Est. Cost ($)", justify="right")
     for s in summaries:
-        table.add_row(
-            s.provider,
-            s.model,
+        row = [s.provider, s.model]
+        if by == "agent":
+            row.append(s.agent or "—")
+        if by == "phase":
+            row.append(s.phase or "—")
+        row += [
             str(s.calls),
             str(s.prompt_tokens),
             str(s.completion_tokens),
             str(s.total_tokens),
             f"{s.estimated_cost:.4f}",
-        )
+        ]
+        table.add_row(*row)
     console.print(table)
 
 

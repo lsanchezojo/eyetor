@@ -2,16 +2,16 @@
 """Receipt ingestion.
 
 Subcommands:
-    receipt.py add --store NAME --date YYYY-MM-DD --items '[...]'
+    receipt.py add --store NAME [--date YYYY-MM-DD] --items '[...]'
                    [--total FLOAT] [--image-path /abs/path]
     receipt.py reconfirm --image-path /abs/path
     receipt.py undo --receipt-id N
 
-`add` validates the payload: every item must have a numeric price, and if
-`--total` is given it must agree with the sum of item prices within 0.05.
-On validation failure the script returns ``needs_reconfirm`` and inserts
-nothing. The caller (the agent) decides whether to call `reconfirm` to
-re-read the image with the vision model.
+`add` validates the payload: the date must be known before insertion, every
+item must have a numeric price, and if `--total` is given it must agree with
+the sum of item prices within 0.05. On validation failure the script returns
+``needs_reconfirm`` and inserts nothing. The caller (the agent) decides whether
+to call `reconfirm` to re-read the image with the vision model.
 
 Each unit purchased becomes one row in `purchases`. If the user bought three
 identical items, the `--items` list must contain three entries (the agent is
@@ -159,6 +159,14 @@ def cmd_add(args: argparse.Namespace) -> None:
     if not store:
         _err("--store is required")
         return
+    if not date:
+        print(
+            json.dumps(
+                {"ok": True, "needs_reconfirm": True, "reason": "missing date"},
+                ensure_ascii=False,
+            )
+        )
+        return
     if not DATE_RE.match(date):
         _err("--date must be YYYY-MM-DD")
         return
@@ -177,8 +185,12 @@ def cmd_add(args: argparse.Namespace) -> None:
     reason = _items_need_reconfirm(items, total)
     if reason is not None:
         # Don't insert anything; the agent decides whether to call reconfirm.
-        print(json.dumps({"ok": True, "needs_reconfirm": True, "reason": reason},
-                         ensure_ascii=False))
+        print(
+            json.dumps(
+                {"ok": True, "needs_reconfirm": True, "reason": reason},
+                ensure_ascii=False,
+            )
+        )
         return
 
     conn = _db.connect()
@@ -275,7 +287,7 @@ def main(argv: list[str]) -> int:
 
     p_add = sub.add_parser("add", help="Register a receipt and its items")
     p_add.add_argument("--store", required=True)
-    p_add.add_argument("--date", required=True)
+    p_add.add_argument("--date", default="")
     p_add.add_argument("--items", required=True, help="JSON array of {name, price}")
     p_add.add_argument("--total", type=float, default=None)
     p_add.add_argument("--image-path", default=None)

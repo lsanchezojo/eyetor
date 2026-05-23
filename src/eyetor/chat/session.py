@@ -13,7 +13,12 @@ from eyetor.models.agents import AgentConfig
 from eyetor.models.messages import Message, ToolCall
 from eyetor.models.tools import ToolRegistry, ToolDefinition
 from eyetor.providers.base import BaseProvider
-from eyetor.providers.tracking import current_session_id
+from eyetor.tracking.context import (
+    current_session_id,
+    current_trace_id,
+    new_trace_id,
+    tracking_context,
+)
 
 if TYPE_CHECKING:
     from eyetor.config import VectorConfig
@@ -46,12 +51,6 @@ _TOOL_INTENT_RE = re.compile(
     r"|now (i'?ll|let me|i will) (call|use|run|execute|invoke))",
     re.IGNORECASE,
 )
-
-
-def _mentions_tool_name(text: str, tool_defs: list) -> bool:
-    """Check if the text mentions any available tool name."""
-    text_lower = text.lower()
-    return any(td.name.lower() in text_lower for td in tool_defs)
 
 
 # Markers that indicate the model is requesting information from the user
@@ -105,6 +104,36 @@ def _is_asking_user(text: str) -> bool:
         return True
     lowered = text.lower()
     return any(m in lowered for m in _ASK_USER_MARKERS)
+
+
+def _is_ghost_assistant(msg: Message) -> bool:
+    """True if ``msg`` is an empty assistant turn that should not be remembered.
+
+    Small local models occasionally collapse mid-turn and produce an
+    assistant message with no ``content`` and no ``tool_calls`` (the whole
+    output ended up in the reasoning/think channel, or was an immediate
+    EOS). Persisting these turns poisons future prompts — the model sees
+    "the previous assistant reply was empty" and mimics that pattern.
+    """
+    if msg.role != "assistant":
+        return False
+    if msg.tool_calls:
+        return False
+    return not (msg.content or "").strip()
+
+
+def _final_text(content: str | None, reasoning: str | None) -> str:
+    """Pick the user-facing answer.
+
+    Only ``content`` is user-facing — ``reasoning`` is the model's internal
+    scratchpad (``<think>`` channel) and may contain tool-call drafts,
+    monologue, or other noise that degrades response quality if shown raw.
+    The ``reasoning`` argument is accepted for call-site symmetry but
+    deliberately not used as a fallback. Channels show their own
+    "no response, retry" message when content is empty.
+    """
+    del reasoning  # intentionally unused
+    return (content or "").strip()
 
 
 def _truncate(s: str, max_len: int) -> str:
@@ -283,14 +312,45 @@ class ChatSession:
     # ------------------------------------------------------------------
 
     def _load_history(self) -> None:
-        """Restore conversation history from the JSONL file on disk."""
+        """Restore conversation history from the JSONL file on disk.
+
+        Any degenerated assistant messages (empty content AND no
+        ``tool_calls``) — at any position — are dropped on load. They are
+        ghost turns the model produced when it collapsed; feeding them back
+        into a future prompt teaches the model that empty assistant replies
+        are acceptable and induces the same failure again.
+        """
         if not self._persist_path or not self._persist_path.exists():
             return
         try:
             lines = self._persist_path.read_text(encoding="utf-8").strip().splitlines()
+            raw: list[Message] = []
             for line in lines:
                 data = json.loads(line)
-                self._messages.append(Message(**data))
+                raw.append(Message(**data))
+            kept = [m for m in raw if not _is_ghost_assistant(m)]
+            dropped = len(raw) - len(kept)
+            self._messages.extend(kept)
+            if dropped:
+                logger.warning(
+                    "Dropped %d ghost assistant message(s) from %s (empty content "
+                    "+ no tool_calls). Rewriting JSONL.",
+                    dropped,
+                    self._persist_path,
+                )
+                # Rewrite JSONL so the contamination is gone from disk too.
+                try:
+                    with open(self._persist_path, "w", encoding="utf-8") as f:
+                        for msg in self._messages:
+                            f.write(
+                                json.dumps(
+                                    msg.model_dump(exclude_none=True),
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
+                except Exception as exc:  # non-fatal: in-memory cleanup still applies
+                    logger.warning("Could not rewrite cleaned JSONL: %s", exc)
             logger.info(
                 "Loaded %d messages from %s", len(self._messages), self._persist_path
             )
@@ -317,6 +377,29 @@ class ChatSession:
             self._maybe_rotate()
         except Exception as exc:
             logger.warning("Failed to persist message: %s", exc)
+
+    def _remember_assistant(
+        self,
+        msg: Message,
+        *,
+        reasoning: str | None = None,
+        context: str = "",
+    ) -> bool:
+        """Persist an assistant turn unless it is an empty ghost response."""
+        if not _is_ghost_assistant(msg):
+            self._messages.append(msg)
+            self._persist_message(msg, reasoning=reasoning)
+            return True
+
+        suffix = f" during {context}" if context else ""
+        logger.warning(
+            "Session '%s' — ghost assistant turn%s (empty content, no tool_calls, "
+            "reasoning=%dch); not persisting to history",
+            self.session_id,
+            suffix,
+            len((reasoning or "").strip()),
+        )
+        return False
 
     def _maybe_rotate(self) -> None:
         """Truncate the JSONL file to max_messages if it grows too large."""
@@ -357,6 +440,7 @@ class ChatSession:
             else None
         )
         current_session_id.set(self.session_id)
+        current_trace_id.set(new_trace_id())
 
         if self._compactor:
             system_content = self._build_system_content()
@@ -373,25 +457,35 @@ class ChatSession:
         recent_bags: list[list[tuple[str, frozenset[str]]]] = []  # for Jaccard
         max_repeat = 3  # max consecutive identical tool calls before forcing answer
         nudged = False  # allow at most one "announce-without-call" nudge per turn
+        degeneration_recovered = False  # one-shot post-tool synthesis fallback
+        tools_executed = 0
 
         while iterations < self.config.max_iterations:
             iterations += 1
             if self._observer:
                 self._observer.on_iteration(iterations)
             # Non-streaming call to detect tool calls
-            result = await self.provider.complete(
-                messages=full_messages,
-                tools=tool_defs,
-                temperature=self.config.temperature,
-            )
+            with tracking_context(phase="main"):
+                result = await self.provider.complete(
+                    messages=full_messages,
+                    tools=tool_defs,
+                    temperature=self.config.temperature,
+                )
             response = result.message
             if result.reasoning_content:
                 self.last_reasoning = (
                     (self.last_reasoning + "\n\n" if self.last_reasoning else "")
                     + result.reasoning_content
                 )
-            self._messages.append(response)
-            self._persist_message(response, reasoning=result.reasoning_content)
+            # Ghost turns (empty content, no tool_calls) are NOT added to the
+            # cross-turn history: persisting them teaches the model that
+            # empty replies are normal. We still append to ``full_messages``
+            # so the in-flight loop sees a coherent trace.
+            self._remember_assistant(
+                response,
+                reasoning=result.reasoning_content,
+                context=f"iter {iterations}",
+            )
             full_messages.append(response)
             if self._observer:
                 self._observer.on_llm_response(
@@ -402,16 +496,16 @@ class ChatSession:
                 content = response.content or ""
                 # Some small local models announce "voy a reintentar / I'll call X"
                 # in plain text without emitting the structured tool_call. Nudge
-                # once; if it still refuses, accept the text as final.
+                # once only before any tool has actually run. After a tool result,
+                # a normal synthesis often mentions the tool name ("he ejecutado
+                # skill_shell..."), and treating that as intent causes loops.
                 if (
                     not nudged
                     and content
                     and tool_defs
+                    and tools_executed == 0
                     and not _is_asking_user(content)
-                    and (
-                        _TOOL_INTENT_RE.search(content)
-                        or _mentions_tool_name(content, tool_defs)
-                    )
+                    and _TOOL_INTENT_RE.search(content)
                 ):
                     nudged = True
                     logger.info(
@@ -429,7 +523,60 @@ class ChatSession:
                         )
                     )
                     continue
-                # Final answer — yield it token by token (character-level)
+                # Post-tool degeneration recovery: model already ran at least
+                # one tool this turn and now returned NOTHING usable (empty
+                # content, no tool_call). Force one synthesis pass without
+                # tools so the user gets an answer built from what was
+                # already fetched, instead of a silent "(no he podido…)".
+                if (
+                    not content.strip()
+                    and iterations > 1
+                    and not degeneration_recovered
+                ):
+                    degeneration_recovered = True
+                    logger.warning(
+                        "Session '%s' — post-tool degeneration at iter %d "
+                        "(empty content, no tool_call, reasoning=%dch). "
+                        "Forcing synthesis pass.",
+                        self.session_id,
+                        iterations,
+                        len((result.reasoning_content or "").strip()),
+                    )
+                    full_messages.append(
+                        Message(
+                            role="user",
+                            content=(
+                                "Sintetiza ahora una respuesta clara y breve al usuario "
+                                "usando ÚNICAMENTE la información obtenida en las herramientas "
+                                "anteriores. No llames más herramientas. Responde en lenguaje "
+                                "natural, en español."
+                            ),
+                        )
+                    )
+                    with tracking_context(phase="degeneration_recovery"):
+                        result = await self.provider.complete(
+                            messages=full_messages,
+                            tools=None,
+                            temperature=self.config.temperature,
+                        )
+                    forced = result.message
+                    if result.reasoning_content:
+                        self.last_reasoning = (
+                            (self.last_reasoning + "\n\n" if self.last_reasoning else "")
+                            + result.reasoning_content
+                        )
+                    self._remember_assistant(
+                        forced,
+                        reasoning=result.reasoning_content,
+                        context="degeneration recovery",
+                    )
+                    content = _final_text(forced.content, result.reasoning_content)
+                    if self._observer:
+                        self._observer.on_done(content)
+                    yield content
+                    return
+                # Final answer — yield it token by token (character-level).
+                content = _final_text(content, result.reasoning_content)
                 if self._observer:
                     self._observer.on_done(content)
                 yield content
@@ -512,20 +659,26 @@ class ChatSession:
                         ),
                     )
                 )
-                result = await self.provider.complete(
-                    messages=full_messages,
-                    tools=None,  # no tools — force text response
-                    temperature=self.config.temperature,
-                )
+                with tracking_context(phase="loop_break"):
+                    result = await self.provider.complete(
+                        messages=full_messages,
+                        tools=None,  # no tools — force text response
+                        temperature=self.config.temperature,
+                    )
                 forced = result.message
                 if result.reasoning_content:
                     self.last_reasoning = (
                         (self.last_reasoning + "\n\n" if self.last_reasoning else "")
                         + result.reasoning_content
                     )
-                self._messages.append(forced)
-                self._persist_message(forced, reasoning=result.reasoning_content)
-                content = forced.content or ""
+                self._remember_assistant(
+                    forced,
+                    reasoning=result.reasoning_content,
+                    context="loop break",
+                )
+                content = _final_text(forced.content, result.reasoning_content)
+                if self._observer:
+                    self._observer.on_done(content)
                 yield content
                 return
 
@@ -559,6 +712,7 @@ class ChatSession:
                 self._messages.append(tool_msg)
                 self._persist_message(tool_msg)
                 full_messages.append(tool_msg)
+                tools_executed += 1
                 logger.info(
                     "Session '%s' — tool '%s'(%s) → %d chars: %s",
                     self.session_id,
@@ -679,11 +833,15 @@ class ChatSession:
         plan_messages = self._get_full_messages()
         plan_messages.append(Message(role="user", content=plan_prompt))
 
-        plan_result = await self.provider.complete(
-            messages=plan_messages,
-            tools=None,  # no tools in planning phase
-            temperature=self.config.temperature,
-        )
+        current_session_id.set(self.session_id)
+        current_trace_id.set(new_trace_id())
+
+        with tracking_context(phase="chain_plan"):
+            plan_result = await self.provider.complete(
+                messages=plan_messages,
+                tools=None,  # no tools in planning phase
+                temperature=self.config.temperature,
+            )
         plan_text = plan_result.message.content or ""
         logger.info(
             "Session '%s' — chain plan: %s", self.session_id, plan_text[:200]
@@ -703,18 +861,18 @@ class ChatSession:
         self._messages.append(user_msg)
         self._persist_message(user_msg)
 
-        current_session_id.set(self.session_id)
         full_messages = self._get_full_messages()
         execution_output = ""
         iterations = 0
 
         while iterations < self.config.max_iterations:
             iterations += 1
-            result = await self.provider.complete(
-                messages=full_messages,
-                tools=tool_defs,
-                temperature=self.config.temperature,
-            )
+            with tracking_context(phase="chain_execute"):
+                result = await self.provider.complete(
+                    messages=full_messages,
+                    tools=tool_defs,
+                    temperature=self.config.temperature,
+                )
             response = result.message
             if result.reasoning_content:
                 self.last_reasoning = (
@@ -758,12 +916,16 @@ class ChatSession:
         synth_messages = self._get_full_messages()
         synth_messages.append(Message(role="user", content=synth_prompt))
 
-        synth_result = await self.provider.complete(
-            messages=synth_messages,
-            tools=None,
-            temperature=self.config.temperature,
+        with tracking_context(phase="chain_synthesize"):
+            synth_result = await self.provider.complete(
+                messages=synth_messages,
+                tools=None,
+                temperature=self.config.temperature,
+            )
+        final_output = (
+            _final_text(synth_result.message.content, synth_result.reasoning_content)
+            or execution_output
         )
-        final_output = synth_result.message.content or execution_output
 
         # Store the synthesis as the final assistant message
         synth_msg = Message(role="assistant", content=final_output)

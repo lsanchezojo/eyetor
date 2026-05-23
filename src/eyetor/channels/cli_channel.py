@@ -13,6 +13,7 @@ from rich.prompt import Prompt
 
 from eyetor.channels.base import BaseChannel
 from eyetor.chat.manager import SessionManager
+from eyetor.tracking.context import current_channel
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,7 @@ class CliChannel(BaseChannel):
             self._console.print("\n[bold green]Assistant[/bold green]:", end=" ")
             response_text = ""
             try:
+                current_channel.set("cli")
                 with self._console.status("", spinner="dots"):
                     async for chunk in session.send(user_input):
                         response_text += chunk

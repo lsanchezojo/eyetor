@@ -9,17 +9,29 @@ providers:
   ollama:
     type: ollama
     base_url: http://localhost:11434/v1
-    # variante con num_ctx=8192 y num_gpu=20 para que no haga OOM en cómputo
-    # sobre la iGPU 890M. Modelfile en /tmp/eyetor.Modelfile, regenerable con:
-    #   ollama create qwen3.6:35b-eyetor -f /tmp/eyetor.Modelfile
+    # OJO: en este equipo (iGPU AMD 890M, ~15 GB RAM unificada) este modelo
+    # Q4_K_M necesita ~25 GiB en runtime y el kernel lo mata por OOM en
+    # cualquier configuración. Para usar ollama de forma fiable hace falta
+    # un modelo que quepa (~<12 GB): 14B/8B Q4, o un quant Q2/IQ2 del 36B.
     model: qwen3.6:35b-a3b-q4_K_M
 
   llamacpp:
     type: llamacpp
     base_url: http://localhost:8080/v1
     model: default
-    temperature: 0.5
+    temperature: 0.3   # bajado de 0.5: SLM Q4 más fiable en tool-calling sin decodificación degenerada
     thinking: true   # set to true to enable reasoning channel (Gemma-4, QwQ, etc.)
+    # Caps de generación para evitar que un modelo local se quede razonando
+    # miles de tokens. Se aplican como max_tokens y n_predict.
+    max_tokens: 1024
+    max_tokens_by_phase:
+      main: 768
+      degeneration_recovery: 512
+      loop_break: 512
+      chain_plan: 512
+      chain_execute: 768
+      chain_synthesize: 768
+      agent: 768
     
   llamacpp-vision:
     type: llamacpp
@@ -33,7 +45,10 @@ providers:
     model: gemini-2.0-flash
 
 fallback:
-  fallback_chain: [ollama, openrouter, gemini]
+  # llamacpp = servidor local (Qwen3.6-35B-A3B Q4_K_XL vía llama.cpp Vulkan
+  # + mmap, ~/.local/bin/llamacpp-eyetor.sh). ollama queda fuera: con este
+  # modelo no mmapea y el kernel lo mata por OOM en 15 GB de RAM.
+  fallback_chain: [llamacpp, openrouter, gemini]
   retry_on: [timeout, connection_error, "500", "502", "503", "529"]
 
 skills_dirs:
@@ -194,7 +209,7 @@ sessions:
     plan_votes: 1         # voting rounds for planning step (1 = no voting)
   compaction:
     enabled: true
-    context_window: 32000           # aligned with llama-server -c 32768
+    context_window: 16384           # = n_ctx real del servidor llama.cpp (/props); mantener sincronizado si se cambia -c
     trigger_at_percent: 0.80
     tool_output_max_chars: 2000
     keep_last_n_user_turns: 2

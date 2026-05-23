@@ -35,6 +35,15 @@ class UsageTracker:
         duration_ms: int = 0,
         speed_tps: float = 0.0,
         finish_reason: str = "",
+        *,
+        agent: str = "",
+        phase: str = "",
+        channel: str = "",
+        tool_count: int = 0,
+        msg_count: int = 0,
+        trace_id: str = "",
+        prompt_digest: str = "",
+        response_digest: str = "",
     ) -> None:
         """Record a completed LLM call."""
         self._store.record(
@@ -47,9 +56,18 @@ class UsageTracker:
             duration_ms=duration_ms,
             speed_tps=speed_tps,
             finish_reason=finish_reason,
+            agent=agent,
+            phase=phase,
+            channel=channel,
+            tool_count=tool_count,
+            msg_count=msg_count,
+            trace_id=trace_id,
+            prompt_digest=prompt_digest,
+            response_digest=response_digest,
         )
         logger.debug(
-            "Usage recorded: provider=%s model=%s tokens=%d+%d cost=%.4f speed=%.1ftps finish=%s",
+            "Usage recorded: provider=%s model=%s tokens=%d+%d cost=%.4f "
+            "speed=%.1ftps finish=%s agent=%s phase=%s channel=%s trace=%s",
             provider,
             model,
             prompt_tokens,
@@ -57,6 +75,10 @@ class UsageTracker:
             estimated_cost,
             speed_tps,
             finish_reason,
+            agent,
+            phase,
+            channel,
+            trace_id,
         )
 
     def check_limits(self, provider: str) -> bool:
@@ -90,7 +112,14 @@ class UsageTracker:
         return self._store.get_recent(limit=limit, provider=provider)
 
     def get_summary(
-        self, period: str = "day", provider: str | None = None
+        self,
+        period: str = "day",
+        provider: str | None = None,
+        *,
+        agent: str | None = None,
+        phase: str | None = None,
+        group_by_agent: bool = False,
+        group_by_phase: bool = False,
     ) -> list[UsageSummary]:
         """Return aggregated usage summaries."""
         return self._store.get_summary(
@@ -98,6 +127,10 @@ class UsageTracker:
             provider=provider,
             month_start_day=self._config.month_start_day,
             month_start_hour=self._config.month_start_hour,
+            agent=agent,
+            phase=phase,
+            group_by_agent=group_by_agent,
+            group_by_phase=group_by_phase,
         )
 
     def get_records(

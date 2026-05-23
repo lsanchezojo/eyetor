@@ -7,6 +7,7 @@ import logging
 from eyetor.models.agents import AgentConfig, AgentResult
 from eyetor.models.messages import Message, StreamingResponse
 from eyetor.providers.base import BaseProvider
+from eyetor.tracking.context import effective_phase, tracking_context
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +35,13 @@ class BaseAgent:
             AgentResult with the assistant response.
         """
         messages = self._build_messages(user_input, history)
-        result = await self.provider.complete(
-            messages=messages,
-            temperature=self.config.temperature,
-        )
+        with tracking_context(
+            agent=self.config.name, phase=effective_phase("agent")
+        ):
+            result = await self.provider.complete(
+                messages=messages,
+                temperature=self.config.temperature,
+            )
         response = result.message
         messages.append(response)
         return AgentResult(
@@ -53,10 +57,13 @@ class BaseAgent:
     ) -> StreamingResponse:
         """Stream tokens from a single LLM call."""
         messages = self._build_messages(user_input, history)
-        return await self.provider.stream(
-            messages=messages,
-            temperature=self.config.temperature,
-        )
+        with tracking_context(
+            agent=self.config.name, phase=effective_phase("agent")
+        ):
+            return await self.provider.stream(
+                messages=messages,
+                temperature=self.config.temperature,
+            )
 
     def _build_messages(
         self, user_input: str, history: list[Message] | None

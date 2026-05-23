@@ -22,6 +22,8 @@ class ProviderConfig(BaseModel):
     temperature: float = 0.7  # Sampling temperature sent in every request
     thinking: bool = False  # Enable thinking/reasoning mode (llamacpp only)
     request_timeout: float = 600.0  # HTTP timeout (s) per chat/completions call
+    max_tokens: int | None = None  # llama.cpp generation cap for all phases
+    max_tokens_by_phase: dict[str, int] = {}  # llama.cpp per-phase overrides
 
 
 class TrackingLimits(BaseModel):

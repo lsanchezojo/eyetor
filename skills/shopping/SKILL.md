@@ -13,8 +13,11 @@ commands:
     action: prompt
     prompt: |
       El usuario ha enviado una foto de ticket (o quiere registrar uno). Usa la skill 'shopping'
-      (script receipt.py) para extraer productos y precios y registrarlos. Si el análisis visual
-      previo no es suficiente (faltan precios, no cuadra total, no hay fecha o tienda), llama
+      (script receipt.py) para extraer productos y precios y registrarlos. Para la fecha:
+      usa primero la fecha visible en la imagen; si falta, busca una fecha completa en el
+      caption/mensaje del usuario; si tampoco aparece ahí, pregunta la fecha al usuario antes
+      de registrar. Si el análisis visual previo no es suficiente por otros campos (faltan
+      precios, no cuadra total o falta tienda), llama
       a `receipt.py reconfirm --image-path <ruta>` sobre la imagen indicada en la línea
       "Imagen guardada en: ..." del contexto. Tras registrar, si hay coincidencias con la
       lista de la compra, pide confirmación al usuario antes de eliminarlas. {args}
@@ -64,12 +67,15 @@ Toda la persistencia vive en una sola base de datos SQLite global:
 
 1. El usuario manda foto a Telegram. El canal guarda la imagen en
    `~/.eyetor/images/{chat_id}_{ts}.jpg` y añade al contexto una línea
-   `Imagen guardada en: <path>` junto con la descripción del modelo de visión.
+   `Imagen guardada en: <path>` junto con la descripción del modelo de visión y,
+   cuando existe, el caption del usuario.
 
 2. Extrae del texto descriptivo: `store`, `date` (formato `YYYY-MM-DD`), `items`
    (lista de `{name, price}` con **precio unitario**), `total` si aparece.
    Si un producto aparece N veces en el ticket, **emite N entradas idénticas** en
-   `--items` (una por unidad).
+   `--items` (una por unidad). Si no hay fecha visible en la imagen, busca una fecha
+   completa en el caption/mensaje del usuario y úsala. Si tampoco hay fecha en el
+   caption, pregunta al usuario antes de registrar.
 
 3. Llama:
 
@@ -139,7 +145,8 @@ sin historial en `missing`.
 
 - **Nunca inventes precios.** Si un ítem no tiene precio extraído del texto/visión,
   no lo incluyas; deja que el script pida `reconfirm`.
-- **Fechas siempre `YYYY-MM-DD`.** Convierte tú "12/05/2026" → "2026-05-11".
+- **Fechas siempre `YYYY-MM-DD`.** Convierte tú "12/05/2026" → "2026-05-12".
+  Prioridad: imagen → caption/mensaje → preguntar al usuario. No inventes una fecha.
 - **Items duplicados en un ticket: una entrada por unidad** en `--items`. El script
   guarda una fila por unidad para que `MIN/AVG(price)` y las comparaciones funcionen.
 - **Reconciliación con la lista: confirmación obligatoria.** No ejecutes

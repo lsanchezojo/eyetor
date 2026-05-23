@@ -10,6 +10,7 @@ Voice message transcription requires faster-whisper:
 from __future__ import annotations
 
 import asyncio
+from datetime import date
 import json
 import logging
 import re
@@ -20,6 +21,7 @@ from pathlib import Path
 from eyetor.channels.base import BaseChannel
 from eyetor.chat.manager import SessionManager
 from eyetor.config import TelegramChannelConfig
+from eyetor.tracking.context import current_channel
 
 from typing import TYPE_CHECKING
 
@@ -32,6 +34,67 @@ logger = logging.getLogger(__name__)
 _CHUNK_TOKENS = 20  # Edit message every N characters
 _TG_MAX_LEN = 4096  # Telegram message character limit
 _IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(.*?)\]")
+_ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
+_NUMERIC_DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
+_TEXT_DATE_RE = re.compile(
+    r"\b(\d{1,2})(?:\s+de)?\s+"
+    r"(enero|febrero|marzo|abril|mayo|junio|julio|agosto|"
+    r"septiembre|setiembre|octubre|noviembre|diciembre)"
+    r"(?:\s+de)?\s+(\d{4})\b",
+    re.IGNORECASE,
+)
+_MONTHS_ES = {
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
+}
+
+
+def _valid_iso_date(year: int, month: int, day: int) -> str | None:
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None
+
+
+def _expand_year(year: int) -> int:
+    if year < 100:
+        return 2000 + year
+    return year
+
+
+def _extract_caption_date(caption: str) -> str | None:
+    """Return the first complete date found in a Telegram image caption."""
+    if not caption.strip():
+        return None
+
+    if match := _ISO_DATE_RE.search(caption):
+        year, month, day = (int(part) for part in match.groups())
+        if parsed := _valid_iso_date(year, month, day):
+            return parsed
+
+    if match := _NUMERIC_DATE_RE.search(caption):
+        day, month, year = (int(part) for part in match.groups())
+        if parsed := _valid_iso_date(_expand_year(year), month, day):
+            return parsed
+
+    if match := _TEXT_DATE_RE.search(caption):
+        day_raw, month_raw, year_raw = match.groups()
+        month = _MONTHS_ES[month_raw.lower()]
+        if parsed := _valid_iso_date(int(year_raw), month, int(day_raw)):
+            return parsed
+
+    return None
 
 
 class TelegramChannel(BaseChannel):
@@ -85,7 +148,15 @@ class TelegramChannel(BaseChannel):
         try:
             from aiogram import Bot, Dispatcher, F
             from aiogram.filters import Command
-            from aiogram.types import Message, BotCommand
+            from aiogram.types import (
+                Message,
+                BotCommand,
+                BotCommandScopeAllChatAdministrators,
+                BotCommandScopeAllGroupChats,
+                BotCommandScopeAllPrivateChats,
+                BotCommandScopeChat,
+                BotCommandScopeDefault,
+            )
         except ImportError:
             raise ImportError(
                 "aiogram is required for the Telegram channel. "
@@ -252,6 +323,7 @@ class TelegramChannel(BaseChannel):
                         buffer = ""
                         last_edit = ""
                         try:
+                            current_channel.set("telegram")
                             async for chunk in session.send(prompt_text):
                                 buffer += chunk
                                 if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
@@ -262,7 +334,7 @@ class TelegramChannel(BaseChannel):
                                         pass
                             if buffer:
                                 html = _md_to_html(buffer)
-                                await _safe_edit_or_send(msg, placeholder, html, buffer)
+                                await _finalize_as_new(msg, placeholder, html, buffer)
                         except Exception as exc:
                             logger.exception("Skill prompt command error")
                             await placeholder.edit_text(f"Error: {_format_exc(exc)}")
@@ -310,6 +382,7 @@ class TelegramChannel(BaseChannel):
             buffer = ""
             last_edit = ""
             try:
+                current_channel.set("telegram")
                 async for chunk in session.send(msg.text or ""):
                     buffer += chunk
                     if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
@@ -327,18 +400,25 @@ class TelegramChannel(BaseChannel):
                     except Exception:
                         await msg.answer(f"💭 {session.last_reasoning.strip()}")
 
-                # Final edit always applies HTML formatting
-                if buffer:
-                    # Strip [IMAGE:...] markers from text (images sent separately)
-                    clean_buffer = _IMAGE_MARKER_RE.sub("", buffer).strip()
-                    html = _md_to_html(clean_buffer) if clean_buffer else ""
-                    if html:
-                        await _safe_edit_or_send(msg, placeholder, html, clean_buffer)
-                    else:
+                # Strip [IMAGE:...] markers from text (images sent separately)
+                clean_buffer = _IMAGE_MARKER_RE.sub("", buffer).strip()
+                image_paths = _collect_image_paths(buffer, session)
+                if clean_buffer:
+                    await _finalize_as_new(
+                        msg, placeholder, _md_to_html(clean_buffer), clean_buffer
+                    )
+                else:
+                    try:
                         await placeholder.delete()
+                    except Exception:
+                        pass
+                    # No text and no image → never leave the user with silence.
+                    if not image_paths:
+                        await msg.answer(
+                            "(no he podido generar una respuesta; reintenta)"
+                        )
 
                 # Send generated images: from [IMAGE:] markers + tool results
-                image_paths = _collect_image_paths(buffer, session)
                 await _send_images(msg, image_paths)
 
             except Exception as exc:
@@ -391,9 +471,23 @@ class TelegramChannel(BaseChannel):
 
                 # Step 2: Send the description (+ metadata) to the main LLM session
                 user_text = caption.strip() if caption.strip() else ""
+                caption_date = _extract_caption_date(user_text)
+                if caption_date:
+                    date_instruction = (
+                        f"Fecha detectada en el caption: {caption_date}. "
+                        "Si el ticket no muestra fecha visible, usa esta fecha "
+                        "para registrar herramientas; no la pidas de nuevo.\n\n"
+                    )
+                else:
+                    date_instruction = (
+                        "No hay fecha completa detectada en el caption. "
+                        "Si el ticket tampoco muestra fecha visible, pregunta "
+                        "la fecha al usuario antes de registrar el recibo.\n\n"
+                    )
                 if user_text:
                     prompt = (
                         f"El usuario ha enviado una imagen con este mensaje: «{user_text}»\n\n"
+                        f"{date_instruction}"
                         f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
                         f"Imagen guardada en: {img_path}\n\n"
                         f"Responde a lo que pide el usuario. Usa el análisis de la imagen "
@@ -403,6 +497,7 @@ class TelegramChannel(BaseChannel):
                 else:
                     prompt = (
                         f"El usuario ha enviado una imagen sin mensaje adicional.\n\n"
+                        f"{date_instruction}"
                         f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
                         f"Imagen guardada en: {img_path}\n\n"
                         f"Responde al usuario basándote en el contenido descrito. "
@@ -414,6 +509,7 @@ class TelegramChannel(BaseChannel):
 
                 buffer = ""
                 last_edit = ""
+                current_channel.set("telegram")
                 async for chunk in session.send(prompt):
                     buffer += chunk
                     if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
@@ -422,9 +518,23 @@ class TelegramChannel(BaseChannel):
                             last_edit = buffer
                         except Exception:
                             pass
-                if buffer:
-                    html = _md_to_html(buffer)
-                    await _safe_edit_or_send(msg, placeholder, html, buffer)
+
+                clean_buffer = _IMAGE_MARKER_RE.sub("", buffer).strip()
+                image_paths = _collect_image_paths(buffer, session)
+                if clean_buffer:
+                    html = _md_to_html(clean_buffer)
+                    await _finalize_as_new(msg, placeholder, html, clean_buffer)
+                else:
+                    try:
+                        await placeholder.delete()
+                    except Exception:
+                        pass
+                    if not image_paths:
+                        await msg.answer(
+                            "(no he podido generar una respuesta; reintenta)"
+                        )
+
+                await _send_images(msg, image_paths)
             except Exception as exc:
                 logger.exception("Photo handler error")
                 detail = _format_exc(exc)
@@ -456,6 +566,7 @@ class TelegramChannel(BaseChannel):
             buffer = ""
             last_edit = ""
             try:
+                current_channel.set("telegram")
                 async for chunk in session.send(transcription):
                     buffer += chunk
                     if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
@@ -467,10 +578,23 @@ class TelegramChannel(BaseChannel):
                         except Exception:
                             pass
 
-                if buffer:
-                    html = f"🎤 <i>{_escape_html(transcription)}</i>\n\n{_md_to_html(buffer)}"
-                    plain = f"🎤 {transcription}\n\n{buffer}"
-                    await _safe_edit_or_send(msg, placeholder, html, plain)
+                clean_buffer = _IMAGE_MARKER_RE.sub("", buffer).strip()
+                image_paths = _collect_image_paths(buffer, session)
+                if clean_buffer:
+                    html = f"🎤 <i>{_escape_html(transcription)}</i>\n\n{_md_to_html(clean_buffer)}"
+                    plain = f"🎤 {transcription}\n\n{clean_buffer}"
+                    await _finalize_as_new(msg, placeholder, html, plain)
+                else:
+                    try:
+                        await placeholder.delete()
+                    except Exception:
+                        pass
+                    if not image_paths:
+                        await msg.answer(
+                            "(no he podido generar una respuesta; reintenta)"
+                        )
+
+                await _send_images(msg, image_paths)
             except Exception as exc:
                 logger.exception("Telegram voice handler error")
                 await placeholder.edit_text(f"Error: {_format_exc(exc)}")
@@ -488,7 +612,18 @@ class TelegramChannel(BaseChannel):
         for _sc in _skill_commands:
             commands.append(BotCommand(command=_sc.name, description=_sc.description))
         commands.append(BotCommand(command="help", description="Show help"))
-        await bot.set_my_commands(commands)
+        await _sync_bot_commands(
+            bot,
+            commands,
+            allowed_users=allowed_users,
+            scopes={
+                "default": BotCommandScopeDefault,
+                "all_private": BotCommandScopeAllPrivateChats,
+                "all_group": BotCommandScopeAllGroupChats,
+                "all_admins": BotCommandScopeAllChatAdministrators,
+                "chat": BotCommandScopeChat,
+            },
+        )
 
         logger.info("Starting Telegram bot...")
         await dp.start_polling(bot)
@@ -503,6 +638,67 @@ class TelegramChannel(BaseChannel):
 def _format_exc(exc: BaseException) -> str:
     msg = str(exc).strip()
     return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+
+
+async def _sync_bot_commands(
+    bot,
+    commands: list,
+    *,
+    allowed_users: set[str],
+    scopes: dict[str, type],
+) -> None:
+    """Replace stale Telegram command menus across common scopes.
+
+    Telegram stores bot command menus by scope and language. A previous agent
+    using the same bot token may have registered commands in a more specific
+    scope than ``default`` (for example ``all_private_chats`` or a concrete
+    chat), which overrides a later plain ``set_my_commands`` call. We clear the
+    scopes Eyetor can reasonably know, then set the current command list.
+    """
+    languages = (None, "es", "en")
+    base_scopes = [
+        scopes["default"](),
+        scopes["all_private"](),
+        scopes["all_group"](),
+        scopes["all_admins"](),
+    ]
+    chat_scopes = []
+    for raw in allowed_users:
+        try:
+            chat_scopes.append(scopes["chat"](chat_id=int(raw)))
+        except (TypeError, ValueError):
+            # Usernames cannot be used as BotCommandScopeChat ids.
+            continue
+
+    for scope in [*base_scopes, *chat_scopes]:
+        for language_code in languages:
+            try:
+                await bot.delete_my_commands(
+                    scope=scope,
+                    language_code=language_code,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not delete Telegram commands for scope=%s lang=%s: %s",
+                    type(scope).__name__,
+                    language_code or "default",
+                    exc,
+                )
+
+    # Set both default and all-private menus. If we know the numeric allowed
+    # chat id, set it explicitly too so a stale chat-specific menu is replaced.
+    target_scopes = [scopes["default"](), scopes["all_private"](), *chat_scopes]
+    for scope in target_scopes:
+        try:
+            await bot.set_my_commands(commands, scope=scope)
+        except Exception as exc:
+            logger.warning(
+                "Could not set Telegram commands for scope=%s: %s",
+                type(scope).__name__,
+                exc,
+            )
+            if type(scope).__name__ == "BotCommandScopeDefault":
+                raise
 
 
 async def _describe_image(
@@ -531,23 +727,27 @@ async def _describe_image(
     ).strip()
     model = model or os.environ.get("VISION_MODEL", "default")
 
+    prompt = (
+        "Analiza esta imagen. Primero indica qué tipo de imagen es "
+        "(ticket de compra, factura, documento, foto, captura de pantalla, etc.).\n\n"
+        "Si es un ticket o recibo de compra, extrae TODOS los productos y precios "
+        "que puedas leer, incluyendo el nombre de la tienda y la fecha si aparecen. "
+        "Usa este formato:\n"
+        "- Tipo: ticket de compra\n"
+        "- Tienda: [nombre]\n"
+        "- Fecha: [fecha si visible]\n"
+        "- Productos:\n"
+        "  - [nombre producto]: [precio]€\n"
+        "  - ...\n"
+        "- Total: [total]€\n\n"
+        "Si NO es un ticket, describe la imagen de forma detallada."
+    )
     if caption.strip():
-        prompt = caption.strip()
-    else:
-        prompt = (
-            "Analiza esta imagen. Primero indica qué tipo de imagen es "
-            "(ticket de compra, factura, documento, foto, captura de pantalla, etc.).\n\n"
-            "Si es un ticket o recibo de compra, extrae TODOS los productos y precios "
-            "que puedas leer, incluyendo el nombre de la tienda y la fecha si aparecen. "
-            "Usa este formato:\n"
-            "- Tipo: ticket de compra\n"
-            "- Tienda: [nombre]\n"
-            "- Fecha: [fecha si visible]\n"
-            "- Productos:\n"
-            "  - [nombre producto]: [precio]€\n"
-            "  - ...\n"
-            "- Total: [total]€\n\n"
-            "Si NO es un ticket, describe la imagen de forma detallada."
+        prompt += (
+            "\n\nCaption del usuario, solo como contexto adicional:\n"
+            f"{caption.strip()}\n\n"
+            "Si la imagen no muestra fecha y el caption contiene una fecha, "
+            "menciónalo explícitamente."
         )
 
     headers: dict[str, str] = {
@@ -719,71 +919,40 @@ def _split_message(text: str, limit: int = _TG_MAX_LEN) -> list[str]:
     return chunks
 
 
-async def _safe_edit_or_send(msg, placeholder, html: str, plain: str) -> None:
-    """Edit *placeholder* with HTML; on parse failure retry as plain text.
+async def _finalize_as_new(msg, placeholder, html: str, plain: str) -> None:
+    """Delete the streaming placeholder and send the final answer as a NEW
+    message.
 
-    Protects against malformed HTML that Telegram rejects (e.g. crossed
-    <b>/<i> tags). "Message is not modified" errors are treated as
-    success — the placeholder already shows identical content from the
-    streaming phase, so re-sending would duplicate the message.
+    Editing the placeholder keeps its original send time (when "..." was
+    posted, right after the user's question), so the visible timestamp would
+    not reflect when the answer was actually ready. Sending a fresh message
+    fixes that. On HTML parse failure (e.g. crossed <b>/<i> tags) it retries
+    as plain text. ``_send_long`` splits messages over Telegram's limit.
     """
     try:
         from aiogram.exceptions import TelegramBadRequest
     except ImportError:  # pragma: no cover
         TelegramBadRequest = Exception  # type: ignore
 
-    def _not_modified(exc: BaseException) -> bool:
-        return "not modified" in str(exc).lower()
+    try:
+        await placeholder.delete()
+    except Exception:
+        pass
 
-    # Happy path: HTML.
-    if len(html) <= _TG_MAX_LEN:
-        try:
-            await placeholder.edit_text(html, parse_mode="HTML")
-            return
-        except TelegramBadRequest as exc:
-            if _not_modified(exc):
-                return  # Same content already on screen — nothing to do.
-            logger.warning(
-                "Telegram HTML parse failed, retrying as plain text: %s", exc
-            )
-        except Exception as exc:
-            logger.warning("edit_text failed, retrying as plain text: %s", exc)
-    else:
-        try:
-            await placeholder.delete()
-            await _send_long(msg, html, parse_mode="HTML")
-            return
-        except TelegramBadRequest as exc:
-            if _not_modified(exc):
-                return
-            logger.warning("Telegram HTML parse failed on long send: %s", exc)
-        except Exception as exc:
-            logger.warning("Long HTML send failed, retrying as plain text: %s", exc)
+    try:
+        await _send_long(msg, html, parse_mode="HTML")
+        return
+    except TelegramBadRequest as exc:
+        logger.warning(
+            "Telegram HTML parse failed on finalize, retrying as plain text: %s", exc
+        )
+    except Exception as exc:
+        logger.warning("Finalize HTML send failed, retrying as plain text: %s", exc)
 
-    # Fallback: plain text, no parse_mode.
-    plain_body = plain or "..."
-    if len(plain_body) <= _TG_MAX_LEN:
-        try:
-            await placeholder.edit_text(plain_body)
-            return
-        except TelegramBadRequest as exc:
-            if _not_modified(exc):
-                return  # Same content already on screen.
-        except Exception:
-            pass
-        try:
-            await msg.answer(plain_body)
-        except Exception as exc:
-            logger.error("Telegram plain-text fallback also failed: %s", exc)
-    else:
-        try:
-            await placeholder.delete()
-        except Exception:
-            pass
-        try:
-            await _send_long(msg, plain_body)
-        except Exception as exc:
-            logger.error("Telegram long plain-text fallback failed: %s", exc)
+    try:
+        await _send_long(msg, plain or "...")
+    except Exception as exc:
+        logger.error("Telegram plain-text finalize fallback failed: %s", exc)
 
 
 async def _send_long(msg, text: str, parse_mode: str | None = None) -> None:
@@ -1088,6 +1257,37 @@ def _format_usage_text(tracker, session_id: str | None = None) -> str:
 
         total_tok = sum(r.prompt_tokens + r.completion_tokens for r in calls)
         lines.append(f"  ─ {len(calls)} llamadas · {_fmt_num(total_tok)} tok")
+
+    # --- Breakdown by phase / agent (today) ---
+    def _agg(key_fn, recs):
+        agg: dict[str, list] = defaultdict(list)
+        for r in recs:
+            k = key_fn(r)
+            if k:
+                agg[k].append(r)
+        return agg
+
+    def _emit_breakdown(title: str, agg: dict) -> None:
+        if not agg:
+            return
+        lines.append(f"\n{title}")
+        ordered = sorted(
+            agg.items(),
+            key=lambda kv: -sum(
+                x.prompt_tokens + x.completion_tokens for x in kv[1]
+            ),
+        )
+        for key, recs in ordered:
+            tok = sum(r.prompt_tokens + r.completion_tokens for r in recs)
+            cost = sum(r.estimated_cost for r in recs)
+            cost_str = f"${cost:.4f}" if cost > 0 else "$0"
+            lines.append(
+                f"  {_escape_html(key)}: {len(recs)} ll · "
+                f"{_fmt_num(tok)} tok · {cost_str}"
+            )
+
+    _emit_breakdown("🧩 <b>Por fase</b>", _agg(lambda r: r.phase, day_records))
+    _emit_breakdown("🤖 <b>Por agente</b>", _agg(lambda r: r.agent, day_records))
 
     # --- Footer: day vs week totals ---
     week_records = tracker.get_records(period="week")
