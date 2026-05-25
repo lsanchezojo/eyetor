@@ -30,9 +30,38 @@ pip install --upgrade pip wheel
 
 # 5. Install Eyetor in editable mode + Telegram support
 pip install -e ".[telegram]"
+
+# 6. First-time host setup
+eyetor setup
 ```
 
 After installation the `eyetor` command is available at `.venv/bin/eyetor` (and on `PATH` while the venv is activated).
+
+`eyetor setup` creates `~/.eyetor/host.json` with the detected operating system,
+architecture, available package managers, and the preferred install command. The
+agent loads this profile at startup so it does not assume the wrong OS package
+manager. Regenerate it after moving the agent to another machine or installing a
+new package manager:
+
+```bash
+eyetor setup --refresh-host
+```
+
+### Autonomous system package installs
+
+By default Eyetor does not have `sudo` permissions. To let the agent install
+system packages autonomously, install the restricted helper once:
+
+```bash
+sudo .venv/bin/eyetor setup --install-helper --service-user $USER
+systemctl --user restart eyetor
+```
+
+This creates a root-owned `/usr/local/sbin/eyetor-install-tool` and a narrow
+sudoers rule that only allows that helper. The agent uses the `install_package`
+tool instead of arbitrary `sudo` commands. The helper validates package names
+and automatically chooses the appropriate OS-specific install strategy for the
+detected system; arbitrary shell commands are not enabled through this helper.
 
 **Dependencies:**
 - Core: `httpx`, `pyyaml`, `pydantic`, `rich`, `click`, `apscheduler`
@@ -161,7 +190,7 @@ OPENAI_API_KEY=sk-...                    # optional: OpenAI Whisper API
 
 This is the recommended way to run Eyetor permanently: a **systemd user service** that points to the venv-installed binary, auto-starts on every reboot and restarts on failure. The service runs `eyetor start` without a tty, so only Telegram (or other non-interactive channels) start.
 
-> **Prerequisite:** the venv must already be created and Eyetor installed in it (see [Installation](#installation)).
+> **Prerequisite:** the venv must already be created, Eyetor installed, and `eyetor setup` run once (see [Installation](#installation)).
 
 ### 1. Create the service unit
 

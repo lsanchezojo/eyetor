@@ -48,6 +48,12 @@ class TestSingleScript:
         assert path.name == "browser.py"
         assert args == ["browser", "--help"]
 
+    def test_filename_invocation_is_stripped(self, tmp_path: Path) -> None:
+        r = self._router(tmp_path)
+        path, args = r.route("browser.py source --url https://example.com")
+        assert path.name == "browser.py"
+        assert args == ["source", "--url", "https://example.com"]
+
 
 # ── Multi-script skills ───────────────────────────────────────────────
 
@@ -100,6 +106,30 @@ class TestMultiScript:
 
 
 class TestEdgeCases:
+    def test_single_script_strips_shell_filename_invocation(self, tmp_path: Path) -> None:
+        script = tmp_path / "run.py"
+        script.touch()
+        r = ScriptRouter("shell", [script])
+        path, args = r.route('run.py --cmd "which megatools"')
+        assert path.name == "run.py"
+        assert args == ["--cmd", "which megatools"]
+
+    def test_single_script_strips_scripts_prefix_invocation(self, tmp_path: Path) -> None:
+        script = tmp_path / "run.py"
+        script.touch()
+        r = ScriptRouter("shell", [script])
+        path, args = r.route('scripts/run.py --cmd "date"')
+        assert path.name == "run.py"
+        assert args == ["--cmd", "date"]
+
+    def test_single_script_strips_interpreter_invocation(self, tmp_path: Path) -> None:
+        script = tmp_path / "run.py"
+        script.touch()
+        r = ScriptRouter("shell", [script])
+        path, args = r.route('python3 run.py --cmd "date"')
+        assert path.name == "run.py"
+        assert args == ["--cmd", "date"]
+
     def test_shlex_fallback_on_bad_quoting(self, tmp_path: Path) -> None:
         script = tmp_path / "run.py"
         script.touch()

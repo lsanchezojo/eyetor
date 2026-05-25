@@ -21,7 +21,8 @@ Schema (stable keys, additive — never remove fields without a major bump):
       "vision": {"provider": str, "base_url": str, "model": str, "api_key": str} | null,
       "image": {"provider": str} | null,
       "paths": {"memory_db": str, "tracking_db": str, "sessions_dir": str},
-      "knowledge": {"enabled": bool, "workspaces": [str, ...]}
+      "knowledge": {"enabled": bool, "workspaces": [str, ...]},
+      "host": {"os_name": str, "os_id": str, "package_managers": [str, ...]}
     }
 
 Callers should treat missing keys as optional and default gracefully.
@@ -54,7 +55,7 @@ def runtime_path() -> Path:
     return runtime_dir() / RUNTIME_FILENAME
 
 
-def write_snapshot(cfg: Any) -> Path:
+def write_snapshot(cfg: Any, *, host_profile: dict[str, Any] | None = None) -> Path:
     """Dump the resolved config to `runtime.json`.
 
     Called once from `cli.py` at startup, before any subprocess is spawned.
@@ -96,6 +97,11 @@ def write_snapshot(cfg: Any) -> Path:
             "workspaces": [w.name for w in (cfg.knowledge.workspaces or [])],
         }
 
+    if host_profile is None:
+        from eyetor.host_info import ensure_host_profile
+
+        host_profile = ensure_host_profile()
+
     snapshot = {
         "pid": os.getpid(),
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -111,6 +117,7 @@ def write_snapshot(cfg: Any) -> Path:
             else "",
         },
         "knowledge": knowledge_block,
+        "host": host_profile,
     }
 
     target = target_dir / RUNTIME_FILENAME

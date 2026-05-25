@@ -225,3 +225,44 @@ def test_future_tool_intent_before_any_tool_still_gets_one_nudge():
 
     assert asyncio.run(session.send_sync("use tool")) == "final"
     assert provider.calls == 2
+
+
+class _EmptyFirstPassProvider:
+    model = "fake"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, messages, tools=None, temperature=0.0):
+        self.calls += 1
+        if self.calls == 1:
+            return CompletionResult(
+                message=Message(role="assistant", content=""),
+                reasoning_content="internal",
+            )
+        return CompletionResult(message=Message(role="assistant", content="recovered"))
+
+    async def stream(self, messages, tools=None, temperature=0.0):  # pragma: no cover
+        raise NotImplementedError
+
+
+def test_empty_first_pass_with_tools_gets_one_nudge():
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="fake_tool",
+            description="fake",
+            parameters={"type": "object", "properties": {}},
+            handler=lambda: "ok",  # type: ignore[arg-type]
+        )
+    )
+    provider = _EmptyFirstPassProvider()
+    session = ChatSession(
+        session_id="test",
+        config=AgentConfig(name="t", provider="fake", model="fake", max_iterations=5),
+        provider=provider,
+        tool_registry=registry,
+    )
+
+    assert asyncio.run(session.send_sync("use tool")) == "recovered"
+    assert provider.calls == 2

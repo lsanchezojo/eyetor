@@ -100,8 +100,12 @@ class SkillRegistry:
                     parts.append(f"Telegram commands: {cmds}")
                 if scripts:
                     parts.append("Scripts:")
+                    strip_script_prefix = len(scripts) == 1
                     for script in scripts:
-                        usage = _script_usage_summary(script)
+                        usage = _script_usage_summary(
+                            script,
+                            strip_script_prefix=strip_script_prefix,
+                        )
                         if usage:
                             parts.append(f"- {script.name}: {usage}")
                         else:
@@ -149,7 +153,12 @@ class SkillRegistry:
         return "\n".join(lines)
 
 
-def _script_usage_summary(script: Path, max_chars: int = 500) -> str:
+def _script_usage_summary(
+    script: Path,
+    max_chars: int = 500,
+    *,
+    strip_script_prefix: bool = False,
+) -> str:
     """Extract a compact usage hint from a script module docstring."""
     if script.suffix != ".py":
         return ""
@@ -179,7 +188,30 @@ def _script_usage_summary(script: Path, max_chars: int = 500) -> str:
     if not selected:
         selected = [line.strip() for line in lines[:3] if line.strip()]
 
+    if strip_script_prefix:
+        selected = [
+            cleaned
+            for line in selected
+            if (cleaned := _strip_usage_script_prefix(line, script))
+        ]
+
     text = " ".join(selected)
     if len(text) > max_chars:
         return text[: max_chars - 3].rstrip() + "..."
     return text
+
+
+def _strip_usage_script_prefix(line: str, script: Path) -> str:
+    """Remove the script filename from usage examples for single-script skills."""
+    stripped = line.strip()
+    prefixes = (
+        script.name,
+        f"./{script.name}",
+        f"scripts/{script.name}",
+    )
+    for prefix in prefixes:
+        if stripped == prefix:
+            return ""
+        if stripped.startswith(f"{prefix} "):
+            return stripped[len(prefix):].lstrip()
+    return stripped

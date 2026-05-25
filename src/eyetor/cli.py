@@ -118,6 +118,134 @@ def cli(ctx: click.Context, config: str | None, log_level: str | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# eyetor setup
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--refresh-host",
+    is_flag=True,
+    default=False,
+    help="Regenerate the persisted host profile.",
+)
+@click.option(
+    "--print-json",
+    "print_json",
+    is_flag=True,
+    default=False,
+    help="Print the host profile as JSON.",
+)
+@click.option(
+    "--install-helper",
+    is_flag=True,
+    default=False,
+    help="Install the restricted privileged package-install helper.",
+)
+@click.option(
+    "--service-user",
+    default=None,
+    help="User account that runs the Eyetor service (default: current user or SUDO_USER).",
+)
+def setup(
+    refresh_host: bool,
+    print_json: bool,
+    install_helper: bool,
+    service_user: str | None,
+) -> None:
+    """Run first-time setup tasks for this machine."""
+    from eyetor.host_info import (
+        detect_host_profile,
+        ensure_host_profile,
+        host_profile_path,
+        read_host_profile,
+    )
+
+    if install_helper:
+        from eyetor.install_helper import install_privileged_helper
+
+        service_user = _resolve_setup_service_user(service_user)
+        target = _host_profile_path_for_user(service_user)
+        if os.geteuid() != 0:
+            import shlex
+
+            exe = shlex.quote(str(Path(sys.argv[0]).resolve()))
+            user_arg = shlex.quote(service_user)
+            console.print(
+                "[red]Installing the privileged helper requires root.[/red]\n"
+                "Run this one-time bootstrap command:\n"
+                f"  sudo {exe} setup --install-helper --service-user {user_arg}"
+            )
+            sys.exit(1)
+        profile = detect_host_profile() if refresh_host else (read_host_profile(target) or detect_host_profile())
+        profile = install_privileged_helper(
+            service_user=service_user,
+            host_profile=profile,
+            host_path=target,
+        )
+        existed = True
+    else:
+        target = host_profile_path()
+        existed = target.exists()
+        profile = ensure_host_profile(refresh=refresh_host)
+
+    if print_json:
+        console.print_json(data=profile)
+        return
+
+    if install_helper:
+        status = "Installed package helper and updated"
+    elif refresh_host:
+        status = "Regenerated"
+    elif existed:
+        status = "Existing"
+    else:
+        status = "Created"
+
+    console.print(f"[green]{status} host profile:[/green] {target}")
+    table = Table(title="Host Profile")
+    table.add_column("Field", style="bold cyan")
+    table.add_column("Value")
+    table.add_row("OS", str(profile.get("os_name") or "-"))
+    table.add_row("OS ID", str(profile.get("os_id") or "-"))
+    table.add_row("OS Like", ", ".join(profile.get("os_like") or []) or "-")
+    table.add_row("Platform", str(profile.get("platform") or "-"))
+    table.add_row("Machine", str(profile.get("machine") or "-"))
+    table.add_row(
+        "Package managers",
+        ", ".join(profile.get("package_managers") or []) or "-",
+    )
+    table.add_row(
+        "Preferred manager",
+        str(profile.get("preferred_package_manager") or "-"),
+    )
+    table.add_row(
+        "Autonomous installs",
+        "yes" if profile.get("can_install_system_packages") else "no",
+    )
+    if profile.get("install_helper"):
+        table.add_row("Install helper", str(profile.get("install_helper")))
+        table.add_row("Install strategy", str(profile.get("install_strategy") or "auto"))
+    console.print(table)
+
+
+def _resolve_setup_service_user(service_user: str | None) -> str:
+    from eyetor.install_helper import validate_service_user
+
+    resolved = service_user or os.environ.get("SUDO_USER") or getpass.getuser()
+    if resolved == "root" and not service_user:
+        raise click.UsageError("Pass --service-user with the account that runs Eyetor.")
+    return validate_service_user(resolved)
+
+
+def _host_profile_path_for_user(service_user: str) -> Path:
+    import pwd
+
+    info = pwd.getpwnam(service_user)
+    return Path(info.pw_dir) / ".eyetor" / "host.json"
+
+
+# ---------------------------------------------------------------------------
 # eyetor start  (unified entry point)
 # ---------------------------------------------------------------------------
 
@@ -175,11 +303,14 @@ def start(
         from eyetor.tracking.usage import UsageTracker
         from eyetor.tracking.pricing import CostEstimator
         from eyetor.runtime import runtime_path, write_snapshot
+        from eyetor.host_info import ensure_host_profile, format_host_prompt
+
+        host_profile = ensure_host_profile()
 
         # In interactive (CLI) mode the systemd service is usually the snapshot
         # owner — only write it if no snapshot exists yet, to avoid races.
         if not interactive or not runtime_path().exists():
-            write_snapshot(cfg)
+            write_snapshot(cfg, host_profile=host_profile)
 
         tracker = UsageTracker.from_config(cfg.tracking)
         cost_estimator = CostEstimator()
@@ -245,6 +376,10 @@ def start(
         )
         base_system = f"{base_system}\n\nFecha y hora actual: {now_str}"
 
+        host_context = format_host_prompt(host_profile)
+        if host_context:
+            base_system = f"{base_system}\n\n{host_context}"
+
         skills_context = skill_reg.build_skills_context(skill_names)
         if skills_context:
             base_system = f"{base_system}\n\n{skills_context}"
@@ -272,6 +407,38 @@ def start(
 
         # Shared tool registry
         tool_registry = ToolRegistry(plugin_registry=plugin_registry)
+        if use_host_tools:
+            install_package_handler = _make_install_package_handler(host_profile)
+            tool_registry.register(
+                ToolDefinition(
+                    name="install_package",
+                    description=(
+                        "Install a system package using Eyetor's restricted "
+                        "privileged helper. Use only after checking whether the binary "
+                        "already exists. The helper automatically chooses the OS-specific "
+                        "install strategy and does not allow arbitrary sudo commands."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "package": {
+                                "type": "string",
+                                "description": "System package name to install.",
+                            },
+                            "binary": {
+                                "type": "string",
+                                "description": "Optional binary expected after install, e.g. megadl.",
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "Brief reason for installing this package.",
+                            },
+                        },
+                        "required": ["package"],
+                    },
+                    handler=install_package_handler,
+                )
+            )
         if skill_names:
             from eyetor.skills.router import RoutingError, ScriptRouter
 
@@ -294,6 +461,27 @@ def start(
                         except RoutingError as exc:
                             return json.dumps({"error": str(exc)})
                         routed_args = " ".join(arg_list)
+                        if (
+                            use_host_tools
+                            and skill_name == "shell"
+                            and host_profile.get("can_install_system_packages")
+                            and _looks_like_package_install_command(routed_args)
+                        ):
+                            return json.dumps(
+                                {
+                                    "ok": False,
+                                    "error": (
+                                        "Do not install system packages through skill_shell. "
+                                        "Use the install_package tool with a package name."
+                                    ),
+                                    "tool": "install_package",
+                                    "example": {
+                                        "package": "megatools",
+                                        "binary": "megadl",
+                                    },
+                                },
+                                ensure_ascii=False,
+                            )
                         if use_host_tools and _is_dangerous(skill_name, script_path.name, routed_args):
                             confirmed = await _ask_confirm(skill_name, script_path.name, routed_args)
                             if not confirmed:
@@ -948,6 +1136,149 @@ def start(
 # ---------------------------------------------------------------------------
 # Helpers for host-tools safety
 # ---------------------------------------------------------------------------
+
+
+def _make_install_package_handler(host_profile: dict):
+    async def _handler(
+        package: str,
+        binary: str | None = None,
+        reason: str | None = None,
+    ) -> str:
+        import shutil
+
+        from eyetor.install_helper import is_safe_package_name
+
+        package = (package or "").strip()
+        binary = (binary or "").strip() or None
+        reason = (reason or "").strip()
+
+        if not package or not is_safe_package_name(package):
+            return json.dumps(
+                {"ok": False, "error": f"Invalid package name: {package!r}"},
+                ensure_ascii=False,
+            )
+
+        if binary:
+            existing = shutil.which(binary)
+            if existing:
+                return json.dumps(
+                    {
+                        "ok": True,
+                        "already_installed": True,
+                        "binary": binary,
+                        "path": existing,
+                    },
+                    ensure_ascii=False,
+                )
+
+        if not host_profile.get("can_install_system_packages"):
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "Privileged install helper is not configured.",
+                    "setup": "Run: sudo .venv/bin/eyetor setup --install-helper --service-user <user>",
+                },
+                ensure_ascii=False,
+            )
+
+        helper = str(host_profile.get("install_helper") or "")
+        if not helper or not Path(helper).exists():
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "Configured install helper is missing.",
+                    "helper": helper,
+                },
+                ensure_ascii=False,
+            )
+        if not shutil.which("sudo"):
+            return json.dumps(
+                {"ok": False, "error": "sudo is not available on this host."},
+                ensure_ascii=False,
+            )
+
+        proc = await asyncio.create_subprocess_exec(
+            "sudo",
+            "-n",
+            helper,
+            package,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=1800)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return json.dumps(
+                {"ok": False, "error": "Package install timed out."},
+                ensure_ascii=False,
+            )
+
+        stdout = stdout_b.decode(errors="replace").strip()
+        stderr = stderr_b.decode(errors="replace").strip()
+        try:
+            payload = json.loads(stdout) if stdout else {}
+        except json.JSONDecodeError:
+            payload = {}
+
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.setdefault("ok", proc.returncode == 0)
+        payload.setdefault("package", package)
+        if reason:
+            payload.setdefault("reason", reason)
+        if stderr:
+            payload.setdefault("sudo_stderr", stderr[-2000:])
+        if stdout and "message" not in payload:
+            payload.setdefault("stdout", stdout[-2000:])
+        if proc.returncode != 0:
+            payload["ok"] = False
+            payload.setdefault("error", "Package install helper failed.")
+
+        if binary and payload.get("ok"):
+            installed = shutil.which(binary)
+            payload["binary"] = binary
+            payload["binary_path"] = installed or ""
+            if not installed:
+                payload["ok"] = False
+                payload.setdefault(
+                    "error",
+                    f"Package installed but expected binary {binary!r} was not found in PATH.",
+                )
+
+        return json.dumps(payload, ensure_ascii=False)
+
+    return _handler
+
+
+def _looks_like_package_install_command(args: str) -> bool:
+    """Return True for shell args that should use install_package instead."""
+    tokens = _split_args(args)
+    if not tokens:
+        return False
+    if "--cmd" in tokens:
+        idx = tokens.index("--cmd")
+        command = tokens[idx + 1] if idx + 1 < len(tokens) else ""
+        tokens = _split_args(command)
+    if tokens[:2] == ["sudo", "-n"]:
+        tokens = tokens[2:]
+    elif tokens and tokens[0] == "sudo":
+        tokens = tokens[1:]
+    if len(tokens) < 2:
+        return False
+
+    manager = tokens[0]
+    if manager in {"pacman", "paru", "yay"}:
+        return any(t.startswith("-S") for t in tokens[1:])
+    if manager == "apt-get":
+        return any(t in {"install", "update"} for t in tokens[1:])
+    if manager in {"dnf", "zypper"}:
+        return "install" in tokens[1:]
+    if manager == "apk":
+        return "add" in tokens[1:]
+    return False
+
 
 _DANGEROUS_PATTERNS = [
     (

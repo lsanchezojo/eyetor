@@ -15,6 +15,7 @@ from pathlib import Path
 _SHELL_VAR_RE = re.compile(r'^"?\$\{?[A-Za-z_][A-Za-z0-9_]*\}?"?$')
 # Absolute or home-relative paths that are script invocations, not commands
 _ABS_PATH_RE = re.compile(r'^[/~]')
+_PYTHON_RE = re.compile(r"^python(?:\d+(?:\.\d+)*)?(?:\.exe)?$")
 
 
 class RoutingError(Exception):
@@ -43,9 +44,11 @@ class ScriptRouter:
         tokens = self._tokenize(raw_args)
         tokens = self._strip_invocation_prefix(tokens)
 
-        # Single-script skill: always pass all args through.
+        # Single-script skill: pass args through after removing accidental
+        # script invocations copied from docs, e.g. ``run.py --cmd ...``.
         if len(self._scripts) == 1:
-            return self._scripts[0], tokens
+            script = self._scripts[0]
+            return script, self._strip_script_invocation(tokens, script)
 
         # Multi-script: need at least one token to pick a script.
         if not tokens:
@@ -93,6 +96,24 @@ class ScriptRouter:
         return tokens
 
     @staticmethod
+    def _strip_script_invocation(tokens: list[str], script: Path) -> list[str]:
+        """Strip a leading invocation of *script* from already-routed args."""
+        if not tokens:
+            return tokens
+
+        if _is_script_token(tokens[0], script):
+            return tokens[1:]
+
+        if _is_interpreter_token(tokens[0]):
+            for idx, token in enumerate(tokens[1:], start=1):
+                if _is_script_token(token, script):
+                    return tokens[idx + 1:]
+                if not token.startswith("-"):
+                    break
+
+        return tokens
+
+    @staticmethod
     def _tokenize(raw: str) -> list[str]:
         raw = raw.strip()
         if not raw:
@@ -101,3 +122,15 @@ class ScriptRouter:
             return shlex.split(raw)
         except ValueError:
             return raw.split()
+
+
+def _is_script_token(token: str, script: Path) -> bool:
+    """Return True for tokens that explicitly name the routed script file."""
+    token_path = token.removeprefix("scripts/")
+    return Path(token_path).name == script.name
+
+
+def _is_interpreter_token(token: str) -> bool:
+    """Return True for common interpreter wrappers before script names."""
+    name = Path(token).name.lower()
+    return bool(_PYTHON_RE.match(name)) or name in {"py", "py.exe"}

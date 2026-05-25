@@ -64,9 +64,18 @@ class FallbackProvider(BaseProvider):
         temperature: float = 0.0,
     ) -> CompletionResult:
         last_exc: Exception | None = None
-        for provider in self._providers:
+        last_empty: CompletionResult | None = None
+        for idx, provider in enumerate(self._providers):
             try:
-                return await provider.complete(messages, tools, temperature)
+                result = await provider.complete(messages, tools, temperature)
+                if _is_empty_completion(result) and idx < len(self._providers) - 1:
+                    logger.warning(
+                        "Provider %s returned empty completion, trying next in chain",
+                        provider,
+                    )
+                    last_empty = result
+                    continue
+                return result
             except Exception as exc:
                 if self._should_retry(exc):
                     logger.warning(
@@ -77,6 +86,8 @@ class FallbackProvider(BaseProvider):
                     last_exc = exc
                 else:
                     raise
+        if last_empty is not None:
+            return last_empty
         raise RuntimeError("All providers in fallback chain failed") from last_exc
 
     async def stream(
@@ -100,3 +111,10 @@ class FallbackProvider(BaseProvider):
                 else:
                     raise
         raise RuntimeError("All providers in fallback chain failed") from last_exc
+
+
+def _is_empty_completion(result: CompletionResult) -> bool:
+    message = result.message
+    if message.tool_calls:
+        return False
+    return not (message.content or "").strip()

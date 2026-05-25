@@ -457,6 +457,7 @@ class ChatSession:
         recent_bags: list[list[tuple[str, frozenset[str]]]] = []  # for Jaccard
         max_repeat = 3  # max consecutive identical tool calls before forcing answer
         nudged = False  # allow at most one "announce-without-call" nudge per turn
+        empty_nudged = False  # allow one retry for immediate empty/no-tool replies
         degeneration_recovered = False  # one-shot post-tool synthesis fallback
         tools_executed = 0
 
@@ -494,6 +495,32 @@ class ChatSession:
 
             if not response.tool_calls:
                 content = response.content or ""
+                if (
+                    not empty_nudged
+                    and not content.strip()
+                    and tool_defs
+                    and tools_executed == 0
+                ):
+                    empty_nudged = True
+                    logger.warning(
+                        "Session '%s' — empty first-pass response at iter %d "
+                        "(no content, no tool_call, reasoning=%dch). Nudging once.",
+                        self.session_id,
+                        iterations,
+                        len((result.reasoning_content or "").strip()),
+                    )
+                    full_messages.append(
+                        Message(
+                            role="user",
+                            content=(
+                                "No has emitido ni respuesta visible ni tool_call estructurada. "
+                                "Continúa ahora: si necesitas actuar en el ordenador, emite la "
+                                "tool_call correcta; si no necesitas herramientas, responde al "
+                                "usuario directamente en español. No dejes la respuesta vacía."
+                            ),
+                        )
+                    )
+                    continue
                 # Some small local models announce "voy a reintentar / I'll call X"
                 # in plain text without emitting the structured tool_call. Nudge
                 # once only before any tool has actually run. After a tool result,
