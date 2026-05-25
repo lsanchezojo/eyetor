@@ -21,6 +21,8 @@ providers:
     model: default
     temperature: 0.3   # bajado de 0.5: SLM Q4 más fiable en tool-calling sin decodificación degenerada
     thinking: true   # set to true to enable reasoning channel (Gemma-4, QwQ, etc.)
+    request_timeout: 300
+    reasoning_budget: 1024
     # Caps de generación para evitar que un modelo local se quede razonando
     # miles de tokens. Se aplican como max_tokens y n_predict.
     max_tokens: 1024
@@ -209,7 +211,7 @@ sessions:
     plan_votes: 1         # voting rounds for planning step (1 = no voting)
   compaction:
     enabled: true
-    context_window: 16384           # = n_ctx real del servidor llama.cpp (/props); mantener sincronizado si se cambia -c
+    context_window: 12288           # = n_ctx real del servidor llama.cpp (/props); mantener sincronizado si se cambia -c
     trigger_at_percent: 0.80
     tool_output_max_chars: 2000
     keep_last_n_user_turns: 2

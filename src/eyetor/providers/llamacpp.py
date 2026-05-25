@@ -46,6 +46,7 @@ class LlamaCppProvider(BaseProvider):
         *args: Any,
         thinking: bool = False,
         request_timeout: float = 600.0,
+        reasoning_budget: int | None = None,
         max_tokens: int | None = None,
         max_tokens_by_phase: dict[str, int] | None = None,
         **kwargs: Any,
@@ -53,6 +54,7 @@ class LlamaCppProvider(BaseProvider):
         super().__init__(*args, **kwargs)
         self.thinking = thinking
         self.request_timeout = request_timeout
+        self.reasoning_budget = reasoning_budget
         self.max_tokens = max_tokens
         self.max_tokens_by_phase = max_tokens_by_phase or {}
 
@@ -75,6 +77,8 @@ class LlamaCppProvider(BaseProvider):
         payload = super()._build_payload(messages, tools, temperature, stream)
         if self.thinking:
             payload["chat_template_kwargs"] = {"enable_thinking": True}
+            if self.reasoning_budget is not None and self.reasoning_budget > 0:
+                payload["reasoning_budget_tokens"] = self.reasoning_budget
         max_tokens = self._max_tokens_for_current_phase()
         if max_tokens is not None and max_tokens > 0:
             payload["max_tokens"] = max_tokens

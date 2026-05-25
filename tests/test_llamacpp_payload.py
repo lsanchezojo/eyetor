@@ -41,3 +41,21 @@ def test_llamacpp_phase_generation_cap_overrides_global() -> None:
 
     assert payload["max_tokens"] == 45
     assert payload["n_predict"] == 45
+
+
+def test_llamacpp_sets_reasoning_budget_when_thinking() -> None:
+    provider = LlamaCppProvider(
+        base_url="http://localhost:8080/v1",
+        model="default",
+        thinking=True,
+        reasoning_budget=1024,
+    )
+
+    payload = provider._build_payload(
+        [Message(role="user", content="hi")],
+        tools=None,
+        temperature=0.0,
+    )
+
+    assert payload["chat_template_kwargs"] == {"enable_thinking": True}
+    assert payload["reasoning_budget_tokens"] == 1024
