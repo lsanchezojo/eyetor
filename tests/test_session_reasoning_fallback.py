@@ -266,3 +266,122 @@ def test_empty_first_pass_with_tools_gets_one_nudge():
 
     assert asyncio.run(session.send_sync("use tool")) == "recovered"
     assert provider.calls == 2
+
+
+class _RetryThenFinalProvider:
+    model = "fake"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, messages, tools=None, temperature=0.0):
+        if tools is None:
+            return CompletionResult(message=Message(role="assistant", content="looped"))
+
+        self.calls += 1
+        if self.calls == 1:
+            args = '{"q":"mkdir tmp directory"}'
+        elif self.calls == 2:
+            args = '{"q":"megadl path tmp url"}'
+        elif self.calls == 3:
+            args = '{"q":"megadl path tmp url timeout 300"}'
+        else:
+            return CompletionResult(message=Message(role="assistant", content="done"))
+
+        return CompletionResult(
+            message=Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id=f"call-{self.calls}",
+                        function=FunctionCall(name="fake_tool", arguments=args),
+                    )
+                ],
+            )
+        )
+
+    async def stream(self, messages, tools=None, temperature=0.0):  # pragma: no cover
+        raise NotImplementedError
+
+
+def test_soft_loop_requires_all_recent_calls_to_be_similar():
+    async def fake_tool(q: str) -> str:
+        return q
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="fake_tool",
+            description="fake",
+            parameters={"type": "object", "properties": {"q": {"type": "string"}}},
+            handler=fake_tool,
+        )
+    )
+    provider = _RetryThenFinalProvider()
+    session = ChatSession(
+        session_id="test",
+        config=AgentConfig(name="t", provider="fake", model="fake", max_iterations=5),
+        provider=provider,
+        tool_registry=registry,
+    )
+
+    assert asyncio.run(session.send_sync("retry with timeout")) == "done"
+    assert provider.calls == 4
+
+
+class _DuplicateToolCallProvider:
+    model = "fake"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, messages, tools=None, temperature=0.0):
+        self.calls += 1
+        if self.calls == 1:
+            call = ToolCall(
+                id="call-1",
+                function=FunctionCall(name="fake_tool", arguments='{"q":"same"}'),
+            )
+            duplicate = ToolCall(
+                id="call-2",
+                function=FunctionCall(name="fake_tool", arguments='{"q":"same"}'),
+            )
+            return CompletionResult(
+                message=Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=[call, duplicate],
+                )
+            )
+        return CompletionResult(message=Message(role="assistant", content="final"))
+
+    async def stream(self, messages, tools=None, temperature=0.0):  # pragma: no cover
+        raise NotImplementedError
+
+
+def test_duplicate_tool_calls_in_same_turn_execute_once():
+    calls: list[str] = []
+
+    async def fake_tool(q: str) -> str:
+        calls.append(q)
+        return q
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="fake_tool",
+            description="fake",
+            parameters={"type": "object", "properties": {"q": {"type": "string"}}},
+            handler=fake_tool,
+        )
+    )
+    session = ChatSession(
+        session_id="test",
+        config=AgentConfig(name="t", provider="fake", model="fake", max_iterations=5),
+        provider=_DuplicateToolCallProvider(),
+        tool_registry=registry,
+    )
+
+    assert asyncio.run(session.send_sync("dedupe")) == "final"
+    assert calls == ["same"]

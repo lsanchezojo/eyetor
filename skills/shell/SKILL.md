@@ -22,12 +22,17 @@ Use when the user asks to:
 
 **Canonical form** — wrap the command in `--cmd "..."`:
 ```
---cmd "<command>" [--cwd "<directory>"] [--timeout N]
+--cmd "<command>" [--cwd "<directory>"] [--timeout N] [--idle-timeout N]
 ```
 
 The whole command must live inside a single `--cmd "..."` quoted string
 (including pipes, redirects, and arguments). Returns JSON:
 `{"stdout": "...", "stderr": "...", "exit_code": 0}`.
+
+`--timeout` is the absolute maximum runtime. `--idle-timeout` stops commands
+that produce no stdout/stderr for too long. Long downloads/builds can keep
+running while they emit progress output; for silent long-running commands,
+increase `--idle-timeout` outside the `--cmd` string.
 
 ## Examples
 
@@ -51,6 +56,11 @@ Install npm packages:
 --cmd "npm install" --cwd "/home/user/myapp" --timeout 120
 ```
 
+Run a long download or build:
+```
+--cmd "download-tool --output ./downloads URL" --timeout 900 --idle-timeout 180
+```
+
 List running processes:
 ```
 --cmd "ps aux"        # Linux/macOS
@@ -59,7 +69,8 @@ List running processes:
 
 ## Notes
 - Default working directory is the current directory
-- Default timeout: 30 seconds (override with --timeout)
+- Default absolute timeout: 900 seconds (override with --timeout)
+- Default idle timeout: 120 seconds without stdout/stderr (override with --idle-timeout)
 - On Windows, commands run inside PowerShell (`powershell -Command "..."`)
 - On Linux/macOS, commands run inside bash (`bash -c "..."`)
 - For multi-line scripts, use a temp file and run it

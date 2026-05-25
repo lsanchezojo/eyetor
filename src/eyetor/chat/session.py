@@ -401,6 +401,27 @@ class ChatSession:
         )
         return False
 
+    def _dedupe_tool_calls(self, tool_calls: list[ToolCall] | None) -> list[ToolCall] | None:
+        """Drop duplicate tool calls emitted in the same model response."""
+        if not tool_calls:
+            return tool_calls
+
+        unique: list[ToolCall] = []
+        seen: set[tuple[str, str]] = set()
+        for tc in tool_calls:
+            key = (tc.function.name, tc.function.arguments)
+            if key in seen:
+                logger.warning(
+                    "Session '%s' — duplicate tool_call in same turn ignored: %s(%s)",
+                    self.session_id,
+                    tc.function.name,
+                    _truncate(tc.function.arguments, 200),
+                )
+                continue
+            seen.add(key)
+            unique.append(tc)
+        return unique
+
     def _maybe_rotate(self) -> None:
         """Truncate the JSONL file to max_messages if it grows too large."""
         if not self._persist_path or not self._persist_path.exists():
@@ -473,6 +494,7 @@ class ChatSession:
                     temperature=self.config.temperature,
                 )
             response = result.message
+            response.tool_calls = self._dedupe_tool_calls(response.tool_calls)
             if result.reasoning_content:
                 self.last_reasoning = (
                     (self.last_reasoning + "\n\n" if self.last_reasoning else "")
@@ -652,21 +674,21 @@ class ChatSession:
                 and all(len(b) == 1 for b in recent_bags)
                 and len({b[0][0] for b in recent_bags}) == 1
             ):
-                # Soft loop: among the last N same-tool calls, if ANY pair
-                # overlaps ≥ threshold, the model is re-asking what it just
-                # asked. Using ``max`` (not ``min``) is deliberate — small
-                # models vary satellite tokens wildly, so min would never
-                # trip; max catches "iter N is nearly iter N-1".
+                # Soft loop: among the last N same-tool calls, require every
+                # pair to overlap above threshold. This still catches true
+                # repeated loops while allowing legitimate retries that change
+                # strategy, parameters, or timeout after a failed attempt.
                 bags = [b[0][1] for b in recent_bags]
                 pairwise = [
                     _jaccard(bags[i], bags[j])
                     for i in range(len(bags))
                     for j in range(i + 1, len(bags))
                 ]
-                if pairwise and max(pairwise) >= _LOOP_JACCARD_THRESHOLD:
+                min_jaccard = min(pairwise) if pairwise else 0.0
+                if pairwise and min_jaccard >= _LOOP_JACCARD_THRESHOLD:
                     loop_reason = (
                         f"{max_repeat} near-duplicate '{recent_bags[-1][0][0]}' "
-                        f"calls (max Jaccard {max(pairwise):.2f} ≥ {_LOOP_JACCARD_THRESHOLD})"
+                        f"calls (min Jaccard {min_jaccard:.2f} ≥ {_LOOP_JACCARD_THRESHOLD})"
                     )
 
             if loop_reason:

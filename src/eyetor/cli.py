@@ -486,7 +486,7 @@ def start(
                             confirmed = await _ask_confirm(skill_name, script_path.name, routed_args)
                             if not confirmed:
                                 return json.dumps({"error": "Operation cancelled by user."})
-                        timeout = meta.timeout if meta.timeout is not None else DEFAULT_TIMEOUT
+                        timeout = _skill_execution_timeout(skill_name, arg_list, meta.timeout)
                         return await run_script(script_path, arg_list, timeout=timeout)
                     return _handler
 
@@ -1278,6 +1278,44 @@ def _looks_like_package_install_command(args: str) -> bool:
     if manager == "apk":
         return "add" in tokens[1:]
     return False
+
+
+_SHELL_DEFAULT_ABSOLUTE_TIMEOUT = 900.0
+_SHELL_MAX_ABSOLUTE_TIMEOUT = 3600.0
+_SHELL_TIMEOUT_GRACE = 10.0
+
+
+def _skill_execution_timeout(
+    skill_name: str,
+    arg_list: list[str],
+    meta_timeout: float | None,
+) -> float:
+    """Return the outer script timeout for a routed skill invocation."""
+    from eyetor.skills.executor import DEFAULT_TIMEOUT
+
+    if skill_name != "shell":
+        return meta_timeout if meta_timeout is not None else DEFAULT_TIMEOUT
+
+    requested = _shell_requested_timeout(arg_list)
+    absolute = requested if requested is not None else _SHELL_DEFAULT_ABSOLUTE_TIMEOUT
+    absolute = max(1.0, min(float(absolute), _SHELL_MAX_ABSOLUTE_TIMEOUT))
+    return absolute + _SHELL_TIMEOUT_GRACE
+
+
+def _shell_requested_timeout(arg_list: list[str]) -> int | None:
+    """Extract shell run.py's --timeout value from routed arguments."""
+    for idx, token in enumerate(arg_list):
+        if token == "--timeout" and idx + 1 < len(arg_list):
+            try:
+                return int(arg_list[idx + 1])
+            except ValueError:
+                return None
+        if token.startswith("--timeout="):
+            try:
+                return int(token.split("=", 1)[1])
+            except ValueError:
+                return None
+    return None
 
 
 _DANGEROUS_PATTERNS = [

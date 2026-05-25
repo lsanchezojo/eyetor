@@ -11,6 +11,8 @@ from click.testing import CliRunner
 from eyetor.cli import (
     _looks_like_package_install_command,
     _make_install_package_handler,
+    _shell_requested_timeout,
+    _skill_execution_timeout,
     cli,
 )
 from eyetor.config import VectorConfig
@@ -217,6 +219,20 @@ def test_shell_package_install_commands_are_detected() -> None:
     assert _looks_like_package_install_command('--cmd "sudo pacman -S megatools"')
     assert _looks_like_package_install_command('--cmd "apt-get install -y megatools"')
     assert not _looks_like_package_install_command('--cmd "command -v megadl"')
+
+
+def test_shell_requested_timeout_is_extracted() -> None:
+    assert _shell_requested_timeout(["--cmd", "sleep 1", "--timeout", "600"]) == 600
+    assert _shell_requested_timeout(["--cmd", "sleep 1", "--timeout=300"]) == 300
+    assert _shell_requested_timeout(["--cmd", "sleep 1"]) is None
+    assert _shell_requested_timeout(["--cmd", "sleep 1", "--timeout", "bad"]) is None
+
+
+def test_shell_execution_timeout_respects_requested_timeout() -> None:
+    assert _skill_execution_timeout("shell", ["--cmd", "date"], None) == 910.0
+    assert _skill_execution_timeout("shell", ["--cmd", "date", "--timeout", "600"], None) == 610.0
+    assert _skill_execution_timeout("shell", ["--cmd", "date", "--timeout", "9999"], None) == 3610.0
+    assert _skill_execution_timeout("browser", [], 42.0) == 42.0
 
 
 def test_setup_install_helper_non_root_prints_bootstrap_command(tmp_path: Path, monkeypatch) -> None:
