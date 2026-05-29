@@ -8,7 +8,12 @@ and let the model end its turn with an unfulfilled announcement.
 
 from __future__ import annotations
 
-from eyetor.chat.session import _is_asking_user
+from eyetor.chat.session import (
+    _is_asking_user,
+    _is_user_confirmation,
+    _last_assistant_proposed_action,
+)
+from eyetor.models.messages import Message
 
 
 # ── Real questions: must still be classified as questions ─────────────
@@ -77,3 +82,24 @@ class TestMixed:
 
     def test_none_like_no_marks(self):
         assert _is_asking_user("Respuesta final sin preguntas.") is False
+
+
+class TestConfirmationNudgeHelpers:
+    def test_vale_is_confirmation(self):
+        assert _is_user_confirmation("vale") is True
+
+    def test_confirmation_must_be_short(self):
+        assert _is_user_confirmation("vale, pero espera") is False
+
+    def test_detects_previous_action_proposal(self):
+        messages = [
+            Message(
+                role="assistant",
+                content="Este comando cerrará Hyprland. ¿Quieres que lo ejecute?",
+            )
+        ]
+        assert _last_assistant_proposed_action(messages) is True
+
+    def test_ignores_plain_information_question(self):
+        messages = [Message(role="assistant", content="¿Prefieres la opción A o la B?")]
+        assert _last_assistant_proposed_action(messages) is False

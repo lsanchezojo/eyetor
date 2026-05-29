@@ -106,6 +106,7 @@ class ConversationCompactor:
         system_content: str,
         provider: BaseProvider,
         session_id: str,
+        force: bool = False,
     ) -> CompactionResult:
         """Execute two-phase compaction."""
         threshold = self._config.context_window * self._config.trigger_at_percent
@@ -117,7 +118,7 @@ class ConversationCompactor:
         pruned = self._prune_tool_outputs(history)
         tokens = self.estimate_tokens(pruned + tail, system_content)
 
-        if tokens >= threshold:
+        if force or tokens >= threshold:
             try:
                 summary = await self._summarize(history, provider)
             except Exception as e:

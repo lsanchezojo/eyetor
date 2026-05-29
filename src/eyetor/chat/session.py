@@ -106,6 +106,44 @@ def _is_asking_user(text: str) -> bool:
     return any(m in lowered for m in _ASK_USER_MARKERS)
 
 
+_CONFIRMATION_RE = re.compile(
+    r"^(s[ií]|ok|dale|hazlo|adelante|confirmo|confirma|vale|"
+    r"venga|va|claro|por supuesto|yes|yeah|yep|sure|go ahead|do it"
+    r")[\s.!,]*$",
+    re.IGNORECASE,
+)
+
+
+def _is_user_confirmation(text: str) -> bool:
+    """True if ``text`` is a short affirmative confirmation."""
+    return bool(_CONFIRMATION_RE.match(text.strip()))
+
+
+_ACTION_PROPOSAL_RE = re.compile(
+    r"\b("
+    r"comando|command|herramienta|tool|ejecut\w*|lanz\w*|corr\w*|"
+    r"run|execute|launch|dispatch|cerr\w*|abr\w*|borr\w*|elimin\w*|"
+    r"instal\w*|reinici\w*|reload"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _last_assistant_proposed_action(messages: list[Message]) -> bool:
+    """True if the last assistant turn asked to confirm an actionable step."""
+    for msg in reversed(messages):
+        if msg.role == "assistant":
+            content = msg.content or ""
+            return (
+                bool(content.strip())
+                and _is_asking_user(content)
+                and bool(_ACTION_PROPOSAL_RE.search(content))
+            )
+        if msg.role == "user":
+            return False
+    return False
+
+
 def _is_ghost_assistant(msg: Message) -> bool:
     """True if ``msg`` is an empty assistant turn that should not be remembered.
 
@@ -235,6 +273,7 @@ class ChatSession:
         self._cost_estimator = cost_estimator
         self._observer = observer
         self.last_reasoning: str | None = None  # Accumulated reasoning from the latest send() turn
+        self._force_compact_next = False
 
         self._compactor: ConversationCompactor | None = None
         if root_config and root_config.sessions.compaction.enabled:
@@ -463,16 +502,28 @@ class ChatSession:
         current_session_id.set(self.session_id)
         current_trace_id.set(new_trace_id())
 
-        if self._compactor:
-            system_content = self._build_system_content()
-            if self._compactor.should_compact(self._messages, system_content):
-                result = await self._compactor.compact(
-                    self._messages, system_content, self.provider, self.session_id
-                )
-                if result.compacted:
-                    self._apply_compaction(result)
-
         full_messages = self._get_full_messages()
+        if (
+            tool_defs
+            and _is_user_confirmation(user_input)
+            and _last_assistant_proposed_action(self._messages[:-1])
+        ):
+            logger.info(
+                "Session '%s' — user confirmed a pending action; nudging tool execution",
+                self.session_id,
+            )
+            full_messages.append(
+                Message(
+                    role="system",
+                    content=(
+                        "El usuario acaba de confirmar la acción que propusiste. "
+                        "DEBES ejecutarla AHORA emitiendo la tool_call estructurada "
+                        "correspondiente en esta misma respuesta. No respondas solo "
+                        "con texto: si hay una herramienta adecuada, llama a la "
+                        "herramienta con los parámetros correctos."
+                    ),
+                )
+            )
         iterations = 0
         recent_calls: list[str] = []  # normalized sig for exact-match detection
         recent_bags: list[list[tuple[str, frozenset[str]]]] = []  # for Jaccard
@@ -486,6 +537,9 @@ class ChatSession:
             iterations += 1
             if self._observer:
                 self._observer.on_iteration(iterations)
+            full_messages = await self._compact_before_llm(
+                full_messages, reason=f"main iter {iterations}"
+            )
             # Non-streaming call to detect tool calls
             with tracking_context(phase="main"):
                 result = await self.provider.complete(
@@ -493,6 +547,7 @@ class ChatSession:
                     tools=tool_defs,
                     temperature=self.config.temperature,
                 )
+            self._mark_force_compact_after_fallback("main")
             response = result.message
             response.tool_calls = self._dedupe_tool_calls(response.tool_calls)
             if result.reasoning_content:
@@ -603,11 +658,15 @@ class ChatSession:
                         )
                     )
                     with tracking_context(phase="degeneration_recovery"):
+                        full_messages = await self._compact_before_llm(
+                            full_messages, reason="degeneration_recovery"
+                        )
                         result = await self.provider.complete(
                             messages=full_messages,
                             tools=None,
                             temperature=self.config.temperature,
                         )
+                    self._mark_force_compact_after_fallback("degeneration_recovery")
                     forced = result.message
                     if result.reasoning_content:
                         self.last_reasoning = (
@@ -709,11 +768,15 @@ class ChatSession:
                     )
                 )
                 with tracking_context(phase="loop_break"):
+                    full_messages = await self._compact_before_llm(
+                        full_messages, reason="loop_break"
+                    )
                     result = await self.provider.complete(
                         messages=full_messages,
                         tools=None,  # no tools — force text response
                         temperature=self.config.temperature,
                     )
+                self._mark_force_compact_after_fallback("loop_break")
                 forced = result.message
                 if result.reasoning_content:
                     self.last_reasoning = (
@@ -770,24 +833,6 @@ class ChatSession:
                     len(result),
                     _truncate(result, 200),
                 )
-
-            # Intra-turn compaction: tool outputs can blow the context mid-loop
-            # even when the turn started under the threshold. Re-check before
-            # the next LLM call so we don't bust the window.
-            if self._compactor:
-                system_content = self._build_system_content()
-                if self._compactor.should_compact(self._messages, system_content):
-                    logger.info(
-                        "Session '%s' — intra-turn compaction at iter %d",
-                        self.session_id,
-                        iterations,
-                    )
-                    result = await self._compactor.compact(
-                        self._messages, system_content, self.provider, self.session_id
-                    )
-                    if result.compacted:
-                        self._apply_compaction(result)
-                        full_messages = self._get_full_messages()
 
         # Max iterations reached
         logger.warning(
@@ -886,11 +931,15 @@ class ChatSession:
         current_trace_id.set(new_trace_id())
 
         with tracking_context(phase="chain_plan"):
+            plan_messages = await self._compact_before_llm(
+                plan_messages, reason="chain_plan"
+            )
             plan_result = await self.provider.complete(
                 messages=plan_messages,
                 tools=None,  # no tools in planning phase
                 temperature=self.config.temperature,
             )
+        self._mark_force_compact_after_fallback("chain_plan")
         plan_text = plan_result.message.content or ""
         logger.info(
             "Session '%s' — chain plan: %s", self.session_id, plan_text[:200]
@@ -917,11 +966,15 @@ class ChatSession:
         while iterations < self.config.max_iterations:
             iterations += 1
             with tracking_context(phase="chain_execute"):
+                full_messages = await self._compact_before_llm(
+                    full_messages, reason=f"chain_execute iter {iterations}"
+                )
                 result = await self.provider.complete(
                     messages=full_messages,
                     tools=tool_defs,
                     temperature=self.config.temperature,
                 )
+            self._mark_force_compact_after_fallback("chain_execute")
             response = result.message
             if result.reasoning_content:
                 self.last_reasoning = (
@@ -966,11 +1019,15 @@ class ChatSession:
         synth_messages.append(Message(role="user", content=synth_prompt))
 
         with tracking_context(phase="chain_synthesize"):
+            synth_messages = await self._compact_before_llm(
+                synth_messages, reason="chain_synthesize"
+            )
             synth_result = await self.provider.complete(
                 messages=synth_messages,
                 tools=None,
                 temperature=self.config.temperature,
             )
+        self._mark_force_compact_after_fallback("chain_synthesize")
         final_output = (
             _final_text(synth_result.message.content, synth_result.reasoning_content)
             or execution_output
@@ -1010,6 +1067,64 @@ class ChatSession:
             messages.append(Message(role="system", content=system_content))
         messages.extend(self._messages)
         return messages
+
+    async def _compact_before_llm(
+        self, full_messages: list[Message], *, reason: str
+    ) -> list[Message]:
+        """Compact persisted history before an LLM call if the local window is at risk."""
+        if not self._compactor:
+            return full_messages
+
+        system_content = self._build_system_content()
+        force = self._force_compact_next
+        if not force and not self._compactor.should_compact(
+            self._messages, system_content
+        ):
+            return full_messages
+
+        self._force_compact_next = False
+        persisted_full = self._get_full_messages()
+        extra_messages: list[Message] = []
+        if (
+            len(full_messages) >= len(persisted_full)
+            and full_messages[: len(persisted_full)] == persisted_full
+        ):
+            extra_messages = list(full_messages[len(persisted_full) :])
+
+        logger.info(
+            "Session '%s' — %s compaction before LLM call (%s)",
+            self.session_id,
+            "forced" if force else "preventive",
+            reason,
+        )
+        result = await self._compactor.compact(
+            self._messages,
+            system_content,
+            self.provider,
+            self.session_id,
+            force=force,
+        )
+        if result.compacted:
+            self._apply_compaction(result)
+            return self._get_full_messages() + extra_messages
+        return full_messages
+
+    def _mark_force_compact_after_fallback(self, phase: str) -> None:
+        """Force a compaction before the next local attempt after fallback was used."""
+        if not self._compactor:
+            return
+        idx = getattr(self.provider, "last_used_provider_index", None)
+        if not isinstance(idx, int) or idx <= 0:
+            return
+        used = getattr(self.provider, "last_used_provider", None)
+        self._force_compact_next = True
+        logger.info(
+            "Session '%s' — fallback provider used in phase '%s' (%s); "
+            "forcing compaction before next LLM call",
+            self.session_id,
+            phase,
+            used,
+        )
 
     def _apply_compaction(self, result) -> None:
         """Apply compaction result: archive, rewrite JSONL, update messages."""

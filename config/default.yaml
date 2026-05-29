@@ -51,7 +51,19 @@ fallback:
   # + mmap, ~/.local/bin/llamacpp-eyetor.sh). ollama queda fuera: con este
   # modelo no mmapea y el kernel lo mata por OOM en 15 GB de RAM.
   fallback_chain: [llamacpp, openrouter, gemini]
-  retry_on: [timeout, connection_error, "500", "502", "503", "529"]
+  retry_on:
+    - timeout
+    - connection_error
+    - malformed_response
+    - "400"
+    - "408"
+    - "413"
+    - "422"
+    - "429"
+    - "500"
+    - "502"
+    - "503"
+    - "529"
 
 skills_dirs:
   - ./skills
@@ -212,7 +224,7 @@ sessions:
   compaction:
     enabled: true
     context_window: 12288           # = n_ctx real del servidor llama.cpp (/props); mantener sincronizado si se cambia -c
-    trigger_at_percent: 0.80
+    trigger_at_percent: 0.70
     tool_output_max_chars: 2000
     keep_last_n_user_turns: 2
     summary_max_percent: 0.05

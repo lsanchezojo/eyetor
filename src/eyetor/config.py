@@ -128,7 +128,20 @@ class FallbackConfig(BaseModel):
     """Fallback chain configuration."""
 
     fallback_chain: list[str] = []
-    retry_on: list[str] = ["timeout", "connection_error", "500", "502", "503", "529"]
+    retry_on: list[str] = [
+        "timeout",
+        "connection_error",
+        "malformed_response",
+        "400",
+        "408",
+        "413",
+        "422",
+        "429",
+        "500",
+        "502",
+        "503",
+        "529",
+    ]
 
 
 class CompactionConfig(BaseModel):
