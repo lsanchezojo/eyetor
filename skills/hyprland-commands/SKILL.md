@@ -21,7 +21,7 @@ commands:
     args:
       - bye
   - name: hypr_shot
-    description: Captura la pantalla y la envía al chat.
+    description: "Captura un workspace y lo envía al chat. Uso: /hypr_shot [número]; vacío = activo."
     action: script
     script: hypr.py
     args:
@@ -77,7 +77,7 @@ status message. Each action is a subcommand:
 ```
 hypr.py hello                # hyprctl dispatch dpms on && brightnessctl -r
 hypr.py bye                  # hyprctl dispatch dpms off
-hypr.py shot                 # grimblast/grim screenshot -> image_path
+hypr.py shot [workspace]     # grim screenshot of a workspace (default: active) -> image_path
 hypr.py lock                 # loginctl lock-session (fallback: hyprlock)
 hypr.py status               # active window + monitors + workspaces
 hypr.py notify <text...>     # notify-send
@@ -87,11 +87,15 @@ hypr.py media play-pause|next|prev|stop # playerctl
 
 ## Notes
 - Requires `hyprctl` on the host PATH. Per action, also: `brightnessctl`
-  (hello), `grimblast` or `grim` (shot), `loginctl`/`hyprlock` (lock),
-  `notify-send`/libnotify (notify), `wpctl` or `pactl` (volume),
-  `playerctl` (media). Missing tools are reported as an error.
+  (hello), `grim` (shot; `grimblast` as fallback for the no-arg whole screen),
+  `loginctl`/`hyprlock` (lock), `notify-send`/libnotify (notify),
+  `wpctl` or `pactl` (volume), `playerctl` (media). Missing tools are reported
+  as an error.
 - The script must run in the same session as the Hyprland compositor
   (it relies on HYPRLAND_INSTANCE_SIGNATURE being set in the environment).
+- `shot` with a workspace number that is **not currently visible** switches to
+  it momentarily (a brief flicker on the host screen), captures, and restores
+  the previous workspace. A visible workspace is captured without switching.
 - Output is JSON: `{"ok": true, "message": "..."}` on success (the `shot`
   action also includes `"image_path"`, which the channel sends as a photo),
   or `{"error": "..."}` on failure.

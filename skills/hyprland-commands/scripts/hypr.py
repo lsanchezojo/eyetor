@@ -4,7 +4,7 @@
 Usage:
   hypr.py hello              Wake screens (DPMS on) and restore saved brightness.
   hypr.py bye                Turn screens off (DPMS off).
-  hypr.py shot               Take a screenshot and return its path.
+  hypr.py shot [workspace]   Screenshot a workspace (default: active) -> image_path.
   hypr.py lock               Lock the session.
   hypr.py status             Active window, monitors and workspaces summary.
   hypr.py notify <text...>   Show a desktop notification on the host screen.
@@ -43,6 +43,17 @@ def _run(cmd: list[str], timeout: float = 15.0) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
+def _hypr_json(*hypr_args: str):
+    """Run `hyprctl -j <args>` and return the parsed JSON, or None on failure."""
+    code, out, _err = _run(["hyprctl", "-j", *hypr_args])
+    if code != 0 or not out:
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+
 def cmd_hello(_args: argparse.Namespace) -> int:
     """hyprctl dispatch dpms on && brightnessctl -r"""
     for tool in ("hyprctl", "brightnessctl"):
@@ -72,23 +83,120 @@ def cmd_bye(_args: argparse.Namespace) -> int:
     return _emit({"ok": True, "message": "Pantallas apagadas."})
 
 
-def cmd_shot(_args: argparse.Namespace) -> int:
-    """Screenshot with grimblast (preferred) or grim, return its path."""
+def _grim_output(output: str, out_path: str) -> tuple[int, str]:
+    """Capture a single Hyprland output with grim. Returns (code, err)."""
+    code, _out, err = _run(["grim", "-o", output, out_path], timeout=20.0)
+    return code, err
+
+
+def _focused_monitor(monitors: list[dict]) -> dict | None:
+    for mon in monitors:
+        if mon.get("focused"):
+            return mon
+    return monitors[0] if monitors else None
+
+
+def cmd_shot(args: argparse.Namespace) -> int:
+    """Screenshot a Hyprland workspace (default: active) and return its path."""
+    if shutil.which("hyprctl") is None:
+        return _emit({"error": "'hyprctl' no está en el PATH"})
+
     out_path = os.path.join(
-        tempfile.gettempdir(), f"eyetor-shot-{int(time.time())}.png"
+        tempfile.gettempdir(), f"eyetor-shot-{time.time_ns()}.png"
     )
+    target = args.workspace
 
-    if shutil.which("grimblast") is not None:
-        code, _out, err = _run(["grimblast", "save", "screen", out_path], timeout=20.0)
-    elif shutil.which("grim") is not None:
-        code, _out, err = _run(["grim", out_path], timeout=20.0)
-    else:
-        return _emit({"error": "ni 'grimblast' ni 'grim' están en el PATH"})
+    monitors = _hypr_json("monitors") or []
 
-    if code != 0 or not os.path.exists(out_path):
-        return _emit({"error": f"la captura falló: {err or code}"})
+    # --- No parameter: capture the active workspace (focused output) ---
+    if target is None:
+        if shutil.which("grim") is None:
+            # Fallback: whole screen via grimblast when grim isn't available.
+            if shutil.which("grimblast") is None:
+                return _emit({"error": "ni 'grim' ni 'grimblast' están en el PATH"})
+            code, _out, err = _run(["grimblast", "save", "screen", out_path], timeout=20.0)
+            if code != 0 or not os.path.exists(out_path):
+                return _emit({"error": f"la captura falló: {err or code}"})
+            return _emit({"ok": True, "image_path": out_path, "message": "📸 Captura de pantalla"})
 
-    return _emit({"ok": True, "image_path": out_path, "message": "📸 Captura de pantalla"})
+        mon = _focused_monitor(monitors)
+        if mon is None:
+            return _emit({"error": "no se encontró ningún monitor"})
+        ws = (mon.get("activeWorkspace") or {}).get("id", "?")
+        code, err = _grim_output(mon["name"], out_path)
+        if code != 0 or not os.path.exists(out_path):
+            return _emit({"error": f"la captura falló: {err or code}"})
+        return _emit({
+            "ok": True,
+            "image_path": out_path,
+            "message": f"📸 Captura (workspace {ws} @ {mon['name']})",
+        })
+
+    # --- With parameter: capture a specific workspace ---
+    if shutil.which("grim") is None:
+        return _emit({"error": "'grim' es necesario para capturar un workspace concreto"})
+
+    target_id = int(target) if str(target).lstrip("-").isdigit() else target
+
+    workspaces = _hypr_json("workspaces") or []
+    if not any(ws.get("id") == target_id for ws in workspaces):
+        return _emit({"error": f"El workspace {target} no existe"})
+
+    def _monitor_showing(ws_id, mons: list[dict]) -> dict | None:
+        for mon in mons:
+            if (mon.get("activeWorkspace") or {}).get("id") == ws_id:
+                return mon
+        return None
+
+    # Already visible somewhere: capture directly, no switching.
+    visible = _monitor_showing(target_id, monitors)
+    if visible is not None:
+        code, err = _grim_output(visible["name"], out_path)
+        if code != 0 or not os.path.exists(out_path):
+            return _emit({"error": f"la captura falló: {err or code}"})
+        return _emit({
+            "ok": True,
+            "image_path": out_path,
+            "message": f"📸 Captura (workspace {target_id} @ {visible['name']})",
+        })
+
+    # Not visible: switch to it momentarily, capture, then restore.
+    focused = _focused_monitor(monitors)
+    if focused is None:
+        return _emit({"error": "no se encontró ningún monitor"})
+    prev_ws = (focused.get("activeWorkspace") or {}).get("id")
+
+    # Disable the switch animation so the capture isn't caught mid-transition
+    # (otherwise the frame shows a sliver of the previous/next workspace).
+    anim = _hypr_json("getoption", "animations:enabled")
+    prev_anim = anim.get("int", 1) if isinstance(anim, dict) else 1
+
+    try:
+        _run(["hyprctl", "keyword", "animations:enabled", "0"])
+        code, _out, err = _run(["hyprctl", "dispatch", "workspace", str(target_id)])
+        if code != 0:
+            return _emit({"error": f"no se pudo cambiar al workspace {target_id}: {err or code}"})
+        time.sleep(0.12)  # let the new frame render (no animation now)
+
+        now = _hypr_json("monitors") or monitors
+        shown = _monitor_showing(target_id, now) or _focused_monitor(now)
+        if shown is None:
+            return _emit({"error": "no se encontró el monitor tras conmutar"})
+        code, err = _grim_output(shown["name"], out_path)
+        if code != 0 or not os.path.exists(out_path):
+            return _emit({"error": f"la captura falló: {err or code}"})
+        return _emit({
+            "ok": True,
+            "image_path": out_path,
+            "message": f"📸 Captura (workspace {target_id} @ {shown['name']})",
+        })
+    finally:
+        # Restore the workspace while animations are still off (no flicker),
+        # then re-enable animations.
+        if prev_ws is not None:
+            _run(["hyprctl", "dispatch", "focusmonitor", focused["name"]])
+            _run(["hyprctl", "dispatch", "workspace", str(prev_ws)])
+        _run(["hyprctl", "keyword", "animations:enabled", str(prev_anim)])
 
 
 def cmd_lock(_args: argparse.Namespace) -> int:
@@ -119,31 +227,22 @@ def cmd_status(_args: argparse.Namespace) -> int:
     if shutil.which("hyprctl") is None:
         return _emit({"error": "'hyprctl' no está en el PATH"})
 
-    def _json(*hypr_args: str):
-        code, out, _err = _run(["hyprctl", "-j", *hypr_args])
-        if code != 0 or not out:
-            return None
-        try:
-            return json.loads(out)
-        except json.JSONDecodeError:
-            return None
-
     lines: list[str] = []
 
-    active = _json("activewindow")
+    active = _hypr_json("activewindow")
     if active and active.get("class"):
         title = active.get("title", "")
         lines.append(f"🪟 Ventana activa: {active['class']} — {title}".rstrip(" —"))
     else:
         lines.append("🪟 Ventana activa: ninguna")
 
-    monitors = _json("monitors") or []
+    monitors = _hypr_json("monitors") or []
     for mon in monitors:
         ws = (mon.get("activeWorkspace") or {}).get("id", "?")
         focused = " (enfocado)" if mon.get("focused") else ""
         lines.append(f"🖥️ {mon.get('name', '?')}: workspace {ws}{focused}")
 
-    workspaces = _json("workspaces") or []
+    workspaces = _hypr_json("workspaces") or []
     if workspaces:
         lines.append(f"🗂️ Workspaces activos: {len(workspaces)}")
 
@@ -237,7 +336,10 @@ def main(argv: list[str] | None = None) -> int:
     p_bye = sub.add_parser("bye", help="Turn screens off (DPMS off)")
     p_bye.set_defaults(func=cmd_bye)
 
-    p_shot = sub.add_parser("shot", help="Take a screenshot")
+    p_shot = sub.add_parser("shot", help="Screenshot a workspace (default: active)")
+    p_shot.add_argument(
+        "workspace", nargs="?", help="número de workspace; vacío = el activo"
+    )
     p_shot.set_defaults(func=cmd_shot)
 
     p_lock = sub.add_parser("lock", help="Lock the session")
