@@ -301,7 +301,7 @@ class TelegramChannel(BaseChannel):
                             return
                         user_args = (msg.text or "").split()[1:]
                         raw = await _run_skill_script(_path, _args + user_args)
-                        await _send_long(msg, raw, parse_mode=_pm)
+                        await _send_skill_script_result(msg, raw, parse_mode=_pm)
 
                 elif _cmd.action == "prompt":
                     _template = _cmd.prompt
@@ -959,6 +959,47 @@ async def _send_long(msg, text: str, parse_mode: str | None = None) -> None:
     """Send a potentially long message, splitting if it exceeds Telegram's limit."""
     for part in _split_message(text):
         await msg.answer(part, parse_mode=parse_mode)
+
+
+async def _send_skill_script_result(msg, raw: str, parse_mode: str | None = None) -> None:
+    """Render a skill script's stdout for a channel command.
+
+    Scripts conventionally print a JSON object. When that object carries an
+    ``image_path`` (e.g. a screenshot), the file is sent as a photo; otherwise
+    a human-friendly ``message``/``error`` is shown. Non-JSON output (or any
+    other shape) falls back to sending the raw text verbatim.
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        data = None
+
+    if not isinstance(data, dict):
+        await _send_long(msg, raw, parse_mode=parse_mode)
+        return
+
+    image_path = data.get("image_path")
+    message = data.get("message") or ""
+    if image_path and Path(image_path).exists():
+        from aiogram.types import FSInputFile
+
+        try:
+            await msg.answer_photo(FSInputFile(image_path), caption=message or None)
+            return
+        except Exception as exc:
+            logger.error("Failed to send skill image %s: %s", image_path, exc)
+            await _send_long(msg, message or f"[Image: {image_path}]", parse_mode=parse_mode)
+            return
+
+    if data.get("error"):
+        await _send_long(msg, f"⚠️ {data['error']}", parse_mode=parse_mode)
+        return
+
+    if message:
+        await _send_long(msg, message, parse_mode=parse_mode)
+        return
+
+    await _send_long(msg, raw, parse_mode=parse_mode)
 
 
 def _collect_image_paths(buffer: str, session) -> list[str]:
