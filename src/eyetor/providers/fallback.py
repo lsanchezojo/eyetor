@@ -104,9 +104,19 @@ class FallbackProvider(BaseProvider):
             try:
                 result = await provider.complete(messages, tools, temperature)
                 if _is_empty_completion(result) and idx < len(self._providers) - 1:
+                    usage = result.usage
                     logger.warning(
-                        "Provider %s returned empty completion, trying next in chain",
+                        "Provider %s returned empty completion "
+                        "(finish_reason=%s, model=%s, prompt_tokens=%s, "
+                        "completion_tokens=%s, content_len=%d, reasoning_len=%d), "
+                        "trying next in chain",
                         provider,
+                        result.finish_reason or "",
+                        result.model or provider.model,
+                        usage.prompt_tokens if usage else "",
+                        usage.completion_tokens if usage else "",
+                        len(result.message.content or ""),
+                        len(result.reasoning_content or ""),
                     )
                     last_empty = result
                     last_empty_idx = idx

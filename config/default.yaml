@@ -22,7 +22,7 @@ providers:
     temperature: 0.3   # bajado de 0.5: SLM Q4 más fiable en tool-calling sin decodificación degenerada
     thinking: true   # set to true to enable reasoning channel (Gemma-4, QwQ, etc.)
     request_timeout: 300
-    reasoning_budget: 1024
+    reasoning_budget: 384
     # Caps de generación para evitar que un modelo local se quede razonando
     # miles de tokens. Se aplican como max_tokens y n_predict.
     max_tokens: 1024

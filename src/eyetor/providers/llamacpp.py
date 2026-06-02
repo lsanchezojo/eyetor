@@ -23,6 +23,15 @@ from eyetor.streaming.parsers import extract_delta_content, extract_usage, parse
 
 logger = logging.getLogger(__name__)
 
+_NO_THINKING_PHASES = frozenset(
+    {
+        "compaction",
+        "degeneration_recovery",
+        "loop_break",
+        "chain_synthesize",
+    }
+)
+
 
 class LlamaCppProvider(BaseProvider):
     """Provider adapter for llama.cpp server's OpenAI-compatible API.
@@ -75,8 +84,9 @@ class LlamaCppProvider(BaseProvider):
         # Adding a contradictory JSON-format hint makes Qwen3 flip-flop
         # between formats and degrades tool-name fidelity.
         payload = super()._build_payload(messages, tools, temperature, stream)
-        if self.thinking:
-            payload["chat_template_kwargs"] = {"enable_thinking": True}
+        thinking_enabled = self._thinking_enabled_for_current_phase()
+        payload["chat_template_kwargs"] = {"enable_thinking": thinking_enabled}
+        if thinking_enabled:
             if self.reasoning_budget is not None and self.reasoning_budget > 0:
                 payload["reasoning_budget_tokens"] = self.reasoning_budget
         max_tokens = self._max_tokens_for_current_phase()
@@ -87,18 +97,27 @@ class LlamaCppProvider(BaseProvider):
             payload["n_predict"] = max_tokens
         return payload
 
+    def _thinking_enabled_for_current_phase(self) -> bool:
+        if not self.thinking:
+            return False
+        phase = self._current_phase()
+        return phase not in _NO_THINKING_PHASES
+
     def _max_tokens_for_current_phase(self) -> int | None:
         if not self.max_tokens_by_phase:
             return self.max_tokens
-        try:
-            from eyetor.tracking.context import current_phase
-
-            phase = current_phase.get()
-        except Exception:  # pragma: no cover - defensive fallback
-            phase = ""
+        phase = self._current_phase()
         if phase and phase in self.max_tokens_by_phase:
             return int(self.max_tokens_by_phase[phase])
         return self.max_tokens
+
+    def _current_phase(self) -> str:
+        try:
+            from eyetor.tracking.context import current_phase
+
+            return current_phase.get()
+        except Exception:  # pragma: no cover - defensive fallback
+            return ""
 
     # ------------------------------------------------------------------
     # Non-streaming
