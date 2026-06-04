@@ -1246,7 +1246,7 @@ def _format_usage_text(tracker, session_id: str | None = None) -> str:
     ]
     day_label = f"{day_names[now.weekday()]} {now.day} {month_names[now.month - 1]}"
 
-    lines: list[str] = [f"<b>📊 Uso — {day_label}</b>"]
+    lines: list[str] = [f"<b>📊 Uso · {day_label}</b>", "━━━━━━━━━━━━━━━━"]
 
     # --- Session totals (if session_id provided) ---
     day_records = tracker.get_records(period="day")
@@ -1259,10 +1259,9 @@ def _format_usage_text(tracker, session_id: str | None = None) -> str:
             s_cost = sum(r.estimated_cost for r in sess_records)
             cost_str = f"${s_cost:.4f}" if s_cost > 0 else "$0"
             lines.append(
-                f"\n💬 <b>Esta sesión</b>"
-                f"\n  Tokens: {_fmt_num(s_prompt)} prompt · {_fmt_num(s_comp)} completion"
-                f"\n  Coste: {cost_str}"
-                f"\n  Llamadas: {len(sess_records)}"
+                f"\n💬 <b>Sesión actual</b>"
+                f"\n   {len(sess_records)} ll · "
+                f"{_fmt_num(s_prompt)}→{_fmt_num(s_comp)} tok · {cost_str}"
             )
 
     # --- Individual calls for today, grouped by (provider, model) ---
@@ -1279,25 +1278,30 @@ def _format_usage_text(tracker, session_id: str | None = None) -> str:
 
     for (provider, model), calls in groups.items():
         emoji = _provider_emoji(provider)
+        provider_label = _escape_html(provider)
         model_label = _escape_html(_model_short(model))
         shown = list(reversed(calls[-_MAX_CALLS_SHOWN:]))
         hidden = len(calls) - _MAX_CALLS_SHOWN
         label_extra = f" (últimas {_MAX_CALLS_SHOWN})" if hidden > 0 else ""
-        lines.append(f"\n{emoji} <b>{model_label}</b>{label_extra}")
+        lines.append(f"\n{emoji} <b>{provider_label}</b> · {model_label}{label_extra}")
 
-        for r in shown:
+        total_cost = sum(r.estimated_cost for r in calls)
+        total_tok = sum(r.prompt_tokens + r.completion_tokens for r in calls)
+        cost_sum = f"${total_cost:.4f}" if total_cost > 0 else "$0"
+        lines.append(
+            f"   {len(calls)} ll · {_fmt_num(total_tok)} tok · {cost_sum}"
+        )
+
+        for i, r in enumerate(shown):
+            branch = "└" if i == len(shown) - 1 else "├"
             ts_local = datetime.fromisoformat(r.timestamp) + utc_offset
             hhmm = ts_local.strftime("%H:%M")
-            tok = (
-                f"{_fmt_num(r.prompt_tokens)} → {_fmt_num(r.completion_tokens)} tokens"
-            )
-            cost = f"${r.estimated_cost:.4f}" if r.estimated_cost > 0 else "$0"
+            tok = f"{_fmt_num(r.prompt_tokens)}→{_fmt_num(r.completion_tokens)}"
             speed = f"{r.speed_tps:.1f} tps".replace(".", ",") if r.speed_tps else "—"
             finish = r.finish_reason or "—"
-            lines.append(f"  <code>{hhmm}</code>  {tok} | {cost} | {speed} | {finish}")
-
-        total_tok = sum(r.prompt_tokens + r.completion_tokens for r in calls)
-        lines.append(f"  ─ {len(calls)} llamadas · {_fmt_num(total_tok)} tok")
+            lines.append(
+                f"   {branch} <code>{hhmm}</code>  {tok}  {speed}  {finish}"
+            )
 
     # --- Breakdown by phase / agent (today) ---
     def _agg(key_fn, recs):
@@ -1357,25 +1361,13 @@ def _format_usage_text(tracker, session_id: str | None = None) -> str:
 
     lines.append("\n──────────────")
     lines.append(
-        _footer_line("Hoy   ", day_prompt, day_comp, day_calls, day_tool, day_cost)
+        _footer_line("📅 Hoy   ", day_prompt, day_comp, day_calls, day_tool, day_cost)
     )
     lines.append(
-        _footer_line("Semana", week_prompt, week_comp, week_calls, week_tool, week_cost)
-    )
-
-    # Media/día (semana)
-    week_days = 7
-    if week_calls > 0:
-        avg_prompt = week_prompt // week_days
-        avg_comp = week_comp // week_days
-        avg_calls = week_calls // week_days
-        avg_tool = week_tool // week_days
-        avg_cost = week_cost / week_days
-        lines.append(
-            _footer_line(
-                "Promedio diario ", avg_prompt, avg_comp, avg_calls, avg_tool, avg_cost
-            )
+        _footer_line(
+            "📆 Semana", week_prompt, week_comp, week_calls, week_tool, week_cost
         )
+    )
 
     return "\n".join(lines)
 
