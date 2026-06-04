@@ -77,6 +77,7 @@ class LlamaCppProvider(BaseProvider):
         tools: list[ToolDefinition] | None,
         temperature: float,
         stream: bool = False,
+        force_no_thinking: bool = False,
     ) -> dict[str, Any]:
         # NOTE: we do NOT inject a tool-format hint here. The GGUF's chat
         # template already teaches the model the exact XML pythonic format
@@ -84,7 +85,7 @@ class LlamaCppProvider(BaseProvider):
         # Adding a contradictory JSON-format hint makes Qwen3 flip-flop
         # between formats and degrades tool-name fidelity.
         payload = super()._build_payload(messages, tools, temperature, stream)
-        thinking_enabled = self._thinking_enabled_for_current_phase()
+        thinking_enabled = self._thinking_enabled_for_current_phase(force_no_thinking)
         payload["chat_template_kwargs"] = {"enable_thinking": thinking_enabled}
         if thinking_enabled:
             if self.reasoning_budget is not None and self.reasoning_budget > 0:
@@ -97,8 +98,10 @@ class LlamaCppProvider(BaseProvider):
             payload["n_predict"] = max_tokens
         return payload
 
-    def _thinking_enabled_for_current_phase(self) -> bool:
-        if not self.thinking:
+    def _thinking_enabled_for_current_phase(
+        self, force_no_thinking: bool = False
+    ) -> bool:
+        if force_no_thinking or not self.thinking:
             return False
         phase = self._current_phase()
         return phase not in _NO_THINKING_PHASES
@@ -129,7 +132,48 @@ class LlamaCppProvider(BaseProvider):
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
     ) -> CompletionResult:
-        payload = self._build_payload(messages, tools, temperature, stream=False)
+        thinking_enabled = self._thinking_enabled_for_current_phase()
+        result = await self._complete_once(
+            messages, tools, temperature, force_no_thinking=False
+        )
+        # Think-only degeneration: with the reasoning channel open, Qwen3 Q4
+        # sometimes emits a tiny <think> block then EOS with no content and no
+        # tool_call. The reasoning is usually too short to hold a leaked
+        # <tool_call>, so it would escalate to a remote provider. Retry ONCE
+        # locally with thinking disabled before giving up — non-thinking mode
+        # is far more reliable at directly emitting a tool_call or an answer.
+        if thinking_enabled and _is_degenerate_completion(result):
+            logger.info(
+                "llama.cpp: empty think-only completion (phase=%s, reasoning=%dch); "
+                "retrying once with thinking disabled",
+                self._current_phase() or "?",
+                len((result.reasoning_content or "").strip()),
+            )
+            retry = await self._complete_once(
+                messages, tools, temperature, force_no_thinking=True
+            )
+            if _is_degenerate_completion(retry):
+                logger.warning(
+                    "llama.cpp: no-thinking retry still empty (phase=%s); "
+                    "escalating. First-pass reasoning: %s",
+                    self._current_phase() or "?",
+                    (result.reasoning_content or "").strip()[:200],
+                )
+            return retry
+        return result
+
+    async def _complete_once(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        temperature: float,
+        *,
+        force_no_thinking: bool,
+    ) -> CompletionResult:
+        payload = self._build_payload(
+            messages, tools, temperature, stream=False,
+            force_no_thinking=force_no_thinking,
+        )
         async with self._client(timeout=self.request_timeout) as client:
             response = await client.post(
                 f"{self.base_url}/chat/completions",
@@ -146,7 +190,7 @@ class LlamaCppProvider(BaseProvider):
             response.raise_for_status()
             data = response.json()
             result = _parse_completion_response(data)
-            if self.thinking:
+            if self.thinking and not force_no_thinking:
                 reasoning = _extract_reasoning(data)
                 if reasoning:
                     result.reasoning_content = reasoning
@@ -242,6 +286,18 @@ class LlamaCppProvider(BaseProvider):
 # ------------------------------------------------------------------
 # Reasoning helpers
 # ------------------------------------------------------------------
+
+def _is_degenerate_completion(result: CompletionResult) -> bool:
+    """True when the model returned no usable output (no content, no tool_call).
+
+    Mirrors ``FallbackProvider._is_empty_completion`` but lives here so the
+    provider can self-recover before the fallback chain ever escalates.
+    """
+    message = result.message
+    if message.tool_calls:
+        return False
+    return not (message.content or "").strip()
+
 
 def _extract_reasoning(data: dict[str, Any]) -> str | None:
     """Extract reasoning_content from a non-streaming response."""

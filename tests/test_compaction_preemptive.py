@@ -96,7 +96,12 @@ def test_preventive_compaction_runs_before_model_call() -> None:
     assert provider.calls[1][-1] == Message(role="user", content="new question")
 
 
-def test_fallback_marks_next_call_for_forced_compaction() -> None:
+def test_fallback_skips_forced_compaction_when_context_low() -> None:
+    """A fallback on a low-context degeneration must NOT trigger compaction.
+
+    The escalation was not caused by context overflow (e.g. an empty
+    think-only completion at 46% of the window), so compacting is wasteful.
+    """
     provider = _FallbackMarkerProvider()
     root = VectorConfig(
         sessions=SessionsConfig(
@@ -113,7 +118,28 @@ def test_fallback_marks_next_call_for_forced_compaction() -> None:
     assert asyncio.run(session.send_sync("first")) == "final 1"
     assert asyncio.run(session.send_sync("second")) == "final 2"
 
-    assert len(provider.calls) == 3
-    assert provider.calls[0][-1] == Message(role="user", content="first")
-    assert _is_summary_call(provider.calls[1])
-    assert provider.calls[2][-1] == Message(role="user", content="second")
+    # No summary call: forced compaction is skipped because context is low.
+    assert len(provider.calls) == 2
+    assert not any(_is_summary_call(c) for c in provider.calls)
+
+
+def test_fallback_forces_compaction_when_context_high() -> None:
+    """When context is genuinely under pressure, the forced flag is still set."""
+    provider = _FallbackMarkerProvider()
+    root = VectorConfig(
+        sessions=SessionsConfig(
+            compaction=CompactionConfig(
+                enabled=True,
+                context_window=20,
+                trigger_at_percent=0.5,
+                keep_last_n_user_turns=1,
+            )
+        )
+    )
+    session = _session(provider, root)
+    provider.last_used_provider_index = 1
+    session._messages = [Message(role="user", content="old " * 80)]
+
+    session._mark_force_compact_after_fallback("main")
+
+    assert session._force_compact_next is True

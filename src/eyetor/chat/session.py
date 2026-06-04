@@ -1110,13 +1110,32 @@ class ChatSession:
         return full_messages
 
     def _mark_force_compact_after_fallback(self, phase: str) -> None:
-        """Force a compaction before the next local attempt after fallback was used."""
+        """Force a compaction before the next local attempt after fallback was used.
+
+        The intent is to give the local model a smaller context on the next
+        attempt when the escalation was plausibly caused by context overflow.
+        But a fallback can also fire on a low-context degeneration (e.g. an
+        empty think-only completion at 46% of the window), in which case
+        compacting is pure overhead. Only force it when context is actually
+        under pressure — reuse the compactor's own trigger.
+        """
         if not self._compactor:
             return
         idx = getattr(self.provider, "last_used_provider_index", None)
         if not isinstance(idx, int) or idx <= 0:
             return
         used = getattr(self.provider, "last_used_provider", None)
+        if not self._compactor.should_compact(
+            self._messages, self._build_system_content()
+        ):
+            logger.info(
+                "Session '%s' — fallback provider used in phase '%s' (%s); "
+                "context below trigger, skipping forced compaction",
+                self.session_id,
+                phase,
+                used,
+            )
+            return
         self._force_compact_next = True
         logger.info(
             "Session '%s' — fallback provider used in phase '%s' (%s); "

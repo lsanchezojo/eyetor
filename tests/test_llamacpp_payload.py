@@ -2,9 +2,118 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+
+import httpx
+
 from eyetor.models.messages import Message
 from eyetor.providers.llamacpp import LlamaCppProvider
 from eyetor.tracking.context import tracking_context
+
+
+def _completion_response(content: str = "", reasoning: str | None = None) -> dict:
+    message: dict = {"role": "assistant", "content": content}
+    if reasoning is not None:
+        message["reasoning_content"] = reasoning
+    return {
+        "choices": [{"message": message, "finish_reason": "stop"}],
+        "model": "default",
+        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+    }
+
+
+class _QueuedTransport:
+    """Serves queued JSON responses and records each request body."""
+
+    def __init__(self, provider: LlamaCppProvider, responses: list[dict]) -> None:
+        self.responses = responses
+        self.requests: list[dict] = []
+        self._transport = httpx.MockTransport(self._handler)
+        orig_client = provider._client
+
+        def _client(timeout: float = 120.0) -> httpx.AsyncClient:
+            client = orig_client(timeout=timeout)
+            client._transport = self._transport
+            return client
+
+        provider._client = _client  # type: ignore[method-assign]
+
+    def _handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(json.loads(request.content))
+        payload = self.responses.pop(0)
+        return httpx.Response(200, json=payload)
+
+
+def test_complete_retries_without_thinking_on_think_only_degeneration() -> None:
+    provider = LlamaCppProvider(
+        base_url="http://localhost:8080/v1",
+        model="default",
+        thinking=True,
+        reasoning_budget=384,
+    )
+    transport = _QueuedTransport(
+        provider,
+        [
+            _completion_response(content="", reasoning="hmm"),  # degenerate
+            _completion_response(content="aquí tienes"),         # retry succeeds
+        ],
+    )
+
+    with tracking_context(phase="main"):
+        result = asyncio.run(
+            provider.complete([Message(role="user", content="lista")])
+        )
+
+    assert result.message.content == "aquí tienes"
+    assert len(transport.requests) == 2
+    assert transport.requests[0]["chat_template_kwargs"]["enable_thinking"] is True
+    assert transport.requests[1]["chat_template_kwargs"]["enable_thinking"] is False
+    assert "reasoning_budget_tokens" not in transport.requests[1]
+
+
+def test_complete_no_retry_when_first_pass_usable() -> None:
+    provider = LlamaCppProvider(
+        base_url="http://localhost:8080/v1",
+        model="default",
+        thinking=True,
+    )
+    transport = _QueuedTransport(
+        provider, [_completion_response(content="respuesta directa")]
+    )
+
+    with tracking_context(phase="main"):
+        result = asyncio.run(
+            provider.complete([Message(role="user", content="hola")])
+        )
+
+    assert result.message.content == "respuesta directa"
+    assert len(transport.requests) == 1
+
+
+def test_complete_propagates_double_empty(caplog) -> None:
+    provider = LlamaCppProvider(
+        base_url="http://localhost:8080/v1",
+        model="default",
+        thinking=True,
+    )
+    transport = _QueuedTransport(
+        provider,
+        [
+            _completion_response(content="", reasoning="a"),
+            _completion_response(content=""),
+        ],
+    )
+
+    with tracking_context(phase="main"):
+        result = asyncio.run(
+            provider.complete([Message(role="user", content="hola")])
+        )
+
+    # Both passes empty → the empty retry is returned so FallbackProvider escalates.
+    assert (result.message.content or "") == ""
+    assert len(transport.requests) == 2
+    assert "no-thinking retry still empty" in caplog.text
 
 
 def test_llamacpp_sets_global_generation_cap() -> None:
