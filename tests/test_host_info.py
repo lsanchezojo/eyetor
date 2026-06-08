@@ -78,9 +78,9 @@ def test_host_prompt_tells_agent_not_to_assume_wrong_manager() -> None:
         }
     )
 
-    assert "Sistema operativo: CachyOS" in prompt
-    assert "Gestor preferido: paru" in prompt
-    assert "No uses ni asumas estos gestores" in prompt
+    assert "Operating system: CachyOS" in prompt
+    assert "Preferred manager: paru" in prompt
+    assert "Do not use or assume these managers" in prompt
     assert "apt-get" in prompt
     assert "command -v" in prompt
 
@@ -103,10 +103,10 @@ def test_host_prompt_mentions_install_package_when_helper_enabled() -> None:
         }
     )
 
-    assert "usa la herramienta `install_package`" in prompt
-    assert "no invoques `sudo` directamente" in prompt
-    assert "Estrategia de instalacion: auto" in prompt
-    assert "decide automaticamente" in prompt
+    assert "use the `install_package` tool" in prompt
+    assert "do not invoke `sudo` directly" in prompt
+    assert "Install strategy: auto" in prompt
+    assert "automatically picks" in prompt
 
 
 def test_host_profile_roundtrip(tmp_path: Path) -> None:

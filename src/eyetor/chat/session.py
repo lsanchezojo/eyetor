@@ -1368,73 +1368,51 @@ class ChatSession:
             ToolDefinition(
                 name="schedule_task",
                 description=(
-                    "Programa una tarea que se ejecuta automáticamente. Tres modos:\n"
-                    "\n"
-                    "1) ONE-SHOT (un solo disparo) — usa una fecha-hora absoluta o relativa:\n"
-                    "   - Absoluta: '2026-04-16 09:00' o 'at 2026-04-16T09:00:00'\n"
-                    "   - Relativa: 'next thursday at 9', 'next monday at 18:30', 'tomorrow at 8'\n"
-                    "\n"
-                    "2) RECURRENTE por cron de 5 campos ('m h dom mon dow'):\n"
-                    "   - '0 9 * * *' = cada día a las 9:00\n"
-                    "   - '0 9 * * 4' = todos los jueves a las 9:00 (dow: 0=domingo, 4=jueves)\n"
-                    "   - '30 18 * * 1-5' = lunes a viernes a las 18:30\n"
-                    "\n"
-                    "3) INTERVALO: 'every 30m', 'every 2h', 'every 1d'.\n"
-                    "\n"
-                    "REGLAS OBLIGATORIAS — léelas antes de llamar:\n"
-                    "- Si el usuario dice 'el jueves', 'el lunes', 'el día X' (singular, sin "
-                    "  'cada' ni 'todos los'), interprétalo como ONE-SHOT del próximo jueves/"
-                    "  lunes/etc. NO crees un cron recurrente.\n"
-                    "- Si el usuario dice 'los jueves', 'cada lunes', 'todos los días', es "
-                    "  RECURRENTE (cron o intervalo).\n"
-                    "- Si el usuario NO especifica hora, NO inventes una. PREGÚNTASELA "
-                    "  primero y vuelve a llamar a esta herramienta cuando la sepas. "
-                    "  Nunca uses 00:00 ni 09:00 por defecto.\n"
-                    "- Si la hora es 00:00 (medianoche), debe ser porque el usuario lo pidió "
-                    "  explícitamente. En ese caso pasa user_confirmed_midnight=true.\n"
-                    "- Tras crear la tarea, confirma al usuario el modo (one-shot o "
-                    "  recurrente) y la próxima ejecución exacta que devuelve la herramienta "
-                    "  en el campo 'next_run'.\n"
-                    "\n"
-                    "Notify: 'telegram' (envía a este chat), 'log' (escribe a fichero), "
-                    "'none' (silencioso)."
+                    "Schedule an automatic task. 3 'schedule' modes: "
+                    "ONE-SHOT ('2026-04-16 09:00', 'next thursday at 9', 'tomorrow at 8'); "
+                    "RECURRING 5-field cron m h dom mon dow ('0 9 * * 4' = Thursday 9:00, "
+                    "dow 0=Sun..6=Sat); INTERVAL ('every 30m', 'every 2h', 'every 1d'). "
+                    "Spanish input rules: 'el jueves' (singular) = ONE-SHOT next Thursday, "
+                    "NOT cron; 'los jueves'/'cada' = recurring. If no time is given, ask for "
+                    "it (do not invent 00:00 or 09:00); for midnight, confirm and pass "
+                    "user_confirmed_midnight=true. After creating, confirm the mode and 'next_run'."
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
                         "name": {
                             "type": "string",
-                            "description": "Nombre corto y descriptivo (p. ej. 'Comprar pan')",
+                            "description": "Short descriptive name (e.g. 'Comprar pan')",
                         },
                         "prompt": {
                             "type": "string",
-                            "description": "El mensaje que se enviará al agente cuando la tarea se dispare",
+                            "description": "The message sent to the agent when the task fires",
                         },
                         "schedule": {
                             "type": "string",
                             "description": (
-                                "Cuándo ejecutar. One-shot: '2026-04-16 09:00', "
+                                "When to run. One-shot: '2026-04-16 09:00', "
                                 "'next thursday at 9', 'tomorrow at 18:00'. "
-                                "Recurrente: cron 5 campos '0 9 * * 4'. "
-                                "Intervalo: 'every 30m', 'every 2h', 'every 1d'."
+                                "Recurring: 5-field cron '0 9 * * 4'. "
+                                "Interval: 'every 30m', 'every 2h', 'every 1d'."
                             ),
                         },
                         "notify": {
                             "type": "string",
                             "enum": ["telegram", "log", "none"],
-                            "description": "Dónde entregar el resultado. Default: 'telegram'",
+                            "description": "Where to deliver the result. Default: 'telegram'",
                         },
                         "timezone": {
                             "type": "string",
-                            "description": "Zona horaria para crons y fechas relativas (p. ej. 'Europe/Madrid'). Default: 'Europe/Madrid'",
+                            "description": "Timezone for crons and relative dates (e.g. 'Europe/Madrid'). Default: 'Europe/Madrid'",
                         },
                         "notify_target_override": {
                             "type": "string",
-                            "description": "Sobrescribe la ruta del log (solo si notify='log'). Déjalo vacío para el default.",
+                            "description": "Overrides the log path (only if notify='log'). Leave empty for the default.",
                         },
                         "user_confirmed_midnight": {
                             "type": "boolean",
-                            "description": "Pasa true SOLO si el usuario ha pedido medianoche explícitamente. Por defecto false.",
+                            "description": "Pass true ONLY if the user explicitly asked for midnight. Default false.",
                         },
                     },
                     "required": ["name", "prompt", "schedule"],
@@ -1456,24 +1434,23 @@ class ChatSession:
             ToolDefinition(
                 name="cancel_task",
                 description=(
-                    "Cancela y elimina una tarea programada. Puedes pasar task_id "
-                    "(preferido, exacto) o name (búsqueda por subcadena, case-insensitive). "
-                    "Si pasas name y hay múltiples coincidencias, la herramienta devuelve "
-                    "'ambiguous' con la lista de candidatos para que pidas confirmación al "
-                    "usuario antes de volver a llamar con el task_id correcto. Cuando el "
-                    "usuario te diga 'borra esa tarea', 'cancela el recordatorio del pan' "
-                    "o similar, llama primero a list_tasks o usa directamente name."
+                    "Cancel and delete a scheduled task. Pass task_id (preferred, exact) "
+                    "or name (case-insensitive substring search). If name matches multiple "
+                    "tasks, the tool returns 'ambiguous' with the candidate list so you ask "
+                    "the user to confirm before calling again with the right task_id. When "
+                    "the user says 'borra esa tarea', 'cancela el recordatorio del pan' or "
+                    "similar, call list_tasks first or use name directly."
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
                         "task_id": {
                             "type": "string",
-                            "description": "El ID exacto de la tarea (devuelto por list_tasks o schedule_task).",
+                            "description": "The exact task ID (returned by list_tasks or schedule_task).",
                         },
                         "name": {
                             "type": "string",
-                            "description": "Nombre o fragmento del nombre de la tarea (búsqueda por subcadena).",
+                            "description": "Task name or name fragment (substring search).",
                         },
                     },
                     "required": [],

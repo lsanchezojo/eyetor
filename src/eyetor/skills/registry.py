@@ -75,41 +75,44 @@ class SkillRegistry:
         """
         if not skill_names:
             return ""
+        # The purpose of each skill is already in its `skill_<name>` tool
+        # description, so it is NOT repeated here (that duplication cost ~1k
+        # prompt tokens every turn). This section only carries the extra
+        # detail the tool schema lacks: subcommands/flags and Telegram
+        # commands. Skills with no such extras are omitted entirely.
         parts = [
-            "## Available Skills",
+            "## Skill subcommands",
             (
-                "> **Skill tool call format:** pass only subcommands and flags in `args`. "
-                "Code blocks in skill docs show manual shell usage (with script paths or "
-                "variables like `$PWCLI`) — omit those prefixes when calling the tool."
-            ),
-            (
-                "Use the skill tool named `skill_<skill_name>` and pass only the "
-                "script/subcommand and flags in `args`."
+                "Each skill is the tool `skill_<name>` (purpose in its tool description). "
+                "Pass only the subcommand and flags in `args` — omit script paths or "
+                "vars like `$PWCLI` that appear in any docs."
             ),
         ]
         for name in skill_names:
             try:
                 meta = self.get_metadata(name)
                 scripts = self.list_scripts(name)
-                parts.append(f"\n### Skill: {name}")
-                parts.append(meta.description)
+                lines: list[str] = []
                 if meta.commands:
                     cmds = ", ".join(
                         f"/{c.name} ({c.description})" for c in meta.commands
                     )
-                    parts.append(f"Telegram commands: {cmds}")
+                    lines.append(f"Telegram commands: {cmds}")
                 if scripts:
-                    parts.append("Scripts:")
                     strip_script_prefix = len(scripts) == 1
                     for script in scripts:
                         usage = _script_usage_summary(
                             script,
                             strip_script_prefix=strip_script_prefix,
                         )
-                        if usage:
-                            parts.append(f"- {script.name}: {usage}")
-                        else:
-                            parts.append(f"- {script.name}")
+                        lines.append(
+                            f"- {script.name}: {usage}" if usage else f"- {script.name}"
+                        )
+                if not lines:
+                    continue
+                tool_name = f"skill_{name.replace('-', '_')}"
+                parts.append(f"\n### {tool_name}")
+                parts.extend(lines)
             except KeyError:
                 logger.warning("Skill not found in registry: %s", name)
         return "\n".join(parts)

@@ -230,33 +230,33 @@ def format_host_prompt(profile: dict[str, Any] | None) -> str:
     preferred = profile.get("preferred_package_manager") or ""
 
     lines = [
-        "## Entorno del sistema",
-        f"Sistema operativo: {profile.get('os_name') or 'desconocido'}",
-        f"Familia/compatibilidad: {', '.join(os_like) if os_like else 'desconocida'}",
-        f"Plataforma: {profile.get('platform') or '?'} {profile.get('platform_release') or ''}".strip(),
-        f"Arquitectura: {profile.get('machine') or '?'}",
-        f"Gestores de paquetes disponibles: {', '.join(managers) if managers else 'ninguno detectado'}",
+        "## System environment",
+        f"Operating system: {profile.get('os_name') or 'unknown'}",
+        f"Family/compatibility: {', '.join(os_like) if os_like else 'unknown'}",
+        f"Platform: {profile.get('platform') or '?'} {profile.get('platform_release') or ''}".strip(),
+        f"Architecture: {profile.get('machine') or '?'}",
+        f"Available package managers: {', '.join(managers) if managers else 'none detected'}",
     ]
     if preferred:
-        lines.append(f"Gestor preferido: {preferred}")
+        lines.append(f"Preferred manager: {preferred}")
     if avoid:
-        lines.append(f"No uses ni asumas estos gestores en este host: {', '.join(avoid)}")
+        lines.append(f"Do not use or assume these managers on this host: {', '.join(avoid)}")
     if profile.get("can_install_system_packages") and profile.get("install_helper_command"):
         lines.append(
-            "Instalacion autonoma habilitada: usa la herramienta `install_package` "
-            "para paquetes del sistema; no invoques `sudo` directamente."
+            "Autonomous install enabled: use the `install_package` tool for system "
+            "packages; do not invoke `sudo` directly."
         )
         lines.append(
-            "Si falta una herramienta del sistema, no uses `skill_shell` con pacman, paru, yay, apt-get, dnf, zypper ni apk; "
-            "llama primero a `install_package` con el nombre del paquete."
+            "If a system tool is missing, do not use `skill_shell` with pacman, paru, yay, apt-get, dnf, zypper or apk; "
+            "call `install_package` first with the package name."
         )
-        lines.append(f"Estrategia de instalacion: {profile.get('install_strategy') or 'auto'}")
-        lines.append(f"Helper de instalacion: {profile['install_helper_command']} <package>")
-        lines.append("El helper decide automaticamente el metodo correcto segun el sistema operativo detectado.")
+        lines.append(f"Install strategy: {profile.get('install_strategy') or 'auto'}")
+        lines.append(f"Install helper: {profile['install_helper_command']} <package>")
+        lines.append("The helper automatically picks the right method for the detected OS.")
     else:
-        lines.append("Instalacion autonoma de paquetes del sistema: no configurada.")
-    lines.append("Antes de instalar una herramienta, comprueba si ya existe con `command -v <binario>`.")
-    lines.append("No cambies de gestor de paquetes salvo que la deteccion del host lo justifique.")
+        lines.append("Autonomous system-package install: not configured.")
+    lines.append("Before installing a tool, check whether it already exists with `command -v <binary>`.")
+    lines.append("Do not switch package managers unless host detection justifies it.")
     return "\n".join(lines)
 
 
