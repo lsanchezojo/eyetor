@@ -25,6 +25,11 @@ class ToolDefinition(BaseModel):
     description: str
     parameters: dict[str, Any]  # JSON Schema object
     handler: Callable[..., Awaitable[str]] | None = None
+    # Conditional-loading group. None = always sent to the model. A named
+    # group (e.g. "scheduler", "image") is only sent when the turn's gating
+    # selects it — see eyetor.chat.tool_gating. Keeps rarely-used tool schemas
+    # out of the prompt on trivial turns.
+    group: str | None = None
 
     def to_openai_format(self) -> dict[str, Any]:
         """Serialize to OpenAI tools array element."""

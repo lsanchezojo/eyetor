@@ -437,6 +437,7 @@ def start(
                         "required": ["package"],
                     },
                     handler=install_package_handler,
+                    group="install",
                 )
             )
         if skill_names:
@@ -617,12 +618,13 @@ def start(
                         "required": ["prompt"],
                     },
                     handler=generate_image_handler,
+                    group="image",
                 )
             )
 
             base_system += (
-                "\n\nCuando generes una imagen con generate_image, incluye la ruta en tu respuesta "
-                "con el formato [IMAGE:/ruta/al/archivo.png] para que se muestre correctamente al usuario."
+                "\n\nWhen you generate an image with generate_image, include the path in your "
+                "reply as [IMAGE:/path/to/file.png] so it is shown to the user correctly."
             )
 
         # Knowledge base tools
@@ -738,6 +740,7 @@ def start(
                         "required": ["query"],
                     },
                     handler=kb_search_handler,
+                    group="kb",
                 )
             )
 
@@ -767,6 +770,7 @@ def start(
                         "required": ["doc_id"],
                     },
                     handler=kb_read_handler,
+                    group="kb",
                 )
             )
 
@@ -792,6 +796,7 @@ def start(
                         "required": [],
                     },
                     handler=kb_list_sources_handler,
+                    group="kb",
                 )
             )
 

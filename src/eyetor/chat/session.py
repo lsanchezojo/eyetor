@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 from typing import AsyncIterator, TYPE_CHECKING
 
+from eyetor.chat.tool_gating import KNOWN_GROUPS, select_groups
 from eyetor.models.agents import AgentConfig
 from eyetor.models.messages import Message, ToolCall
 from eyetor.models.tools import ToolRegistry, ToolDefinition
@@ -275,6 +276,18 @@ class ChatSession:
         self.last_reasoning: str | None = None  # Accumulated reasoning from the latest send() turn
         self._force_compact_next = False
 
+        # Conditional tool loading (see eyetor.chat.tool_gating). Token-heavy
+        # tool groups are only sent on turns whose text triggers them, plus a
+        # short sticky window so follow-ups ("cancélalo", "sí") still see them.
+        self._gating_enabled = False
+        self._sticky_turns = 2
+        if root_config is not None:
+            gating_cfg = root_config.sessions.tool_gating
+            self._gating_enabled = gating_cfg.enabled
+            self._sticky_turns = gating_cfg.sticky_turns
+        self._sticky_groups: dict[str, int] = {}  # group → turns it stays active
+        self._last_active_groups: set[str] = set()  # for confirmation inheritance
+
         self._compactor: ConversationCompactor | None = None
         if root_config and root_config.sessions.compaction.enabled:
             from eyetor.chat.compactor import ConversationCompactor
@@ -494,11 +507,15 @@ class ChatSession:
         user_msg = Message(role="user", content=user_input)
         self._messages.append(user_msg)
         self._persist_message(user_msg)
-        tool_defs = (
-            list(self.tool_registry._tools.values())
-            if self.tool_registry._tools
-            else None
-        )
+        tool_defs, active_groups = self._turn_tool_defs(user_input)
+        if self._gating_enabled and tool_defs is not None:
+            logger.info(
+                "Session '%s' — tool gating: %d/%d tools, active groups: %s",
+                self.session_id,
+                len(tool_defs),
+                len(self.tool_registry._tools),
+                ", ".join(sorted(active_groups)) or "none",
+            )
         current_session_id.set(self.session_id)
         current_trace_id.set(new_trace_id())
 
@@ -616,6 +633,21 @@ class ChatSession:
                         "Session '%s' — model announced a tool call without emitting it; nudging once",
                         self.session_id,
                     )
+                    # Safety net for tool gating: if the announced intent maps to
+                    # a group we did not send this turn (the heuristic missed it),
+                    # enable that group now so the retry can actually emit the call.
+                    if self._gating_enabled:
+                        missing = select_groups(content) - active_groups
+                        if missing:
+                            for g in missing:
+                                self._sticky_groups[g] = self._sticky_turns + 1
+                            active_groups |= missing
+                            tool_defs = self._filter_tool_defs(active_groups)
+                            logger.info(
+                                "Session '%s' — tool gating: enabling missed group(s) %s after announce",
+                                self.session_id,
+                                ", ".join(sorted(missing)),
+                            )
                     full_messages.append(
                         Message(
                             role="user",
@@ -825,6 +857,7 @@ class ChatSession:
                 self._persist_message(tool_msg)
                 full_messages.append(tool_msg)
                 tools_executed += 1
+                self._mark_group_used(tc.function.name)
                 logger.info(
                     "Session '%s' — tool '%s'(%s) → %d chars: %s",
                     self.session_id,
@@ -906,11 +939,7 @@ class ChatSession:
             self.session_id, len(user_input),
         )
 
-        tool_defs = (
-            list(self.tool_registry._tools.values())
-            if self.tool_registry._tools
-            else None
-        )
+        tool_defs, _active_groups = self._turn_tool_defs(user_input)
         tool_names = (
             ", ".join(t.name for t in tool_defs) if tool_defs else "none"
         )
@@ -1008,6 +1037,7 @@ class ChatSession:
                 self._messages.append(tool_msg)
                 self._persist_message(tool_msg)
                 full_messages.append(tool_msg)
+                self._mark_group_used(tc.function.name)
 
         # --- Phase 3: Synthesize (no tools) ---
         synth_prompt = (
@@ -1067,6 +1097,68 @@ class ChatSession:
             messages.append(Message(role="system", content=system_content))
         messages.extend(self._messages)
         return messages
+
+    # ------------------------------------------------------------------
+    # Conditional tool loading
+    # ------------------------------------------------------------------
+
+    def _filter_tool_defs(
+        self, active_groups: set[str]
+    ) -> list[ToolDefinition] | None:
+        """Tools whose group is always-on (None) or in ``active_groups``."""
+        selected = [
+            t
+            for t in self.tool_registry._tools.values()
+            if t.group is None or t.group in active_groups
+        ]
+        return selected or None
+
+    def _turn_active_groups(self, user_input: str) -> set[str]:
+        """Conditional tool groups to enable this turn.
+
+        Combines (a) groups triggered by the message text, (b) groups still
+        within their sticky window from recent use, and (c) on a bare
+        confirmation ("sí, hazlo"), the groups active on the previous turn —
+        so an action proposed last turn can still be executed.
+        """
+        # Expire one turn from each sticky group before recomputing.
+        self._sticky_groups = {
+            g: n - 1 for g, n in self._sticky_groups.items() if n - 1 > 0
+        }
+        active = select_groups(user_input) | set(self._sticky_groups)
+        if _is_user_confirmation(user_input):
+            active |= self._last_active_groups
+        self._last_active_groups = set(active)
+        return active
+
+    def _turn_tool_defs(
+        self, user_input: str
+    ) -> tuple[list[ToolDefinition] | None, set[str]]:
+        """Return (tool_defs, active_groups) for this turn.
+
+        When gating is disabled or there are no tools, returns the full set
+        (or None) and treats all known groups as active so later expansion
+        is a no-op.
+        """
+        if not self.tool_registry._tools:
+            return None, set()
+        if not self._gating_enabled:
+            return list(self.tool_registry._tools.values()), set(KNOWN_GROUPS)
+        active = self._turn_active_groups(user_input)
+        return self._filter_tool_defs(active), active
+
+    def _mark_group_used(self, tool_name: str) -> None:
+        """Refresh the sticky window for the group of an executed tool.
+
+        Set to ``sticky_turns + 1`` because ``_turn_active_groups`` decrements
+        every counter at the start of the next turn; this leaves the group
+        active for exactly ``sticky_turns`` follow-up turns.
+        """
+        if not self._gating_enabled:
+            return
+        tool = self.tool_registry._tools.get(tool_name)
+        if tool and tool.group:
+            self._sticky_groups[tool.group] = self._sticky_turns + 1
 
     async def _compact_before_llm(
         self, full_messages: list[Message], *, reason: str
@@ -1418,6 +1510,7 @@ class ChatSession:
                     "required": ["name", "prompt", "schedule"],
                 },
                 handler=handle_schedule_task,
+                group="scheduler",
             )
         )
 
@@ -1427,6 +1520,7 @@ class ChatSession:
                 description="List all scheduled tasks with their next run time and status.",
                 parameters={"type": "object", "properties": {}, "required": []},
                 handler=handle_list_tasks,
+                group="scheduler",
             )
         )
 
@@ -1456,5 +1550,6 @@ class ChatSession:
                     "required": [],
                 },
                 handler=handle_cancel_task,
+                group="scheduler",
             )
         )

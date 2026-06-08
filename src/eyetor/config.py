@@ -166,6 +166,19 @@ class ChainConfig(BaseModel):
     plan_votes: int = 1  # voting rounds for the planning step (1 = no voting)
 
 
+class ToolGatingConfig(BaseModel):
+    """Configuration for conditional (per-turn) tool loading.
+
+    When enabled, token-heavy tool groups (scheduler, image, kb, install,
+    delegate) are only sent to the model on turns whose text triggers them.
+    Always-on tools (skills, memory) are never gated. ``enabled: false``
+    restores the previous behavior of sending every tool every turn.
+    """
+
+    enabled: bool = True
+    sticky_turns: int = 2  # keep a group active for N turns after it is used
+
+
 class SessionsConfig(BaseModel):
     """Configuration for session persistence."""
 
@@ -174,6 +187,7 @@ class SessionsConfig(BaseModel):
     max_messages: int = 200
     chain: ChainConfig = ChainConfig()
     compaction: CompactionConfig = CompactionConfig()
+    tool_gating: ToolGatingConfig = ToolGatingConfig()
 
 
 class SchedulerConfig(BaseModel):

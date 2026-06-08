@@ -217,6 +217,14 @@ knowledge:
 # Session persistence and compaction settings
 sessions:
   persist: true
+  # Conditional tool loading: only send token-heavy tool groups (scheduler,
+  # image, kb, install) on turns whose text triggers them. Skills, memory and
+  # delegate are always available. sticky_turns keeps a used group active for
+  # N follow-up turns so "cancélalo"/"sí" still see it. Set enabled: false to
+  # send every tool every turn (previous behavior).
+  tool_gating:
+    enabled: true
+    sticky_turns: 2
   chain:
     mode: auto           # auto | always | never — decompose complex queries into plan→execute→synthesize
     complexity_threshold: 300  # min chars to consider a message complex (auto mode)
