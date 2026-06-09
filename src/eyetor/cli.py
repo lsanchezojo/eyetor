@@ -519,6 +519,94 @@ def start(
                     )
                 )
 
+                if _sn == "shopping":
+                    receipt_script = next(
+                        (s for s in _scripts if s.name == "receipt.py"), None
+                    )
+                    if receipt_script is not None:
+
+                        async def shopping_receipt_add_handler(
+                            store: str,
+                            date: str,
+                            items: list[dict],
+                            total: float | None = None,
+                            image_path: str | None = None,
+                            _receipt_script=receipt_script,
+                            _meta_timeout=_meta.timeout,
+                        ) -> str:
+                            args = [
+                                "add",
+                                "--store",
+                                store,
+                                "--date",
+                                date,
+                                "--items",
+                                json.dumps(items, ensure_ascii=False),
+                            ]
+                            if total is not None:
+                                args.extend(["--total", str(total)])
+                            if image_path:
+                                args.extend(["--image-path", image_path])
+                            return await run_script(
+                                _receipt_script,
+                                args,
+                                timeout=_skill_execution_timeout(
+                                    "shopping", args, _meta_timeout
+                                ),
+                            )
+
+                        tool_registry.register(
+                            ToolDefinition(
+                                name="shopping_receipt_add",
+                                description=(
+                                    "Register a shopping receipt from structured data. "
+                                    "Prefer this over skill_shopping receipt.py add for "
+                                    "photo receipts or long item lists."
+                                ),
+                                parameters={
+                                    "type": "object",
+                                    "properties": {
+                                        "store": {
+                                            "type": "string",
+                                            "description": "Store name from the receipt.",
+                                        },
+                                        "date": {
+                                            "type": "string",
+                                            "description": "Purchase date in YYYY-MM-DD format.",
+                                        },
+                                        "items": {
+                                            "type": "array",
+                                            "description": (
+                                                "One entry per purchased unit. Do not include "
+                                                "items with unknown prices."
+                                            ),
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "name": {"type": "string"},
+                                                    "price": {"type": "number"},
+                                                },
+                                                "required": ["name", "price"],
+                                            },
+                                        },
+                                        "total": {
+                                            "type": "number",
+                                            "description": "Receipt total if visible.",
+                                        },
+                                        "image_path": {
+                                            "type": "string",
+                                            "description": (
+                                                "Absolute path under ~/.eyetor/images for the "
+                                                "saved receipt image."
+                                            ),
+                                        },
+                                    },
+                                    "required": ["store", "date", "items"],
+                                },
+                                handler=shopping_receipt_add_handler,
+                            )
+                        )
+
         # Image generation tool
         if cfg.default_image_provider and cfg.image_providers:
             from eyetor.image_providers import get_image_provider

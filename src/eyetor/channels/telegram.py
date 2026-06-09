@@ -492,7 +492,10 @@ class TelegramChannel(BaseChannel):
                         f"Imagen guardada en: {img_path}\n\n"
                         f"Responde a lo que pide el usuario. Usa el análisis de la imagen "
                         f"como contexto, pero céntrate en la petición del usuario. "
-                        f"Si dispones de herramientas relevantes, úsalas."
+                        f"Si es un ticket de compra y está disponible, usa "
+                        f"shopping_receipt_add con parámetros estructurados en vez "
+                        f"de construir un comando receipt.py add largo. Si dispones "
+                        f"de herramientas relevantes, úsalas."
                     )
                 else:
                     prompt = (
@@ -501,7 +504,10 @@ class TelegramChannel(BaseChannel):
                         f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
                         f"Imagen guardada en: {img_path}\n\n"
                         f"Responde al usuario basándote en el contenido descrito. "
-                        f"Si dispones de herramientas relevantes para el contenido, úsalas."
+                        f"Si es un ticket de compra y está disponible, usa "
+                        f"shopping_receipt_add con parámetros estructurados en vez "
+                        f"de construir un comando receipt.py add largo. Si dispones "
+                        f"de herramientas relevantes para el contenido, úsalas."
                     )
 
                 session_id = f"telegram-{msg.chat.id}"

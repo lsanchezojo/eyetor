@@ -12,8 +12,9 @@ commands:
     description: Registra el último ticket fotografiado.
     action: prompt
     prompt: |
-      El usuario ha enviado una foto de ticket (o quiere registrar uno). Usa la skill 'shopping'
-      (script receipt.py) para extraer productos y precios y registrarlos. Para la fecha:
+      El usuario ha enviado una foto de ticket (o quiere registrar uno). Si está disponible,
+      usa primero la herramienta estructurada `shopping_receipt_add` para registrarlo. Si no
+      está disponible, usa la skill 'shopping' (script receipt.py). Para la fecha:
       usa primero la fecha visible en la imagen; si falta, busca una fecha completa en el
       caption/mensaje del usuario; si tampoco aparece ahí, pregunta la fecha al usuario antes
       de registrar. Si el análisis visual previo no es suficiente por otros campos (faltan
@@ -77,7 +78,21 @@ Toda la persistencia vive en una sola base de datos SQLite global:
    completa en el caption/mensaje del usuario y úsala. Si tampoco hay fecha en el
    caption, pregunta al usuario antes de registrar.
 
-3. Llama:
+3. Si está disponible, llama a `shopping_receipt_add` con parámetros estructurados:
+
+       {
+         "store": "Mercadona",
+         "date": "2026-05-11",
+         "items": [
+           {"name": "Leche entera 1L", "price": 1.05},
+           {"name": "Leche entera 1L", "price": 1.05},
+           {"name": "Pan", "price": 0.85}
+         ],
+         "total": 2.95,
+         "image_path": "/home/haziel/.eyetor/images/123_1715000000.jpg"
+       }
+
+   Si esa herramienta no está disponible, llama:
 
        receipt.py add --store "Mercadona" --date 2026-05-11 \
            --items '[{"name":"Leche entera 1L","price":1.05},
