@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import shlex
 from pathlib import Path
 from typing import AsyncIterator, TYPE_CHECKING
 
@@ -159,6 +160,65 @@ def _is_ghost_assistant(msg: Message) -> bool:
     if msg.tool_calls:
         return False
     return not (msg.content or "").strip()
+
+
+def _invalid_tool_call_arguments(msg: Message) -> list[str]:
+    """Return tool-call validation errors for a message.
+
+    Providers require ``function.arguments`` to be a JSON object string when a
+    prior assistant tool call is replayed in history. A truncated argument
+    string poisons the whole conversation: the next provider rejects the entire
+    request before the model can recover.
+    """
+    errors: list[str] = []
+    if not msg.tool_calls:
+        return errors
+    for tc in msg.tool_calls:
+        raw = tc.function.arguments
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except (TypeError, ValueError) as exc:
+            errors.append(f"{tc.function.name}: invalid JSON arguments ({exc})")
+            continue
+        if not isinstance(parsed, dict):
+            errors.append(f"{tc.function.name}: arguments must be a JSON object")
+            continue
+        args = parsed.get("args")
+        if isinstance(args, str):
+            try:
+                shlex.split(args)
+            except ValueError as exc:
+                errors.append(f"{tc.function.name}: invalid args string ({exc})")
+    return errors
+
+
+def _has_invalid_tool_call_arguments(msg: Message) -> bool:
+    return bool(_invalid_tool_call_arguments(msg))
+
+
+def _clean_loaded_history(messages: list[Message]) -> tuple[list[Message], int]:
+    """Drop messages that would make provider payloads invalid on replay."""
+    kept: list[Message] = []
+    pending_tool_ids: set[str] = set()
+    dropped = 0
+    for msg in messages:
+        if _is_ghost_assistant(msg) or _has_invalid_tool_call_arguments(msg):
+            dropped += 1
+            continue
+        if msg.role == "assistant":
+            if msg.tool_calls:
+                pending_tool_ids.update(tc.id for tc in msg.tool_calls)
+            kept.append(msg)
+            continue
+        if msg.role == "tool":
+            if msg.tool_call_id and msg.tool_call_id in pending_tool_ids:
+                pending_tool_ids.remove(msg.tool_call_id)
+                kept.append(msg)
+            else:
+                dropped += 1
+            continue
+        kept.append(msg)
+    return kept, dropped
 
 
 def _final_text(content: str | None, reasoning: str | None) -> str:
@@ -380,13 +440,11 @@ class ChatSession:
             for line in lines:
                 data = json.loads(line)
                 raw.append(Message(**data))
-            kept = [m for m in raw if not _is_ghost_assistant(m)]
-            dropped = len(raw) - len(kept)
+            kept, dropped = _clean_loaded_history(raw)
             self._messages.extend(kept)
             if dropped:
                 logger.warning(
-                    "Dropped %d ghost assistant message(s) from %s (empty content "
-                    "+ no tool_calls). Rewriting JSONL.",
+                    "Dropped %d invalid/ghost message(s) from %s. Rewriting JSONL.",
                     dropped,
                     self._persist_path,
                 )
@@ -567,6 +625,34 @@ class ChatSession:
             self._mark_force_compact_after_fallback("main")
             response = result.message
             response.tool_calls = self._dedupe_tool_calls(response.tool_calls)
+            invalid_tool_args = _invalid_tool_call_arguments(response)
+            if invalid_tool_args:
+                logger.warning(
+                    "Session '%s' iter %d/%d — invalid tool_call arguments: %s",
+                    self.session_id,
+                    iterations,
+                    self.config.max_iterations,
+                    "; ".join(invalid_tool_args),
+                )
+                full_messages.append(
+                    Message(
+                        role="assistant",
+                        content=response.content,
+                    )
+                )
+                full_messages.append(
+                    Message(
+                        role="user",
+                        content=(
+                            "La tool_call anterior tenía arguments que no eran JSON "
+                            "válido y se ha descartado. Vuelve a intentarlo ahora "
+                            "emitiendo una tool_call estructurada válida. No construyas "
+                            "JSON dentro de strings largos si existe una herramienta con "
+                            "parámetros estructurados."
+                        ),
+                    )
+                )
+                continue
             if result.reasoning_content:
                 self.last_reasoning = (
                     (self.last_reasoning + "\n\n" if self.last_reasoning else "")

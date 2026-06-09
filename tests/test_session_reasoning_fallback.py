@@ -9,6 +9,7 @@ retry" message; we deliberately do NOT fall back to reasoning.
 from __future__ import annotations
 
 import asyncio
+import json
 
 from eyetor.chat.session import ChatSession
 from eyetor.models.agents import AgentConfig
@@ -385,3 +386,155 @@ def test_duplicate_tool_calls_in_same_turn_execute_once():
 
     assert asyncio.run(session.send_sync("dedupe")) == "final"
     assert calls == ["same"]
+
+
+class _InvalidThenValidToolProvider:
+    model = "fake"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, messages, tools=None, temperature=0.0):
+        self.calls += 1
+        if self.calls == 1:
+            return CompletionResult(
+                message=Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="bad-call",
+                            function=FunctionCall(
+                                name="fake_tool",
+                                arguments=json.dumps(
+                                    {
+                                        "args": (
+                                            "receipt.py add --items '[{\"name\": "
+                                            "\"X\", \"price\": 2."
+                                        )
+                                    }
+                                ),
+                            ),
+                        )
+                    ],
+                )
+            )
+        if self.calls == 2:
+            assert messages[-1].role == "user"
+            assert "arguments que no eran JSON" in (messages[-1].content or "")
+            return CompletionResult(
+                message=Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="good-call",
+                            function=FunctionCall(
+                                name="fake_tool",
+                                arguments='{"q":"ok"}',
+                            ),
+                        )
+                    ],
+                )
+            )
+        return CompletionResult(message=Message(role="assistant", content="final"))
+
+    async def stream(self, messages, tools=None, temperature=0.0):  # pragma: no cover
+        raise NotImplementedError
+
+
+def test_invalid_tool_call_arguments_are_not_executed_or_remembered():
+    calls: list[str] = []
+
+    async def fake_tool(q: str) -> str:
+        calls.append(q)
+        return q
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="fake_tool",
+            description="fake",
+            parameters={"type": "object", "properties": {"q": {"type": "string"}}},
+            handler=fake_tool,
+        )
+    )
+    provider = _InvalidThenValidToolProvider()
+    session = ChatSession(
+        session_id="test",
+        config=AgentConfig(name="t", provider="fake", model="fake", max_iterations=5),
+        provider=provider,
+        tool_registry=registry,
+    )
+
+    assert asyncio.run(session.send_sync("use tool")) == "final"
+    assert provider.calls == 3
+    assert calls == ["ok"]
+    assert all(
+        json.loads(tc.function.arguments) is not None
+        for msg in session.get_history()
+        if msg.tool_calls
+        for tc in msg.tool_calls
+    )
+
+
+def test_load_history_drops_invalid_tool_call_and_orphan_tool_result(tmp_path):
+    cfg = AgentConfig(name="t", provider="fake", model="fake")
+    root_cfg = type(
+        "RootCfg",
+        (),
+        {
+            "sessions": type(
+                "Sessions",
+                (),
+                {
+                    "persist": True,
+                    "dir": str(tmp_path),
+                    "max_messages": 200,
+                    "tool_gating": type(
+                        "Gating", (), {"enabled": False, "sticky_turns": 2}
+                    )(),
+                    "compaction": type("Compaction", (), {"enabled": False})(),
+                },
+            )(),
+        },
+    )()
+    path = tmp_path / "test.jsonl"
+    rows = [
+        Message(role="user", content="hi").model_dump(exclude_none=True),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="bad-call",
+                    function=FunctionCall(
+                        name="fake_tool",
+                        arguments=json.dumps(
+                            {
+                                "args": (
+                                    "receipt.py add --items '[{\"name\": "
+                                    "\"X\", \"price\": 2."
+                                )
+                            }
+                        ),
+                    ),
+                )
+            ],
+        ).model_dump(exclude_none=True),
+        Message(
+            role="tool", tool_call_id="bad-call", content='{"error":"bad"}'
+        ).model_dump(exclude_none=True),
+    ]
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    session = ChatSession(
+        session_id="test",
+        config=cfg,
+        provider=_FakeProvider("ok", None),
+        root_config=root_cfg,  # type: ignore[arg-type]
+    )
+
+    assert [m.role for m in session.get_history()] == ["user"]
+    rewritten = path.read_text(encoding="utf-8").splitlines()
+    assert len(rewritten) == 1
