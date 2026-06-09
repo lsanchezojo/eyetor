@@ -27,10 +27,18 @@ def _rec(**kw) -> UsageRecord:
 
 
 class _FakeTracker:
-    def __init__(self, records: list[UsageRecord]) -> None:
-        self._records = records
+    def __init__(
+        self,
+        records: list[UsageRecord] | None = None,
+        *,
+        records_by_period: dict[str, list[UsageRecord]] | None = None,
+    ) -> None:
+        self._records = records or []
+        self._records_by_period = records_by_period or {}
 
     def get_records(self, period: str = "day"):
+        if period in self._records_by_period:
+            return list(self._records_by_period[period])
         return list(self._records)
 
 
@@ -84,3 +92,20 @@ def test_usage_report_phase_breakdown_includes_tokens_and_cost() -> None:
 def test_usage_report_handles_no_activity() -> None:
     text = _format_usage_text(_FakeTracker([]), session_id="telegram-1")
     assert "Sin actividad registrada" in text
+
+
+def test_usage_report_shows_week_when_today_is_empty() -> None:
+    tracker = _FakeTracker(
+        records_by_period={
+            "day": [],
+            "week": [_rec(prompt_tokens=1000, completion_tokens=250)],
+        }
+    )
+
+    text = _format_usage_text(tracker, session_id="telegram-1")
+
+    assert "Sin actividad hoy" in text
+    assert "📅 Hoy" in text
+    assert "0 → 0 tokens" in text
+    assert "📆 Semana" in text
+    assert "1.000 → 250 tokens" in text

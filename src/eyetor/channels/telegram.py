@@ -1270,11 +1270,50 @@ def _format_usage_text(tracker, session_id: str | None = None) -> str:
                 f"{_fmt_num(s_prompt)}→{_fmt_num(s_comp)} tok · {cost_str}"
             )
 
+    # --- Footer: day vs week totals ---
+    week_records = tracker.get_records(period="week")
+
+    def _totals_from_records(recs):
+        prompt = sum(r.prompt_tokens for r in recs)
+        completion = sum(r.completion_tokens for r in recs)
+        cost = sum(r.estimated_cost for r in recs)
+        tool = sum(1 for r in recs if r.finish_reason == "tool_calls")
+        return prompt, completion, len(recs), tool, cost
+
+    def _footer_line(
+        label: str, prompt: int, comp: int, calls: int, tool: int, cost: float
+    ) -> str:
+        tok_part = f"{_fmt_num(prompt)} → {_fmt_num(comp)} tokens"
+        calls_part = f"{calls} llamadas ({tool} tool_call)"
+        cost_part = f"${cost:.4f}" if cost > 0 else "$0"
+        return f"{label}   {tok_part} · {calls_part} · {cost_part}"
+
+    def _append_totals_footer() -> None:
+        day_prompt, day_comp, day_calls, day_tool, day_cost = _totals_from_records(
+            day_records
+        )
+        week_prompt, week_comp, week_calls, week_tool, week_cost = _totals_from_records(
+            week_records
+        )
+        lines.append("\n──────────────")
+        lines.append(
+            _footer_line("📅 Hoy   ", day_prompt, day_comp, day_calls, day_tool, day_cost)
+        )
+        lines.append(
+            _footer_line(
+                "📆 Semana", week_prompt, week_comp, week_calls, week_tool, week_cost
+            )
+        )
+
     # --- Individual calls for today, grouped by (provider, model) ---
     _MAX_CALLS_SHOWN = 5
 
     if not day_records:
-        lines.append("\nSin actividad registrada.")
+        if week_records:
+            lines.append("\nSin actividad hoy.")
+            _append_totals_footer()
+        else:
+            lines.append("\nSin actividad registrada.")
         return "\n".join(lines)
 
     # Group preserving insertion order; display calls oldest→newest
@@ -1340,40 +1379,7 @@ def _format_usage_text(tracker, session_id: str | None = None) -> str:
     _emit_breakdown("🧩 <b>Por fase</b>", _agg(lambda r: r.phase, day_records))
     _emit_breakdown("🤖 <b>Por agente</b>", _agg(lambda r: r.agent, day_records))
 
-    # --- Footer: day vs week totals ---
-    week_records = tracker.get_records(period="week")
-
-    def _totals_from_records(recs):
-        prompt = sum(r.prompt_tokens for r in recs)
-        completion = sum(r.completion_tokens for r in recs)
-        cost = sum(r.estimated_cost for r in recs)
-        tool = sum(1 for r in recs if r.finish_reason == "tool_calls")
-        return prompt, completion, len(recs), tool, cost
-
-    day_prompt, day_comp, day_calls, day_tool, day_cost = _totals_from_records(
-        day_records
-    )
-    week_prompt, week_comp, week_calls, week_tool, week_cost = _totals_from_records(
-        week_records
-    )
-
-    def _footer_line(
-        label: str, prompt: int, comp: int, calls: int, tool: int, cost: float
-    ) -> str:
-        tok_part = f"{_fmt_num(prompt)} → {_fmt_num(comp)} tokens"
-        calls_part = f"{calls} llamadas ({tool} tool_call)"
-        cost_part = f"${cost:.4f}" if cost > 0 else "$0"
-        return f"{label}   {tok_part} · {calls_part} · {cost_part}"
-
-    lines.append("\n──────────────")
-    lines.append(
-        _footer_line("📅 Hoy   ", day_prompt, day_comp, day_calls, day_tool, day_cost)
-    )
-    lines.append(
-        _footer_line(
-            "📆 Semana", week_prompt, week_comp, week_calls, week_tool, week_cost
-        )
-    )
+    _append_totals_footer()
 
     return "\n".join(lines)
 
