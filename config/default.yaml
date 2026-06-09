@@ -27,7 +27,7 @@ providers:
     # miles de tokens. Se aplican como max_tokens y n_predict.
     max_tokens: 1024
     max_tokens_by_phase:
-      main: 768
+      main: 1536
       degeneration_recovery: 512
       loop_break: 512
       chain_plan: 512
