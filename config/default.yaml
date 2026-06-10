@@ -9,11 +9,25 @@ providers:
   ollama:
     type: ollama
     base_url: http://localhost:11434/v1
-    # OJO: en este equipo (iGPU AMD 890M, ~15 GB RAM unificada) este modelo
-    # Q4_K_M necesita ~25 GiB en runtime y el kernel lo mata por OOM en
-    # cualquier configuración. Para usar ollama de forma fiable hace falta
-    # un modelo que quepa (~<12 GB): 14B/8B Q4, o un quant Q2/IQ2 del 36B.
-    model: qwen3.6:35b-a3b-q4_K_M
+    # Gemma-4 12B QAT importado en Ollama desde
+    # ~/dev/modelos/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf.
+    # thinking=true permite razonamiento solo en fases útiles. Eyetor envía
+    # reasoning.effort=none en fases directas/sensibles (compaction,
+    # degeneration_recovery, loop_break, chain_synthesize) para evitar
+    # respuestas vacías por razonamiento largo en /v1/chat/completions.
+    model: gemma4:12b-qat
+    temperature: 0.3
+    thinking: true
+    request_timeout: 300
+    max_tokens: 1024
+    max_tokens_by_phase:
+      main: 1536
+      degeneration_recovery: 512
+      loop_break: 512
+      chain_plan: 512
+      chain_execute: 768
+      chain_synthesize: 768
+      agent: 768
 
   llamacpp:
     type: llamacpp
@@ -47,10 +61,11 @@ providers:
     model: gemini-2.0-flash
 
 fallback:
-  # llamacpp = servidor local (Qwen3.6-35B-A3B Q4_K_XL vía llama.cpp Vulkan
-  # + mmap, ~/.local/bin/llamacpp-eyetor.sh). ollama queda fuera: con este
-  # modelo no mmapea y el kernel lo mata por OOM en 15 GB de RAM.
-  fallback_chain: [llamacpp, openrouter, gemini]
+  # ollama = Gemma-4 12B QAT local en iGPU.
+  # llamacpp = backup Qwen3.6-35B-A3B Q4_K_XL vía llama.cpp Vulkan + mmap
+  # (~/.local/bin/llamacpp-eyetor.sh, llamacpp-eyetor.service). Para volver a
+  # Qwen como principal, arranca ese servicio y mueve llamacpp al primer lugar.
+  fallback_chain: [ollama, llamacpp, openrouter, gemini]
   retry_on:
     - timeout
     - connection_error

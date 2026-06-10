@@ -97,6 +97,42 @@ def _extract_caption_date(caption: str) -> str | None:
     return None
 
 
+def _build_image_prompt(
+    *,
+    user_text: str,
+    description: str,
+    img_path: Path,
+    caption_date: str | None,
+) -> str:
+    """Build the channel-generic prompt for forwarding an image to the agent."""
+    caption_meta = (
+        f"Fecha completa detectada en el caption: {caption_date}.\n\n"
+        if caption_date
+        else "No hay fecha completa detectada en el caption.\n\n"
+    )
+    if user_text:
+        intro = f"El usuario ha enviado una imagen con este mensaje: «{user_text}»"
+        closing = (
+            "Responde a lo que pide el usuario. Usa el análisis de la imagen "
+            "como contexto, pero céntrate en su petición. Si una herramienta "
+            "disponible encaja con la petición, puedes usarla."
+        )
+    else:
+        intro = "El usuario ha enviado una imagen sin mensaje adicional."
+        closing = (
+            "Responde al usuario basándote en el contenido descrito. Si una "
+            "herramienta disponible encaja con el contenido o la tarea inferida, "
+            "puedes usarla."
+        )
+    return (
+        f"{intro}\n\n"
+        f"{caption_meta}"
+        f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
+        f"Imagen guardada en: {img_path}\n\n"
+        f"{closing}"
+    )
+
+
 class TelegramChannel(BaseChannel):
     """Telegram bot channel using aiogram.
 
@@ -472,43 +508,12 @@ class TelegramChannel(BaseChannel):
                 # Step 2: Send the description (+ metadata) to the main LLM session
                 user_text = caption.strip() if caption.strip() else ""
                 caption_date = _extract_caption_date(user_text)
-                if caption_date:
-                    date_instruction = (
-                        f"Fecha detectada en el caption: {caption_date}. "
-                        "Si el ticket no muestra fecha visible, usa esta fecha "
-                        "para registrar herramientas; no la pidas de nuevo.\n\n"
-                    )
-                else:
-                    date_instruction = (
-                        "No hay fecha completa detectada en el caption. "
-                        "Si el ticket tampoco muestra fecha visible, pregunta "
-                        "la fecha al usuario antes de registrar el recibo.\n\n"
-                    )
-                if user_text:
-                    prompt = (
-                        f"El usuario ha enviado una imagen con este mensaje: «{user_text}»\n\n"
-                        f"{date_instruction}"
-                        f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
-                        f"Imagen guardada en: {img_path}\n\n"
-                        f"Responde a lo que pide el usuario. Usa el análisis de la imagen "
-                        f"como contexto, pero céntrate en la petición del usuario. "
-                        f"Si es un ticket de compra y está disponible, usa "
-                        f"shopping_receipt_add con parámetros estructurados en vez "
-                        f"de construir un comando receipt.py add largo. Si dispones "
-                        f"de herramientas relevantes, úsalas."
-                    )
-                else:
-                    prompt = (
-                        f"El usuario ha enviado una imagen sin mensaje adicional.\n\n"
-                        f"{date_instruction}"
-                        f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
-                        f"Imagen guardada en: {img_path}\n\n"
-                        f"Responde al usuario basándote en el contenido descrito. "
-                        f"Si es un ticket de compra y está disponible, usa "
-                        f"shopping_receipt_add con parámetros estructurados en vez "
-                        f"de construir un comando receipt.py add largo. Si dispones "
-                        f"de herramientas relevantes para el contenido, úsalas."
-                    )
+                prompt = _build_image_prompt(
+                    user_text=user_text,
+                    description=description,
+                    img_path=img_path,
+                    caption_date=caption_date,
+                )
 
                 session_id = f"telegram-{msg.chat.id}"
                 session = self._manager.get_or_create(session_id)
@@ -720,8 +725,8 @@ async def _describe_image(
     default.yaml). Falls back to VISION_BASE_URL / VISION_API_KEY / VISION_MODEL
     environment variables when not provided.
 
-    The vision prompt asks the model to classify the image type and, if it is
-    a receipt/ticket, extract structured data (store, items, prices).
+    The vision prompt stays channel-generic: it asks for visible text,
+    dates, numbers and layout without mentioning any downstream tool.
     """
     import httpx
 
@@ -734,26 +739,21 @@ async def _describe_image(
     model = model or os.environ.get("VISION_MODEL", "default")
 
     prompt = (
-        "Analiza esta imagen. Primero indica qué tipo de imagen es "
-        "(ticket de compra, factura, documento, foto, captura de pantalla, etc.).\n\n"
-        "Si es un ticket o recibo de compra, extrae TODOS los productos y precios "
-        "que puedas leer, incluyendo el nombre de la tienda y la fecha si aparecen. "
-        "Usa este formato:\n"
-        "- Tipo: ticket de compra\n"
-        "- Tienda: [nombre]\n"
-        "- Fecha: [fecha si visible]\n"
-        "- Productos:\n"
-        "  - [nombre producto]: [precio]€\n"
-        "  - ...\n"
-        "- Total: [total]€\n\n"
-        "Si NO es un ticket, describe la imagen de forma detallada."
+        "Analiza esta imagen de forma precisa y neutral. Indica primero qué "
+        "tipo de imagen es (documento, foto, captura de pantalla, objeto, "
+        "lista, tabla, etc.).\n\n"
+        "Transcribe el texto visible importante. Si aparecen fechas, importes, "
+        "cantidades, tablas, listas o pares nombre-valor, extráelos de forma "
+        "ordenada y completa. Si algún dato no se lee con seguridad, márcalo "
+        "como dudoso en vez de inventarlo.\n\n"
+        "Si no hay texto relevante, describe los elementos visibles y su contexto."
     )
     if caption.strip():
         prompt += (
             "\n\nCaption del usuario, solo como contexto adicional:\n"
             f"{caption.strip()}\n\n"
-            "Si la imagen no muestra fecha y el caption contiene una fecha, "
-            "menciónalo explícitamente."
+            "Si el caption contiene datos concretos que no se ven en la imagen "
+            "(por ejemplo fechas, lugares o cantidades), menciónalos aparte."
         )
 
     headers: dict[str, str] = {

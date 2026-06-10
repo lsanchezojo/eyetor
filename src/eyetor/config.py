@@ -20,10 +20,10 @@ class ProviderConfig(BaseModel):
     model: str
     ssl_verify: bool | str = True  # False to disable, or path to CA bundle
     temperature: float = 0.7  # Sampling temperature sent in every request
-    thinking: bool = False  # Enable thinking/reasoning mode (llamacpp only)
+    thinking: bool = False  # Enable thinking/reasoning mode (llamacpp/ollama)
     request_timeout: float = 600.0  # HTTP timeout (s) per chat/completions call
-    max_tokens: int | None = None  # llama.cpp generation cap for all phases
-    max_tokens_by_phase: dict[str, int] = {}  # llama.cpp per-phase overrides
+    max_tokens: int | None = None  # local generation cap for all phases
+    max_tokens_by_phase: dict[str, int] = {}  # local per-phase overrides
     reasoning_budget: int | None = None  # llama.cpp max tokens for the reasoning block
 
 

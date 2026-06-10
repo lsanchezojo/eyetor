@@ -64,6 +64,14 @@ def _make_session(*, enabled: bool = True, sticky_turns: int = 2) -> ChatSession
     )
     registry.register(
         ToolDefinition(
+            name="shopping_receipt_add",
+            description="Register a shopping receipt from structured data.",
+            parameters={"type": "object", "properties": {}},
+            handler=None,
+        )
+    )
+    registry.register(
+        ToolDefinition(
             name="schedule_task", description="sched", parameters={"type": "object", "properties": {}},
             handler=None, group="scheduler",
         )
@@ -90,21 +98,26 @@ def _names(tool_defs):
 def test_trivial_turn_only_always_on():
     s = _make_session()
     defs, groups = s._turn_tool_defs("hola")
-    assert _names(defs) == {"skill_shell"}
+    assert _names(defs) == {"skill_shell", "shopping_receipt_add"}
     assert groups == set()
 
 
 def test_triggered_group_included():
     s = _make_session()
     defs, groups = s._turn_tool_defs("recuérdame comprar pan mañana a las 9")
-    assert _names(defs) == {"skill_shell", "schedule_task"}
+    assert _names(defs) == {"skill_shell", "shopping_receipt_add", "schedule_task"}
     assert groups == {"scheduler"}
 
 
 def test_gating_disabled_sends_all():
     s = _make_session(enabled=False)
     defs, _ = s._turn_tool_defs("hola")
-    assert _names(defs) == {"skill_shell", "schedule_task", "generate_image"}
+    assert _names(defs) == {
+        "skill_shell",
+        "shopping_receipt_add",
+        "schedule_task",
+        "generate_image",
+    }
 
 
 def test_sticky_keeps_group_for_followups():

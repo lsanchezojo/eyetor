@@ -60,6 +60,11 @@ def create_provider(config: ProviderConfig) -> BaseProvider:
         kwargs["reasoning_budget"] = config.reasoning_budget
         kwargs["max_tokens"] = config.max_tokens
         kwargs["max_tokens_by_phase"] = config.max_tokens_by_phase
+    if config.type == "ollama":
+        kwargs["thinking"] = config.thinking
+        kwargs["request_timeout"] = config.request_timeout
+        kwargs["max_tokens"] = config.max_tokens
+        kwargs["max_tokens_by_phase"] = config.max_tokens_by_phase
     return cls(**kwargs)
 
 
