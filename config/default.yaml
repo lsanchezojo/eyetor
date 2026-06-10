@@ -65,7 +65,7 @@ fallback:
   # llamacpp = backup Qwen3.6-35B-A3B Q4_K_XL vía llama.cpp Vulkan + mmap
   # (~/.local/bin/llamacpp-eyetor.sh, llamacpp-eyetor.service). Para volver a
   # Qwen como principal, arranca ese servicio y mueve llamacpp al primer lugar.
-  fallback_chain: [ollama, llamacpp, openrouter, gemini]
+  fallback_chain: [ollama, openrouter, gemini]
   retry_on:
     - timeout
     - connection_error
