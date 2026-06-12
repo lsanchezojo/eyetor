@@ -38,10 +38,18 @@ logger = logging.getLogger(__name__)
 # Phrases a model may emit when it *announces* a tool call but forgets to
 # emit the structured tool_call in the same turn. Used to decide whether
 # to nudge it once before accepting the text as the final answer.
+#
+# The Spanish patterns are deliberately generic ("voy a <any verb>") rather
+# than a verb list: enumerations stay incomplete ("voy a buscar" once slipped
+# through) and a false positive costs at most one extra LLM call per turn —
+# the nudge only fires when tools are available, nothing has executed yet,
+# and the message is not a question to the user (_is_asking_user).
 _TOOL_INTENT_RE = re.compile(
-    r"(voy a (intent\w*|llamar|ejecutar|probar|reintent\w*|usar|lanzar)"
-    r"|procedo a (ejecutar|llamar|usar|lanzar|invocar|probar)"
-    r"|paso a (ejecutar|llamar|usar|lanzar|invocar|probar)"
+    r"((voy|vamos) a \w+"
+    r"|procedo a \w+"
+    r"|paso a \w+"
+    r"|d[ée]jame \w+"
+    r"|ahora (mismo )?lo \w+"
     r"|(ejecutar|llamar|usar|lanzar|invocar)(é| ahora| la herramienta)"
     r"|intentar(é| de nuevo| otra vez| nuevamente)"
     r"|reintent\w+"
