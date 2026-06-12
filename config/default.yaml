@@ -29,6 +29,28 @@ providers:
       chain_synthesize: 768
       agent: 768
 
+  llamacpp-mtp:
+    type: llamacpp
+    base_url: http://localhost:8081/v1
+    # Gemma-4 12B QAT + drafter MTP (decodificación especulativa, ~2x tok/s)
+    # vía llama.cpp b9585 Vulkan (~/.local/bin/llamacpp-gemma4-mtp.sh,
+    # llamacpp-gemma4-mtp.service). n_ctx real del server = 16384 (CTX en la
+    # unidad); si se cambia, sincronizar sessions.compaction.context_window.
+    model: default
+    temperature: 0.3
+    thinking: true
+    request_timeout: 300
+    reasoning_budget: 384
+    max_tokens: 1024
+    max_tokens_by_phase:
+      main: 1536
+      degeneration_recovery: 512
+      loop_break: 512
+      chain_plan: 512
+      chain_execute: 768
+      chain_synthesize: 768
+      agent: 768
+
   llamacpp:
     type: llamacpp
     base_url: http://localhost:8080/v1
@@ -61,11 +83,12 @@ providers:
     model: gemini-2.0-flash
 
 fallback:
-  # ollama = Gemma-4 12B QAT local en iGPU.
+  # llamacpp-mtp = Gemma-4 12B QAT + drafter MTP en :8081 (~2x tok/s).
+  # ollama = mismo Gemma-4 12B QAT sin MTP en :11434 (fallback local).
   # llamacpp = backup Qwen3.6-35B-A3B Q4_K_XL vía llama.cpp Vulkan + mmap
-  # (~/.local/bin/llamacpp-eyetor.sh, llamacpp-eyetor.service). Para volver a
-  # Qwen como principal, arranca ese servicio y mueve llamacpp al primer lugar.
-  fallback_chain: [ollama, openrouter, gemini]
+  # (~/.local/bin/llamacpp-eyetor.sh, llamacpp-eyetor.service, disabled). Para
+  # volver a Qwen, arranca ese servicio y mueve llamacpp al primer lugar.
+  fallback_chain: [llamacpp-mtp, openrouter, gemini]
   retry_on:
     - timeout
     - connection_error
@@ -246,7 +269,7 @@ sessions:
     plan_votes: 1         # voting rounds for planning step (1 = no voting)
   compaction:
     enabled: true
-    context_window: 12288           # = n_ctx real del servidor llama.cpp (/props); mantener sincronizado si se cambia -c
+    context_window: 16384     # = n_ctx real del servidor primario (llamacpp-mtp :8081, CTX=16384; verificable con curl localhost:8081/props). ollama gemma4 usa 32768; mantener sincronizado con el primario si se cambia
     trigger_at_percent: 0.70
     tool_output_max_chars: 2000
     keep_last_n_user_turns: 2

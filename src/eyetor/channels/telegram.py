@@ -1207,7 +1207,7 @@ def _format_tasks_text(scheduler) -> str:
     return "\n\n".join(lines)
 
 
-_LOCAL_PROVIDERS = {"ollama", "llamacpp", "local"}
+_LOCAL_PROVIDERS = {"ollama", "llamacpp", "llamacpp-mtp", "local"}
 _CLOUD_PROVIDERS = {"openrouter", "anthropic", "google", "openai", "azure"}
 
 

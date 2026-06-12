@@ -69,7 +69,7 @@ _IMAGE_PRICING: dict[str, ImagePricing] = {
 }
 
 # Providers that run local models — always $0 cost.
-_LOCAL_PROVIDERS = {"ollama", "llamacpp"}
+_LOCAL_PROVIDERS = {"ollama", "llamacpp", "llamacpp-mtp"}
 
 
 class CostEstimator:
