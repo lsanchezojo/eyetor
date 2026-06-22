@@ -397,6 +397,21 @@ class TelegramChannel(BaseChannel):
             text = _format_tools_text(session.tool_registry)
             await _send_long(msg, text, parse_mode="HTML")
 
+        @dp.message(Command("id"))
+        async def cmd_id(msg: Message) -> None:
+            # Intentionally NOT gated by _is_authorized: discovering a chat's
+            # id is exactly what you need before adding it to allowed_chats.
+            from html import escape
+
+            chat = msg.chat
+            user = msg.from_user
+            lines = [f"<b>chat.id:</b> <code>{chat.id}</code> ({chat.type})"]
+            if chat.title:
+                lines.append(f"<b>chat.title:</b> {escape(chat.title)}")
+            if user:
+                lines.append(f"<b>tu user.id:</b> <code>{user.id}</code>")
+            await msg.answer("\n".join(lines), parse_mode="HTML")
+
         @dp.message(Command("model"))
         async def cmd_model(msg: Message) -> None:
             if not _is_authorized(msg):
@@ -526,6 +541,7 @@ class TelegramChannel(BaseChannel):
                 "/model — list or change LLM provider\n"
                 "/tasks — list scheduled tasks\n"
                 "/usage — show token usage and costs\n"
+                "/id — show this chat's id and your user id\n"
                 "/thinking — toggle thinking display\n"
                 f"{extra}"
                 "/help — show this help\n\n"
@@ -771,6 +787,7 @@ class TelegramChannel(BaseChannel):
             BotCommand(command="usage", description="Show token usage and costs"),
             BotCommand(command="tools", description="List registered tools"),
             BotCommand(command="model", description="List or change LLM provider"),
+            BotCommand(command="id", description="Show this chat's id and your user id"),
         ]
         for _sc in _skill_commands:
             commands.append(BotCommand(command=_sc.name, description=_sc.description))
