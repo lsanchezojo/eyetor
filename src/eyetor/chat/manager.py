@@ -136,6 +136,9 @@ class SessionManager:
     def get_or_create(self, session_id: str) -> ChatSession:
         """Return the existing session or create a new one."""
         if session_id not in self._sessions:
+            from eyetor.access import resolve
+
+            access = resolve(self._root_config, session_id)
             self._sessions[session_id] = ChatSession(
                 session_id=session_id,
                 config=self._config,
@@ -148,6 +151,7 @@ class SessionManager:
                 root_config=self._root_config,
                 tracker=self._tracker,
                 cost_estimator=self._cost_estimator,
+                access=access,
             )
             logger.debug("Created new session: %s", session_id)
         return self._sessions[session_id]

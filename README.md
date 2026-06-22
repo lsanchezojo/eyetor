@@ -131,8 +131,14 @@ channels:
       enabled: true
       allowed_users:
         - ${TELEGRAM_ALLOWED_USER}
+      allowed_chats: []           # group chat_ids where any member may talk to the bot
 
 memory_db_path: ~/.eyetor/memory.db
+
+# Per-day, per-chat group conversation archive (see "Group chats" below)
+chatlog_enabled: true
+chatlog_db_path: ~/.eyetor/chatlog.db
+chatlog_retention_days: 0         # 0 = keep forever
 ```
 
 ## Usage
@@ -159,6 +165,24 @@ When run from a terminal, `eyetor start` opens an interactive CLI session. If Te
 **CLI commands:** `/reset`, `/history`, `/skills`, `/agents`, `/tools`, `/model`, `/help`, `/exit`
 
 **Telegram bot commands:** `/start`, `/reset`, `/skills`, `/agents`, `/tools`, `/model`, `/tasks`, `/usage`, `/help` + any commands declared by skills (see [Skill commands](#skill-commands))
+
+### Group chats (Telegram)
+
+The bot works both in direct messages and in group chats. In a group it behaves like a third participant:
+
+- **Reads everything, replies only when addressed.** Every message is archived for context, but the bot only responds when you **@mention** it or **reply** to one of its messages — so it doesn't interrupt the conversation between humans.
+- **Shared, identity-aware history.** Messages are stored prefixed with the sender's name (`[Luis]: ...`), so the model knows who said what in a multi-party conversation.
+- **Anyone in an allowed group can talk to it.** Authorization in groups is per-chat: add the group's numeric `chat_id` (negative, e.g. `-1001234567890`) to `auth.allowed_chats`. Direct messages still use `auth.allowed_users`.
+
+**Out-of-context archive.** Because the local model has a small context window, the full group history is **not** loaded into context. Instead it's archived per day and per chat in `chatlog.db` and queried **on demand** via tools the model calls when it needs to recall something — or when a user asks (e.g. "¿de qué hablamos ayer sobre X?"):
+
+- `chat_history_search` — full-text search this chat's history (optionally filtered by day)
+- `chat_history_read_day` — read a full day's transcript
+- `chat_history_list_days` — list which days have history
+
+Each tool is scoped to the current chat, so one group can never read another's logs. Set `chatlog_retention_days` > 0 to auto-purge old messages.
+
+**Setup (one-time):** to let the bot receive group messages that don't mention it (needed for the history), disable its *privacy mode* in **@BotFather** → `/setprivacy` → select the bot → **Disable**. Then add the group's `chat_id` to `allowed_chats`. (To find the `chat_id`, add the bot to the group and check the service logs, or use a chat-id helper bot.)
 
 ### Image descriptions (Telegram)
 
@@ -450,7 +474,7 @@ plugins_dirs:
 
 The agent has persistent memory backed by SQLite (`~/.eyetor/memory.db`). It can save facts, preferences, and notes across sessions using the `remember` and `forget` tools. Saved memories are injected into the system prompt at the start of every conversation.
 
-In Telegram, each user has an independent memory space. In CLI, memory is shared under the `cli` session.
+In Telegram, memory is scoped per chat (`telegram-<chat_id>`): a direct chat has its own space, and a group has a single shared one. In CLI, memory is shared under the `cli` session. Group chats additionally keep a separate, out-of-context conversation archive (see [Group chats](#group-chats-telegram)).
 
 ## Skills
 

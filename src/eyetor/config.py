@@ -48,6 +48,7 @@ class TelegramAuthConfig(BaseModel):
 
     enabled: bool = True
     allowed_users: list[str | int] = []
+    allowed_chats: list[str | int] = []  # group chat_ids; any member can talk to the bot
 
 
 class TelegramChannelConfig(BaseModel):
@@ -267,6 +268,18 @@ class KnowledgeConfig(BaseModel):
     embedding: KnowledgeEmbeddingConfig = KnowledgeEmbeddingConfig()
 
 
+class AccessPolicy(BaseModel):
+    """Per-chat allowlist of tools and skills the bot may use.
+
+    Names are matched exactly. ``"*"`` in a list means "all". A skill named
+    ``my-skill`` is exposed as the tool ``skill_my_skill``; list it under
+    ``skills`` (by skill name) to allow it.
+    """
+
+    tools: list[str] = []
+    skills: list[str] = []
+
+
 class VectorConfig(BaseModel):
     """Root configuration for Eyetor."""
 
@@ -277,6 +290,12 @@ class VectorConfig(BaseModel):
     agents_dirs: list[str] = ["./agents", "~/.eyetor/agents"]
     agent_instructions: str = "~/.eyetor/AGENTS.md"
     memory_db_path: str = "~/.eyetor/memory.db"
+    chatlog_enabled: bool = True
+    chatlog_db_path: str = "~/.eyetor/chatlog.db"
+    chatlog_retention_days: int = 0  # 0 = keep forever; >0 purges older messages
+    # Per-chat tool/skill access. Empty = unrestricted (every chat may use all).
+    # When set, keys are session_ids ("cli", "telegram-<chat_id>", or "default").
+    access: dict[str, AccessPolicy] = {}
     tracking: TrackingConfig = TrackingConfig()
     channels: ChannelsConfig = ChannelsConfig()
     sessions: SessionsConfig = SessionsConfig()

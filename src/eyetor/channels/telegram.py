@@ -151,6 +151,7 @@ class TelegramChannel(BaseChannel):
         tracker: "UsageTracker | None" = None,
         full_config: "VectorConfig | None" = None,
         agent_reg=None,
+        chatlog=None,
     ) -> None:
         self._manager = session_manager
         self._config = config
@@ -158,6 +159,8 @@ class TelegramChannel(BaseChannel):
         self._agent_reg = agent_reg
         self._scheduler = scheduler
         self._tracker = tracker
+        self._chatlog = chatlog
+        self._full_config = full_config
         self._dp = None
         self._bot = None
 
@@ -236,11 +239,36 @@ class TelegramChannel(BaseChannel):
         self._bot = bot
         self._dp = dp
 
+        # Bot identity — used to detect mentions/replies in group chats.
+        me = await bot.get_me()
+        bot_username = (me.username or "").lower()
+        bot_id = me.id
+
+        # The model is fed group turns prefixed with "[Name]: " so it knows who
+        # speaks. Some models echo the pattern and prefix their own replies with
+        # "[Eyetor]: ". Strip that leading self-label defensively before sending.
+        _self_labels = {
+            lbl.lower() for lbl in (me.first_name, me.username, "eyetor") if lbl
+        }
+        _self_label_re = re.compile(r"^\s*\[([^\]\n]{1,40})\]:\s*")
+
+        def _strip_self_label(text: str) -> str:
+            m = _self_label_re.match(text or "")
+            if m and m.group(1).strip().lower() in _self_labels:
+                return text[m.end():]
+            return text
+
         auth_config = self._config.auth
         allowed_users = set(str(u) for u in (auth_config.allowed_users or []))
+        allowed_chats = set(str(c) for c in (auth_config.allowed_chats or []))
+
+        def _is_group(msg: Message) -> bool:
+            return msg.chat.type in ("group", "supergroup")
 
         def _is_authorized(msg: Message) -> bool:
             if not auth_config.enabled:
+                return True
+            if _is_group(msg) and str(msg.chat.id) in allowed_chats:
                 return True
             user = msg.from_user
             if not user:
@@ -248,6 +276,71 @@ class TelegramChannel(BaseChannel):
             return str(user.id) in allowed_users or (
                 user.username and user.username in allowed_users
             )
+
+        def _is_addressed(msg: Message) -> bool:
+            """True if the bot should respond: private chat, a reply to the bot,
+            or an @mention of the bot in the text/caption."""
+            if not _is_group(msg):
+                return True
+            reply = msg.reply_to_message
+            if reply and reply.from_user and reply.from_user.id == bot_id:
+                return True
+            if bot_username:
+                text = (msg.text or msg.caption or "").lower()
+                if f"@{bot_username}" in text:
+                    return True
+            return False
+
+        def _sender_label(msg: Message) -> str:
+            user = msg.from_user
+            if not user:
+                return "?"
+            return user.full_name or user.username or str(user.id)
+
+        def _format_input(msg: Message, text: str) -> str:
+            """In groups, prefix with the sender's name (and strip the @mention)
+            so the model knows who is speaking in a multi-party conversation."""
+            if not _is_group(msg):
+                return text
+            if bot_username:
+                text = re.sub(
+                    rf"@{re.escape(bot_username)}\b",
+                    "",
+                    text,
+                    flags=re.IGNORECASE,
+                ).strip()
+            return f"[{_sender_label(msg)}]: {text}"
+
+        def _archive(msg: Message, sender: str, text: str) -> None:
+            """Record a group message into the out-of-context chat archive."""
+            if not (self._chatlog and _is_group(msg) and (text or "").strip()):
+                return
+            self._chatlog.record(f"telegram-{msg.chat.id}", sender, text)
+
+        _GROUP_HINT = (
+            "Estás participando en un chat de GRUPO con varias personas. En el "
+            "historial, cada mensaje viene prefijado con el nombre de quien habla "
+            "([Nombre]: ...); ten en cuenta quién dice cada cosa. El historial "
+            "COMPLETO del grupo NO está en tu contexto: se archiva por día y puedes "
+            "consultarlo con las herramientas chat_history_search, "
+            "chat_history_read_day y chat_history_list_days. Úsalas cuando "
+            "necesites recordar algo dicho antes (hoy u otro día) o cuando alguien "
+            "te lo pida. IMPORTANTE: cuando respondas, escribe tu mensaje "
+            "directamente; NO lo prefijes con tu nombre ni con '[Eyetor]:'. Ese "
+            "formato '[Nombre]:' es solo para los mensajes del historial, no para "
+            "tus respuestas."
+        )
+
+        def _session_for(msg: Message, session_id: str):
+            """get_or_create + inject the group hint into group sessions once."""
+            session = self._manager.get_or_create(session_id)
+            if self._chatlog and _is_group(msg):
+                base = session._system_prompt_suffix or ""
+                if _GROUP_HINT not in base:
+                    session._system_prompt_suffix = (
+                        f"{base}\n\n{_GROUP_HINT}".strip()
+                    )
+            return session
 
         @dp.message(Command("start"))
         async def cmd_start(msg: Message) -> None:
@@ -334,6 +427,13 @@ class TelegramChannel(BaseChannel):
                 except Exception as exc:
                     await msg.answer(f"Error: {exc}")
 
+        def _skill_allowed(msg: Message, skill_name: str) -> bool:
+            """Whether this chat may use the given skill (per access config)."""
+            from eyetor.access import resolve
+
+            acc = resolve(self._full_config, f"telegram-{msg.chat.id}")
+            return acc.allows_tool(f"skill_{skill_name.replace('-', '_')}")
+
         # --- Dynamic skill commands ---
         _skill_commands = []
         if self._skill_reg:
@@ -353,8 +453,12 @@ class TelegramChannel(BaseChannel):
                         _path=_script_path,
                         _args=_default_args,
                         _pm=_parse,
+                        _skill_name=_meta.name,
                     ) -> None:
                         if not _is_authorized(msg):
+                            return
+                        if not _skill_allowed(msg, _skill_name):
+                            await msg.answer("Esa skill no está disponible en este chat.")
                             return
                         user_args = (msg.text or "").split()[1:]
                         raw = await _run_skill_script(_path, _args + user_args)
@@ -367,8 +471,12 @@ class TelegramChannel(BaseChannel):
                     async def _skill_prompt_handler(
                         msg: Message,
                         _tmpl=_template,
+                        _skill_name=_meta.name,
                     ) -> None:
                         if not _is_authorized(msg):
+                            return
+                        if not _skill_allowed(msg, _skill_name):
+                            await msg.answer("Esa skill no está disponible en este chat.")
                             return
                         user_parts = (msg.text or "").split(maxsplit=1)
                         args_text = user_parts[1] if len(user_parts) > 1 else ""
@@ -432,7 +540,14 @@ class TelegramChannel(BaseChannel):
                 return
 
             session_id = f"telegram-{msg.chat.id}"
-            session = self._manager.get_or_create(session_id)
+
+            # Archive every group message (addressed or not) out of context.
+            _archive(msg, _sender_label(msg), msg.text or "")
+            # In groups, only respond when mentioned or replied to.
+            if not _is_addressed(msg):
+                return
+
+            session = _session_for(msg, session_id)
 
             # Send placeholder and stream response progressively
             placeholder = await msg.answer("...")
@@ -440,7 +555,7 @@ class TelegramChannel(BaseChannel):
             last_edit = ""
             try:
                 current_channel.set("telegram")
-                async for chunk in session.send(msg.text or ""):
+                async for chunk in session.send(_format_input(msg, msg.text or "")):
                     buffer += chunk
                     if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
                         try:
@@ -458,9 +573,10 @@ class TelegramChannel(BaseChannel):
                         await msg.answer(f"💭 {session.last_reasoning.strip()}")
 
                 # Strip [IMAGE:...] markers from text (images sent separately)
-                clean_buffer = _IMAGE_MARKER_RE.sub("", buffer).strip()
+                clean_buffer = _strip_self_label(_IMAGE_MARKER_RE.sub("", buffer).strip())
                 image_paths = _collect_image_paths(buffer, session)
                 if clean_buffer:
+                    _archive(msg, "Eyetor", clean_buffer)
                     await _finalize_as_new(
                         msg, placeholder, _md_to_html(clean_buffer), clean_buffer
                     )
@@ -494,6 +610,13 @@ class TelegramChannel(BaseChannel):
                 return
 
             caption = msg.caption or ""
+
+            # Archive the image event (caption) out of context; skip the
+            # expensive vision call when the bot isn't addressed in a group.
+            _archive(msg, _sender_label(msg), f"[imagen] {caption}".strip())
+            if not _is_addressed(msg):
+                return
+
             placeholder = None
             try:
                 import base64 as _b64
@@ -525,7 +648,7 @@ class TelegramChannel(BaseChannel):
                 logger.debug("Vision description: %s", description[:300])
 
                 # Step 2: Send the description (+ metadata) to the main LLM session
-                user_text = caption.strip() if caption.strip() else ""
+                user_text = _format_input(msg, caption.strip()) if caption.strip() else ""
                 caption_date = _extract_caption_date(user_text)
                 prompt = _build_image_prompt(
                     user_text=user_text,
@@ -535,7 +658,7 @@ class TelegramChannel(BaseChannel):
                 )
 
                 session_id = f"telegram-{msg.chat.id}"
-                session = self._manager.get_or_create(session_id)
+                session = _session_for(msg, session_id)
 
                 buffer = ""
                 last_edit = ""
@@ -549,9 +672,10 @@ class TelegramChannel(BaseChannel):
                         except Exception:
                             pass
 
-                clean_buffer = _IMAGE_MARKER_RE.sub("", buffer).strip()
+                clean_buffer = _strip_self_label(_IMAGE_MARKER_RE.sub("", buffer).strip())
                 image_paths = _collect_image_paths(buffer, session)
                 if clean_buffer:
+                    _archive(msg, "Eyetor", clean_buffer)
                     html = _md_to_html(clean_buffer)
                     await _finalize_as_new(msg, placeholder, html, clean_buffer)
                 else:
@@ -588,7 +712,15 @@ class TelegramChannel(BaseChannel):
                 return  # error already sent to user
 
             session_id = f"telegram-{msg.chat.id}"
-            session = self._manager.get_or_create(session_id)
+
+            # Archive the transcription out of context. In groups a voice note
+            # can't @mention the bot, so it only triggers a reply when it's a
+            # reply to the bot; otherwise it's archived silently.
+            _archive(msg, _sender_label(msg), transcription)
+            if not _is_addressed(msg):
+                return
+
+            session = _session_for(msg, session_id)
 
             placeholder = await msg.answer(
                 f"🎤 <i>{_escape_html(transcription)}</i>\n\n...", parse_mode="HTML"
@@ -597,7 +729,7 @@ class TelegramChannel(BaseChannel):
             last_edit = ""
             try:
                 current_channel.set("telegram")
-                async for chunk in session.send(transcription):
+                async for chunk in session.send(_format_input(msg, transcription)):
                     buffer += chunk
                     if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
                         try:
@@ -608,9 +740,10 @@ class TelegramChannel(BaseChannel):
                         except Exception:
                             pass
 
-                clean_buffer = _IMAGE_MARKER_RE.sub("", buffer).strip()
+                clean_buffer = _strip_self_label(_IMAGE_MARKER_RE.sub("", buffer).strip())
                 image_paths = _collect_image_paths(buffer, session)
                 if clean_buffer:
+                    _archive(msg, "Eyetor", clean_buffer)
                     html = f"🎤 <i>{_escape_html(transcription)}</i>\n\n{_md_to_html(clean_buffer)}"
                     plain = f"🎤 {transcription}\n\n{clean_buffer}"
                     await _finalize_as_new(msg, placeholder, html, plain)

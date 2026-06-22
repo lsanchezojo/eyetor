@@ -128,6 +128,33 @@ agent_instructions: ~/.eyetor/AGENTS.md
 
 memory_db_path: ~/.eyetor/memory.db
 
+# Per-day, per-chat conversation archive for group chats. Stored out of the
+# model context and queried on demand via the chat_history_* tools, so a small
+# context window never gets saturated by a busy group.
+chatlog_enabled: true
+chatlog_db_path: ~/.eyetor/chatlog.db
+chatlog_retention_days: 0   # 0 = keep forever; e.g. 90 purges messages older than 90 days
+
+# Per-chat tool/skill access control. WITHOUT this block, every chat may use
+# all tools and skills. WITH it, access is restrictive:
+#   - keys are session_ids: "telegram-<chat_id>", "cli-*", and the special "default"
+#   - lookup precedence: exact id > glob pattern (longest) > "default" > nothing
+#   - "*" in a list means "all tools" / "all skills"
+#   - skills are listed by skill name (e.g. "web-search"); tools by tool name
+access:
+  default:                          # any chat not listed → conversation only, no tools
+    tools: []
+    skills: []
+  "cli-*":                          # all local CLI sessions → everything
+    tools: ["*"]
+    skills: ["*"]
+  "telegram-7874955":               # owner private chat → everything
+    tools: ["*"]
+    skills: ["*"]
+  "telegram--1004368034361":        # group of three → chat + web search + KB + group history
+    tools: [kb_search, kb_read, kb_list_sources, chat_history_search, chat_history_read_day, chat_history_list_days]
+    skills: [web-search]
+
 tracking:
   db_path: ~/.eyetor/tracking.db
   month_start_day: 1        # Day of the month when billing period starts (1-31)
@@ -147,6 +174,13 @@ channels:
       enabled: true
       allowed_users:
         - ${TELEGRAM_ALLOWED_USER}   # your numeric chat_id, e.g.: 123456789
+      # Group chats where ANY member may talk to the bot (mention @bot or reply
+      # to it). Use the group's numeric chat_id (negative, e.g. -1001234567890).
+      # To let the bot read the full group history, disable its privacy mode in
+      # BotFather: /setprivacy -> select the bot -> Disable.
+      allowed_chats:
+        - -1004368034361    # grupo de los tres (supergrupo)
+        # - -1001234567890
 
 scheduler:
   enabled: true

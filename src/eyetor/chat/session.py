@@ -10,6 +10,7 @@ import shlex
 from pathlib import Path
 from typing import AsyncIterator, TYPE_CHECKING
 
+from eyetor.access import Access
 from eyetor.chat.tool_gating import KNOWN_GROUPS, select_groups
 from eyetor.models.agents import AgentConfig
 from eyetor.models.messages import Message, ToolCall
@@ -328,12 +329,14 @@ class ChatSession:
         tracker: "UsageTracker | None" = None,
         cost_estimator: "CostEstimator | None" = None,
         observer: "WorkerObserver | None" = None,
+        access: "Access | None" = None,
     ) -> None:
         self.session_id = session_id
         self.config = config
         self.provider = provider
         self._messages: list[Message] = []
         self._system_prompt_suffix = system_prompt_suffix
+        self._access = access
         self._memory = memory_manager
         self._scheduler = scheduler
         self._knowledge = knowledge
@@ -389,6 +392,25 @@ class ChatSession:
                 self._register_scheduler_tools(scheduler)
         else:
             self.tool_registry = tool_registry or ToolRegistry()
+
+        # Per-chat access control: prune tools this chat may not use. Always
+        # operates on a fresh registry so the shared one is never mutated.
+        if access is not None and not access.unrestricted:
+            allowed = ToolRegistry()
+            removed: list[str] = []
+            for tool in self.tool_registry._tools.values():
+                if access.allows_tool(tool.name):
+                    allowed.register(tool)
+                else:
+                    removed.append(tool.name)
+            self.tool_registry = allowed
+            if removed:
+                logger.info(
+                    "Session '%s' — access policy: %d tool(s) blocked (%s)",
+                    session_id,
+                    len(removed),
+                    ", ".join(sorted(removed)),
+                )
 
     # ------------------------------------------------------------------
     # Conversation history
@@ -1181,6 +1203,10 @@ class ChatSession:
             kb_context = self._knowledge.build_context()
             if kb_context:
                 system_content = f"{system_content}\n\n{kb_context}"
+        if self._access is not None:
+            access_note = self._access.allowed_summary()
+            if access_note:
+                system_content = f"{system_content}\n\n{access_note}"
         return system_content
 
     def _get_full_messages(self) -> list[Message]:
