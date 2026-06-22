@@ -293,6 +293,9 @@ class VectorConfig(BaseModel):
     vision_model: str | None = (
         None  # model override; uses provider's default model if None
     )
+    vision_fallback: list[str] = (
+        []
+    )  # provider names tried in order when the primary vision provider fails
     log_level: str = "INFO"
 
 

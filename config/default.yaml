@@ -75,7 +75,17 @@ providers:
     type: llamacpp
     base_url: http://localhost:8082/v1
     model: default
-    
+
+  # Modelo de visión de PAGO en OpenRouter — solo se usa como fallback cuando el
+  # primario (nemotron :free) o el llamacpp-vision local fallan. OCR fiable y barato.
+  openrouter-vision:
+    type: openrouter
+    ssl_verify: false
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY}
+    model: google/gemini-2.0-flash-001
+
+
   gemini:
     type: gemini
     base_url: https://generativelanguage.googleapis.com/v1beta
@@ -189,9 +199,14 @@ default_image_provider: gemini-flash
 
 # Vision provider: used to describe images sent by users (multimodal LLM call).
 # References one of the providers above — inherits its base_url and api_key.
-# The api_key must be set in .env (e.g. OPENROUTER_API_KEY).
-vision_provider: openrouter # ej. openrouter
-vision_model: nvidia/nemotron-nano-12b-v2-vl:free # ej. nvidia/nemotron-nano-12b-v2-vl:free
+# Primario: Gemma-4 12B multimodal local en :8081 (provider llamacpp-mtp, mismo
+# server de texto con --mmproj). Gratis y privado; el thinking se desactiva por
+# petición para describir imágenes. vision_model vacío → usa el modelo cargado.
+vision_provider: llamacpp-mtp
+vision_model:
+# Respaldo probado en orden si el local falla (server caído, cuerpo sin 'choices',
+# error). openrouter-vision = gemini-2.0-flash de pago, fiable.
+vision_fallback: [openrouter-vision]
 
 mcp_servers: {}
 

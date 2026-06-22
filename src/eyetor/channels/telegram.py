@@ -163,21 +163,42 @@ class TelegramChannel(BaseChannel):
 
         self._show_thinking: dict[int, bool] = {}  # per chat_id toggle for /thinking
 
-        # Resolve vision provider settings from config (fallback to env vars in _describe_image)
-        self._vision_base_url: str | None = None
-        self._vision_api_key: str | None = None
-        self._vision_model: str | None = None
+        # Resolve vision provider chain from config (primary + fallbacks).
+        # Empty list → _describe_image falls back to VISION_* env vars.
+        self._vision_specs: list[dict] = []
         if full_config and full_config.vision_provider:
-            prov_cfg = full_config.providers.get(full_config.vision_provider)
-            if prov_cfg:
-                self._vision_base_url = prov_cfg.base_url
-                self._vision_api_key = prov_cfg.api_key or ""
-                self._vision_model = full_config.vision_model or prov_cfg.model
+            primary = full_config.vision_provider
+            names = [primary] + [
+                n for n in (full_config.vision_fallback or []) if n != primary
+            ]
+            for name in names:
+                prov_cfg = full_config.providers.get(name)
+                if not prov_cfg:
+                    logger.warning("Vision provider '%s' not found in providers", name)
+                    continue
+                # vision_model override only applies to the primary provider
+                model = (
+                    full_config.vision_model or prov_cfg.model
+                    if name == primary
+                    else prov_cfg.model
+                )
+                spec = {
+                    "name": name,
+                    "base_url": prov_cfg.base_url,
+                    "api_key": prov_cfg.api_key or "",
+                    "model": model,
+                }
+                # Local llama.cpp (Gemma-4) razona por defecto; para describir
+                # imágenes no hace falta y desperdicia el presupuesto de tokens.
+                if prov_cfg.type == "llamacpp":
+                    spec["extra"] = {"chat_template_kwargs": {"enable_thinking": False}}
+                self._vision_specs.append(spec)
+            if self._vision_specs:
                 logger.info(
-                    "Vision provider: %s model=%s url=%s",
-                    full_config.vision_provider,
-                    self._vision_model,
-                    self._vision_base_url,
+                    "Vision providers: %s",
+                    ", ".join(
+                        f"{s['name']}(model={s['model']})" for s in self._vision_specs
+                    ),
                 )
 
     async def start(self) -> None:
@@ -499,9 +520,7 @@ class TelegramChannel(BaseChannel):
                 description = await _describe_image(
                     img_b64,
                     caption,
-                    base_url=self._vision_base_url,
-                    api_key=self._vision_api_key,
-                    model=self._vision_model,
+                    specs=self._vision_specs or None,
                 )
                 logger.debug("Vision description: %s", description[:300])
 
@@ -715,28 +734,41 @@ async def _sync_bot_commands(
 async def _describe_image(
     img_b64: str,
     caption: str = "",
+    *,
+    specs: list[dict] | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
     model: str | None = None,
 ) -> str:
-    """Send an image to the configured vision LLM and return a text description.
+    """Send an image to a vision LLM and return a text description.
 
-    Connection settings are resolved from config (vision_provider / vision_model in
-    default.yaml). Falls back to VISION_BASE_URL / VISION_API_KEY / VISION_MODEL
-    environment variables when not provided.
+    Tries each provider spec in ``specs`` (``{"name", "base_url", "api_key",
+    "model"}``) in order, moving on to the next when one fails (connection error,
+    HTTP error, or a 200 body without ``choices`` — common with OpenRouter ``:free``
+    models that return ``{"error": {...}}`` with status 200). Raises only when every
+    provider fails.
+
+    When ``specs`` is None, a single spec is built from the ``base_url``/``api_key``/
+    ``model`` arguments, falling back to VISION_BASE_URL / VISION_API_KEY /
+    VISION_MODEL environment variables.
 
     The vision prompt stays channel-generic: it asks for visible text,
     dates, numbers and layout without mentioning any downstream tool.
     """
     import httpx
 
-    base_url = (
-        base_url or os.environ.get("VISION_BASE_URL", "http://localhost:8080/v1")
-    ).rstrip("/")
-    api_key = (
-        api_key if api_key is not None else os.environ.get("VISION_API_KEY", "")
-    ).strip()
-    model = model or os.environ.get("VISION_MODEL", "default")
+    if not specs:
+        specs = [
+            {
+                "name": "vision",
+                "base_url": base_url
+                or os.environ.get("VISION_BASE_URL", "http://localhost:8080/v1"),
+                "api_key": api_key
+                if api_key is not None
+                else os.environ.get("VISION_API_KEY", ""),
+                "model": model or os.environ.get("VISION_MODEL", "default"),
+            }
+        ]
 
     prompt = (
         "Analiza esta imagen de forma precisa y neutral. Indica primero qué "
@@ -756,39 +788,73 @@ async def _describe_image(
             "(por ejemplo fechas, lugares o cantidades), menciónalos aparte."
         )
 
-    headers: dict[str, str] = {
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/lsanchezojo/eyetor",
-        "X-Title": "Eyetor",
-    }
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                },
+            ],
+        }
+    ]
 
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
-                    },
-                ],
-            }
-        ],
-        "max_tokens": 2048,
-        "temperature": 0.1,
-    }
+    async def _call_one(spec: dict) -> str:
+        base = (spec.get("base_url") or "").rstrip("/")
+        key = (spec.get("api_key") or "").strip()
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/lsanchezojo/eyetor",
+            "X-Title": "Eyetor",
+        }
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        payload = {
+            "model": spec.get("model") or "default",
+            "messages": messages,
+            "max_tokens": 2048,
+            "temperature": 0.1,
+            **(spec.get("extra") or {}),
+        }
+        async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
+            resp = await client.post(
+                f"{base}/chat/completions", json=payload, headers=headers
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not choices:
+            # OpenRouter :free models often return HTTP 200 with an error body.
+            err = ""
+            if isinstance(data, dict) and isinstance(data.get("error"), dict):
+                err = data["error"].get("message", "")
+            logger.warning(
+                "Vision provider %s returned no choices; body: %s",
+                spec.get("name", "?"),
+                str(data)[:300],
+            )
+            raise RuntimeError(err or "respuesta sin 'choices'")
+        content = choices[0].get("message", {}).get("content")
+        if not content:
+            raise RuntimeError("respuesta sin contenido")
+        return content
 
-    async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
-        resp = await client.post(
-            f"{base_url}/chat/completions", json=payload, headers=headers
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
+    errors: list[str] = []
+    for spec in specs:
+        name = spec.get("name", "?")
+        try:
+            return await _call_one(spec)
+        except Exception as exc:  # noqa: BLE001 — try next provider on any failure
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+            logger.warning(
+                "Vision provider %s failed: %s; trying next", name, exc
+            )
+
+    raise RuntimeError(
+        "Todos los proveedores de visión fallaron — " + "; ".join(errors)
+    )
 
 
 _whisper_model = None  # Module-level cache — loaded once on first use
