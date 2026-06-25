@@ -117,6 +117,60 @@ def _is_asking_user(text: str) -> bool:
     return any(m in lowered for m in _ASK_USER_MARKERS)
 
 
+# When the announce-without-call nudge does NOT get the model to emit a
+# tool_call, a small model sometimes replies *to the nudge* as if it were user
+# criticism — apologizing and narrating its own tool/plan process instead of
+# answering. That meta-commentary then leaks to the user as the final answer
+# (see the "Boteando" group incident: "Lo siento, tienes razón... no necesito
+# realizar más llamadas a herramientas"). We detect it by requiring BOTH an
+# apology/error admission AND a reference to the model's internal process, so a
+# legitimate answer that merely mentions a tool ("usé la búsqueda y encontré…")
+# does not trip the guard.
+_SCAFFOLD_APOLOGY_RE = re.compile(
+    r"(lo siento"
+    r"|mis disculpas"
+    r"|disculpa(s|me)?\b"
+    r"|perd[óo]n"
+    r"|tienes raz[óo]n"
+    r"|he cometido (un|el) error"
+    r"|me he equivocado"
+    r"|i (apologize|'?m sorry)"
+    r"|you'?re right"
+    r"|my mistake)",
+    re.IGNORECASE,
+)
+_SCAFFOLD_PROCESS_RE = re.compile(
+    r"(tool[_ ]?calls?"
+    r"|llamadas? a (la |las )?herramientas?"
+    r"|llamar a (la |las )?herramientas?"
+    r"|ejecuci[óo]n del plan"
+    r"|comunicaci[óo]n de (las|mis) acciones"
+    r"|no necesito (realizar|hacer|llamar a|usar)\w* (m[áa]s )?(llamadas|herramientas)"
+    r"|no (necesito|hace falta) (realizar|hacer|usar)\w* m[áa]s (llamadas|herramientas)"
+    r"|en la ejecuci[óo]n"
+    r"|mi proceso interno)",
+    re.IGNORECASE,
+)
+
+
+def _is_scaffolding_leak(text: str) -> bool:
+    """True if ``text`` is the model talking *about its own tool/plan process*
+    (with an apology) instead of answering the user.
+
+    Requires co-occurrence of an apology/error admission and an internal-process
+    reference to keep false positives bounded: a normal answer that mentions a
+    tool in passing won't match, but a meta-reply to the announce-without-call
+    nudge ("lo siento, tienes razón... no necesito más llamadas a herramientas")
+    will. Used as a safety net so such replies are never sent as the final
+    answer. See ``_TOOL_INTENT_RE`` for the announce-without-call nudge itself.
+    """
+    if not text:
+        return False
+    return bool(_SCAFFOLD_APOLOGY_RE.search(text)) and bool(
+        _SCAFFOLD_PROCESS_RE.search(text)
+    )
+
+
 _CONFIRMATION_RE = re.compile(
     r"^(s[ií]|ok|dale|hazlo|adelante|confirmo|confirma|vale|"
     r"venga|va|claro|por supuesto|yes|yeah|yep|sure|go ahead|do it"
@@ -636,6 +690,7 @@ class ChatSession:
         nudged = False  # allow at most one "announce-without-call" nudge per turn
         empty_nudged = False  # allow one retry for immediate empty/no-tool replies
         degeneration_recovered = False  # one-shot post-tool synthesis fallback
+        scaffold_recovered = False  # one-shot clean-synthesis fallback for leaks
         tools_executed = 0
 
         while iterations < self.config.max_iterations:
@@ -723,10 +778,11 @@ class ChatSession:
                         Message(
                             role="user",
                             content=(
-                                "No has emitido ni respuesta visible ni tool_call estructurada. "
-                                "Continúa ahora: si necesitas actuar en el ordenador, emite la "
-                                "tool_call correcta; si no necesitas herramientas, responde al "
-                                "usuario directamente en español. No dejes la respuesta vacía."
+                                "Recordatorio del sistema: aún no hay respuesta visible ni tool_call "
+                                "estructurada. Continúa ahora: si necesitas actuar en el ordenador, "
+                                "emite la tool_call correcta; si no necesitas herramientas, responde "
+                                "directamente a la consulta del usuario en español, sin hablar de tu "
+                                "proceso interno y sin disculparte. No dejes la respuesta vacía."
                             ),
                         )
                     )
@@ -768,9 +824,11 @@ class ChatSession:
                         Message(
                             role="user",
                             content=(
-                                "Has anunciado que ibas a llamar a una herramienta pero no has emitido "
-                                "la tool_call estructurada. Emítela ahora con los parámetros correctos. "
-                                "Si ya no necesitas más herramientas, responde al usuario directamente."
+                                "Recordatorio del sistema: para usar una herramienta debes emitir la "
+                                "tool_call estructurada; describirla en texto no la ejecuta. Si necesitas "
+                                "una herramienta, emítela ahora con los parámetros correctos. Si no, "
+                                "responde directamente a la consulta del usuario en español, sin hablar "
+                                "de herramientas ni de tu proceso interno y sin disculparte."
                             ),
                         )
                     )
@@ -825,6 +883,62 @@ class ChatSession:
                         forced,
                         reasoning=result.reasoning_content,
                         context="degeneration recovery",
+                    )
+                    content = _final_text(forced.content, result.reasoning_content)
+                    if self._observer:
+                        self._observer.on_done(content)
+                    yield content
+                    return
+                # Scaffolding-leak recovery: after a nudge this turn, the model
+                # sometimes replies *to the nudge* — apologizing and narrating
+                # its own tool/plan process instead of answering ("lo siento,
+                # tienes razón... no necesito más llamadas a herramientas").
+                # Never send that meta-commentary; force one clean synthesis
+                # pass so the user gets an actual answer.
+                if (
+                    nudged
+                    and not scaffold_recovered
+                    and _is_scaffolding_leak(content)
+                ):
+                    scaffold_recovered = True
+                    logger.warning(
+                        "Session '%s' — scaffolding-leak reply after nudge at iter %d; "
+                        "forcing clean synthesis pass",
+                        self.session_id,
+                        iterations,
+                    )
+                    full_messages.append(
+                        Message(
+                            role="user",
+                            content=(
+                                "Responde directamente a la consulta original del usuario "
+                                "en español. No menciones herramientas, llamadas, tool_calls, "
+                                "planes ni tu proceso interno; no te disculpes. Si ya tienes la "
+                                "información, da la respuesta; si te falta un dato, pídelo de "
+                                "forma concreta."
+                            ),
+                        )
+                    )
+                    with tracking_context(phase="scaffold_recovery"):
+                        full_messages = await self._compact_before_llm(
+                            full_messages, reason="scaffold_recovery"
+                        )
+                        result = await self.provider.complete(
+                            messages=full_messages,
+                            tools=None,
+                            temperature=self.config.temperature,
+                        )
+                    self._mark_force_compact_after_fallback("scaffold_recovery")
+                    forced = result.message
+                    if result.reasoning_content:
+                        self.last_reasoning = (
+                            (self.last_reasoning + "\n\n" if self.last_reasoning else "")
+                            + result.reasoning_content
+                        )
+                    self._remember_assistant(
+                        forced,
+                        reasoning=result.reasoning_content,
+                        context="scaffold recovery",
                     )
                     content = _final_text(forced.content, result.reasoning_content)
                     if self._observer:

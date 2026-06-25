@@ -478,6 +478,75 @@ def test_invalid_tool_call_arguments_are_not_executed_or_remembered():
     )
 
 
+class _ScaffoldLeakAfterNudgeProvider:
+    """Announces a tool, then (after the nudge) replies to the nudge with a
+    scaffolding-leak apology. The forced clean-synthesis pass (tools=None)
+    returns the real answer."""
+
+    model = "fake"
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.synth_calls = 0
+
+    async def complete(self, messages, tools=None, temperature=0.0):
+        if tools is None:
+            self.synth_calls += 1
+            return CompletionResult(
+                message=Message(
+                    role="assistant",
+                    content="BSEED es una marca de domótica compatible con Tuya.",
+                )
+            )
+        self.calls += 1
+        if self.calls == 1:
+            return CompletionResult(
+                message=Message(
+                    role="assistant",
+                    content="Voy a ejecutar fake_tool ahora.",
+                )
+            )
+        return CompletionResult(
+            message=Message(
+                role="assistant",
+                content=(
+                    "Lo siento, tienes razón. He cometido un error en la "
+                    "ejecución del plan; no necesito realizar más llamadas a "
+                    "herramientas."
+                ),
+            )
+        )
+
+    async def stream(self, messages, tools=None, temperature=0.0):  # pragma: no cover
+        raise NotImplementedError
+
+
+def test_scaffolding_leak_after_nudge_is_replaced_by_clean_synthesis():
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="fake_tool",
+            description="fake",
+            parameters={"type": "object", "properties": {}},
+            handler=lambda: "ok",  # type: ignore[arg-type]
+        )
+    )
+    provider = _ScaffoldLeakAfterNudgeProvider()
+    session = ChatSession(
+        session_id="test",
+        config=AgentConfig(name="t", provider="fake", model="fake", max_iterations=5),
+        provider=provider,
+        tool_registry=registry,
+    )
+
+    answer = asyncio.run(session.send_sync("¿qué es BSEED?"))
+    # The user gets the clean synthesis, never the meta-apology.
+    assert answer == "BSEED es una marca de domótica compatible con Tuya."
+    assert provider.synth_calls == 1
+    # calls: 1 announce + 1 leak reply (with tools) = 2; synthesis is tools=None.
+    assert provider.calls == 2
+
+
 def test_load_history_drops_invalid_tool_call_and_orphan_tool_result(tmp_path):
     cfg = AgentConfig(name="t", provider="fake", model="fake")
     root_cfg = type(
