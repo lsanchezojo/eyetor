@@ -22,6 +22,7 @@ from eyetor.channels.base import BaseChannel
 from eyetor.chat.manager import SessionManager
 from eyetor.config import TelegramChannelConfig
 from eyetor.tracking.context import current_channel
+from eyetor.workflows.observer import WorkerObserver
 
 from typing import TYPE_CHECKING
 
@@ -31,7 +32,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_CHUNK_TOKENS = 20  # Edit message every N characters
 _TG_MAX_LEN = 4096  # Telegram message character limit
 _IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(.*?)\]")
 _ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
@@ -58,6 +58,84 @@ _MONTHS_ES = {
     "noviembre": 11,
     "diciembre": 12,
 }
+
+
+# Friendly labels for the live status message; falls back to the raw tool name.
+_TOOL_LABELS = {
+    "web_search": "🔍 buscando en la web",
+    "web_fetch": "🌐 leyendo una página",
+    "run_skill": "🧩 ejecutando una skill",
+    "run_subagent": "🤖 lanzando un subagente",
+}
+
+
+class TelegramStatus(WorkerObserver):
+    """Live, ephemeral status message for a single Telegram turn.
+
+    Doubles as a :class:`WorkerObserver`: attach it to a session via
+    ``session._observer`` and it updates an editable status message as tools
+    start and finish. The conversational "typing…" feel is provided by
+    ``ChatActionSender``; this message only appears when there's a concrete
+    action to report (a tool running, an image being analysed), and is deleted
+    by :meth:`clear` before the final answer is sent.
+    """
+
+    def __init__(self, bot, chat_id: int) -> None:
+        super().__init__()
+        self._bot = bot
+        self._chat_id = chat_id
+        self._msg = None
+        self._lock = asyncio.Lock()
+        self._last_text: str | None = None
+        self._active: set[str] = set()
+        self._closed = False
+
+    # -- message management --
+
+    async def set(self, text: str) -> None:
+        """Create or edit the status message; no-op if unchanged or closed."""
+        async with self._lock:
+            if self._closed or text == self._last_text:
+                return
+            self._last_text = text
+            try:
+                if self._msg is None:
+                    self._msg = await self._bot.send_message(self._chat_id, text)
+                else:
+                    await self._msg.edit_text(text)
+            except Exception:
+                pass  # ignore "not modified", rate limits, etc.
+
+    async def clear(self) -> None:
+        """Delete the status message (if any) and stop further updates."""
+        async with self._lock:
+            self._closed = True
+            if self._msg is not None:
+                try:
+                    await self._msg.delete()
+                except Exception:
+                    pass
+                self._msg = None
+
+    def _render(self) -> str:
+        if not self._active:
+            return "💭 Pensando…"
+        labels = [_TOOL_LABELS.get(t, t) for t in sorted(self._active)]
+        return "🔧 Ejecutando " + ", ".join(labels) + "…"
+
+    # -- observer interface (sync; fire-and-forget) --
+
+    def on_tool_start(self, tool_name: str, args: str) -> None:
+        self._active.add(tool_name)
+        asyncio.create_task(self.set(self._render()))
+
+    def on_tool_end(self, tool_name: str, result: str) -> None:
+        self._active.discard(tool_name)
+        asyncio.create_task(self.set(self._render()))
+
+    def on_tool_error(self, tool_name: str, error: str) -> None:
+        self._active.discard(tool_name)
+        asyncio.create_task(self.set(self._render()))
 
 
 def _valid_iso_date(year: int, month: int, day: int) -> str | None:
@@ -208,6 +286,7 @@ class TelegramChannel(BaseChannel):
         try:
             from aiogram import Bot, Dispatcher, F
             from aiogram.filters import Command
+            from aiogram.utils.chat_action import ChatActionSender
             from aiogram.types import (
                 Message,
                 BotCommand,
@@ -499,25 +578,26 @@ class TelegramChannel(BaseChannel):
 
                         session_id = f"telegram-{msg.chat.id}"
                         session = self._manager.get_or_create(session_id)
-                        placeholder = await msg.answer("...")
+                        status = TelegramStatus(bot, msg.chat.id)
                         buffer = ""
-                        last_edit = ""
+                        prev_observer = session._observer
+                        session._observer = status
                         try:
                             current_channel.set("telegram")
-                            async for chunk in session.send(prompt_text):
-                                buffer += chunk
-                                if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
-                                    try:
-                                        await placeholder.edit_text(buffer or "...")
-                                        last_edit = buffer
-                                    except Exception:
-                                        pass
+                            async with ChatActionSender.typing(
+                                bot=bot, chat_id=msg.chat.id
+                            ):
+                                async for chunk in session.send(prompt_text):
+                                    buffer += chunk
+                            await status.clear()
                             if buffer:
-                                html = _md_to_html(buffer)
-                                await _finalize_as_new(msg, placeholder, html, buffer)
+                                await _send_answer(msg, _md_to_html(buffer), buffer)
                         except Exception as exc:
                             logger.exception("Skill prompt command error")
-                            await placeholder.edit_text(f"Error: {_format_exc(exc)}")
+                            await status.clear()
+                            await msg.answer(f"Error: {_format_exc(exc)}")
+                        finally:
+                            session._observer = prev_observer
 
         @dp.message(Command("thinking"))
         async def cmd_thinking(msg: Message) -> None:
@@ -565,20 +645,17 @@ class TelegramChannel(BaseChannel):
 
             session = _session_for(msg, session_id)
 
-            # Send placeholder and stream response progressively
-            placeholder = await msg.answer("...")
+            # Show "typing…" while generating; surface live tool activity via status.
+            status = TelegramStatus(bot, msg.chat.id)
             buffer = ""
-            last_edit = ""
+            prev_observer = session._observer
+            session._observer = status
             try:
                 current_channel.set("telegram")
-                async for chunk in session.send(_format_input(msg, msg.text or "")):
-                    buffer += chunk
-                    if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
-                        try:
-                            await placeholder.edit_text(buffer or "...")
-                            last_edit = buffer
-                        except Exception:
-                            pass  # Ignore edit conflicts
+                async with ChatActionSender.typing(bot=bot, chat_id=msg.chat.id):
+                    async for chunk in session.send(_format_input(msg, msg.text or "")):
+                        buffer += chunk
+                await status.clear()
 
                 # Send reasoning/thinking block as a separate message (if enabled)
                 if session.last_reasoning and self._show_thinking.get(msg.chat.id, False):
@@ -593,26 +670,20 @@ class TelegramChannel(BaseChannel):
                 image_paths = _collect_image_paths(buffer, session)
                 if clean_buffer:
                     _archive(msg, "Eyetor", clean_buffer)
-                    await _finalize_as_new(
-                        msg, placeholder, _md_to_html(clean_buffer), clean_buffer
-                    )
-                else:
-                    try:
-                        await placeholder.delete()
-                    except Exception:
-                        pass
+                    await _send_answer(msg, _md_to_html(clean_buffer), clean_buffer)
+                elif not image_paths:
                     # No text and no image → never leave the user with silence.
-                    if not image_paths:
-                        await msg.answer(
-                            "(no he podido generar una respuesta; reintenta)"
-                        )
+                    await msg.answer("(no he podido generar una respuesta; reintenta)")
 
                 # Send generated images: from [IMAGE:] markers + tool results
                 await _send_images(msg, image_paths)
 
             except Exception as exc:
                 logger.exception("Telegram message handler error")
-                await placeholder.edit_text(f"Error: {_format_exc(exc)}")
+                await status.clear()
+                await msg.answer(f"Error: {_format_exc(exc)}")
+            finally:
+                session._observer = prev_observer
 
         @dp.message(F.photo)
         async def on_photo(msg: Message) -> None:
@@ -633,7 +704,9 @@ class TelegramChannel(BaseChannel):
             if not _is_addressed(msg):
                 return
 
-            placeholder = None
+            status = TelegramStatus(bot, msg.chat.id)
+            session = None
+            prev_observer = None
             try:
                 import base64 as _b64
                 import io as _io
@@ -653,68 +726,54 @@ class TelegramChannel(BaseChannel):
                 img_path = images_dir / f"{msg.chat.id}_{int(_time.time())}.jpg"
                 img_path.write_bytes(img_bytes)
 
-                placeholder = await msg.answer("📷 Procesando imagen...")
-
-                # Step 1: Send image to the vision provider to get a description
-                description = await _describe_image(
-                    img_b64,
-                    caption,
-                    specs=self._vision_specs or None,
-                )
-                logger.debug("Vision description: %s", description[:300])
-
-                # Step 2: Send the description (+ metadata) to the main LLM session
-                user_text = _format_input(msg, caption.strip()) if caption.strip() else ""
-                caption_date = _extract_caption_date(user_text)
-                prompt = _build_image_prompt(
-                    user_text=user_text,
-                    description=description,
-                    img_path=img_path,
-                    caption_date=caption_date,
-                )
-
-                session_id = f"telegram-{msg.chat.id}"
-                session = _session_for(msg, session_id)
-
-                buffer = ""
-                last_edit = ""
                 current_channel.set("telegram")
-                async for chunk in session.send(prompt):
-                    buffer += chunk
-                    if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
-                        try:
-                            await placeholder.edit_text(buffer or "...")
-                            last_edit = buffer
-                        except Exception:
-                            pass
+                async with ChatActionSender.typing(bot=bot, chat_id=msg.chat.id):
+                    await status.set("📷 Analizando imagen…")
+
+                    # Step 1: Send image to the vision provider to get a description
+                    description = await _describe_image(
+                        img_b64,
+                        caption,
+                        specs=self._vision_specs or None,
+                    )
+                    logger.debug("Vision description: %s", description[:300])
+
+                    # Step 2: Send the description (+ metadata) to the main LLM session
+                    user_text = _format_input(msg, caption.strip()) if caption.strip() else ""
+                    caption_date = _extract_caption_date(user_text)
+                    prompt = _build_image_prompt(
+                        user_text=user_text,
+                        description=description,
+                        img_path=img_path,
+                        caption_date=caption_date,
+                    )
+
+                    session_id = f"telegram-{msg.chat.id}"
+                    session = _session_for(msg, session_id)
+                    prev_observer = session._observer
+                    session._observer = status
+
+                    buffer = ""
+                    async for chunk in session.send(prompt):
+                        buffer += chunk
+                await status.clear()
 
                 clean_buffer = _strip_self_label(_IMAGE_MARKER_RE.sub("", buffer).strip())
                 image_paths = _collect_image_paths(buffer, session)
                 if clean_buffer:
                     _archive(msg, "Eyetor", clean_buffer)
-                    html = _md_to_html(clean_buffer)
-                    await _finalize_as_new(msg, placeholder, html, clean_buffer)
-                else:
-                    try:
-                        await placeholder.delete()
-                    except Exception:
-                        pass
-                    if not image_paths:
-                        await msg.answer(
-                            "(no he podido generar una respuesta; reintenta)"
-                        )
+                    await _send_answer(msg, _md_to_html(clean_buffer), clean_buffer)
+                elif not image_paths:
+                    await msg.answer("(no he podido generar una respuesta; reintenta)")
 
                 await _send_images(msg, image_paths)
             except Exception as exc:
                 logger.exception("Photo handler error")
-                detail = _format_exc(exc)
-                if placeholder is not None:
-                    try:
-                        await placeholder.edit_text(f"Error procesando la imagen: {detail}")
-                    except Exception:
-                        await msg.answer(f"Error procesando la imagen: {detail}")
-                else:
-                    await msg.answer(f"No se pudo procesar la foto: {detail}")
+                await status.clear()
+                await msg.answer(f"Error procesando la imagen: {_format_exc(exc)}")
+            finally:
+                if session is not None:
+                    session._observer = prev_observer
 
         @dp.message(F.voice | F.audio)
         async def on_voice(msg: Message) -> None:
@@ -738,45 +797,40 @@ class TelegramChannel(BaseChannel):
 
             session = _session_for(msg, session_id)
 
-            placeholder = await msg.answer(
-                f"🎤 <i>{_escape_html(transcription)}</i>\n\n...", parse_mode="HTML"
-            )
+            # Echo the transcription immediately as its own message.
+            try:
+                await msg.answer(
+                    f"🎤 <i>{_escape_html(transcription)}</i>", parse_mode="HTML"
+                )
+            except Exception:
+                await msg.answer(f"🎤 {transcription}")
+
+            status = TelegramStatus(bot, msg.chat.id)
             buffer = ""
-            last_edit = ""
+            prev_observer = session._observer
+            session._observer = status
             try:
                 current_channel.set("telegram")
-                async for chunk in session.send(_format_input(msg, transcription)):
-                    buffer += chunk
-                    if len(buffer) - len(last_edit) >= _CHUNK_TOKENS:
-                        try:
-                            await placeholder.edit_text(
-                                f"🎤 <i>{_escape_html(transcription)}</i>\n\n{buffer}",
-                            )
-                            last_edit = buffer
-                        except Exception:
-                            pass
+                async with ChatActionSender.typing(bot=bot, chat_id=msg.chat.id):
+                    async for chunk in session.send(_format_input(msg, transcription)):
+                        buffer += chunk
+                await status.clear()
 
                 clean_buffer = _strip_self_label(_IMAGE_MARKER_RE.sub("", buffer).strip())
                 image_paths = _collect_image_paths(buffer, session)
                 if clean_buffer:
                     _archive(msg, "Eyetor", clean_buffer)
-                    html = f"🎤 <i>{_escape_html(transcription)}</i>\n\n{_md_to_html(clean_buffer)}"
-                    plain = f"🎤 {transcription}\n\n{clean_buffer}"
-                    await _finalize_as_new(msg, placeholder, html, plain)
-                else:
-                    try:
-                        await placeholder.delete()
-                    except Exception:
-                        pass
-                    if not image_paths:
-                        await msg.answer(
-                            "(no he podido generar una respuesta; reintenta)"
-                        )
+                    await _send_answer(msg, _md_to_html(clean_buffer), clean_buffer)
+                elif not image_paths:
+                    await msg.answer("(no he podido generar una respuesta; reintenta)")
 
                 await _send_images(msg, image_paths)
             except Exception as exc:
                 logger.exception("Telegram voice handler error")
-                await placeholder.edit_text(f"Error: {_format_exc(exc)}")
+                await status.clear()
+                await msg.answer(f"Error: {_format_exc(exc)}")
+            finally:
+                session._observer = prev_observer
 
         commands = [
             BotCommand(command="start", description="Start the bot"),
@@ -1141,15 +1195,11 @@ def _split_message(text: str, limit: int = _TG_MAX_LEN) -> list[str]:
     return chunks
 
 
-async def _finalize_as_new(msg, placeholder, html: str, plain: str) -> None:
-    """Delete the streaming placeholder and send the final answer as a NEW
-    message.
+async def _send_answer(msg, html: str, plain: str) -> None:
+    """Send the final answer as a new message.
 
-    Editing the placeholder keeps its original send time (when "..." was
-    posted, right after the user's question), so the visible timestamp would
-    not reflect when the answer was actually ready. Sending a fresh message
-    fixes that. On HTML parse failure (e.g. crossed <b>/<i> tags) it retries
-    as plain text. ``_send_long`` splits messages over Telegram's limit.
+    On HTML parse failure (e.g. crossed <b>/<i> tags) it retries as plain
+    text. ``_send_long`` splits messages over Telegram's limit.
     """
     try:
         from aiogram.exceptions import TelegramBadRequest
@@ -1157,24 +1207,19 @@ async def _finalize_as_new(msg, placeholder, html: str, plain: str) -> None:
         TelegramBadRequest = Exception  # type: ignore
 
     try:
-        await placeholder.delete()
-    except Exception:
-        pass
-
-    try:
         await _send_long(msg, html, parse_mode="HTML")
         return
     except TelegramBadRequest as exc:
         logger.warning(
-            "Telegram HTML parse failed on finalize, retrying as plain text: %s", exc
+            "Telegram HTML parse failed on answer, retrying as plain text: %s", exc
         )
     except Exception as exc:
-        logger.warning("Finalize HTML send failed, retrying as plain text: %s", exc)
+        logger.warning("Answer HTML send failed, retrying as plain text: %s", exc)
 
     try:
         await _send_long(msg, plain or "...")
     except Exception as exc:
-        logger.error("Telegram plain-text finalize fallback failed: %s", exc)
+        logger.error("Telegram plain-text answer fallback failed: %s", exc)
 
 
 async def _send_long(msg, text: str, parse_mode: str | None = None) -> None:
