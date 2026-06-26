@@ -3,8 +3,8 @@
 Requires the 'telegram' optional dependency:
     pip install eyetor[telegram]
 
-Voice message transcription requires faster-whisper:
-    pip install faster-whisper
+Voice message transcription requires the 'voice' optional dependency:
+    pip install eyetor[voice]
 """
 
 from __future__ import annotations
@@ -281,6 +281,17 @@ class TelegramChannel(BaseChannel):
                         f"{s['name']}(model={s['model']})" for s in self._vision_specs
                     ),
                 )
+
+        # Voice-note transcription (speech-to-text) config.
+        self._transcription = full_config.transcription if full_config else None
+        if self._transcription and self._transcription.enabled:
+            logger.info(
+                "Transcription: backend=%s model=%s device=%s lang=%s",
+                self._transcription.backend,
+                self._transcription.model,
+                self._transcription.device,
+                self._transcription.language or "auto",
+            )
 
     async def start(self) -> None:
         try:
@@ -781,8 +792,12 @@ class TelegramChannel(BaseChannel):
                 await msg.answer("Unauthorized. Contact the administrator.")
                 return
 
-            # Transcribe audio with faster-whisper
-            transcription = await _transcribe_voice(bot, msg)
+            if self._transcription is not None and not self._transcription.enabled:
+                await msg.answer("La transcripción de voz está desactivada.")
+                return
+
+            # Transcribe audio (faster-whisper local, or OpenAI-compatible API)
+            transcription = await _transcribe_voice(bot, msg, self._transcription)
             if transcription is None:
                 return  # error already sent to user
 
@@ -1062,14 +1077,17 @@ async def _describe_image(
 
 
 _whisper_model = None  # Module-level cache — loaded once on first use
+_whisper_key: tuple | None = None  # (model, device, compute_type) of the cache
 
 
-async def _transcribe_voice(bot, msg) -> str | None:
+async def _transcribe_voice(bot, msg, spec=None) -> str | None:
     """Download voice/audio and transcribe it.
 
+    ``spec`` is the :class:`TranscriptionConfig` (or None for legacy defaults).
     Priority:
-    1. OpenAI-compatible /v1/audio/transcriptions API (WHISPER_BASE_URL or OPENAI_API_KEY)
-    2. Local faster-whisper (if installed)
+    1. OpenAI-compatible /v1/audio/transcriptions API when ``backend == "api"``
+       or a WHISPER_BASE_URL / OPENAI_API_KEY env var is set.
+    2. Local faster-whisper.
 
     Returns the transcription string, or None if an error occurred
     (error message already sent to the user).
@@ -1092,15 +1110,20 @@ async def _transcribe_voice(bot, msg) -> str | None:
             tmp_path = tmp.name
         await bot.download_file(tg_file.file_path, destination=tmp_path)
 
-        whisper_url = os.environ.get("WHISPER_BASE_URL", "").strip()
-        openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        whisper_url = (
+            getattr(spec, "base_url", None) or os.environ.get("WHISPER_BASE_URL", "")
+        ).strip()
+        openai_key = (
+            getattr(spec, "api_key", None) or os.environ.get("OPENAI_API_KEY", "")
+        ).strip()
+        backend = getattr(spec, "backend", "local")
 
-        if whisper_url or openai_key:
+        if backend == "api" or whisper_url or openai_key:
             return await _transcribe_via_api(
                 tmp_path, whisper_url or None, openai_key or None, suffix
             )
 
-        return await _transcribe_local(msg, tmp_path)
+        return await _transcribe_local(msg, tmp_path, spec)
 
     except Exception as exc:
         logger.error("Voice transcription error: %s", exc)
@@ -1141,31 +1164,45 @@ async def _transcribe_via_api(
         return r.json()["text"].strip()
 
 
-async def _transcribe_local(msg, path: str) -> str | None:
+async def _transcribe_local(msg, path: str, spec=None) -> str | None:
     """Transcribe using local faster-whisper, with module-level model cache."""
-    global _whisper_model
+    global _whisper_model, _whisper_key
     try:
         from faster_whisper import WhisperModel
     except ImportError:
         await msg.answer(
-            "Voice transcription is not configured. Options:\n"
-            "• Set <code>WHISPER_BASE_URL</code> to a local Whisper server\n"
-            "• Set <code>OPENAI_API_KEY</code> to use OpenAI Whisper API\n"
-            "• Install faster-whisper: <code>pip install faster-whisper</code>",
+            "Voice transcription is not installed. Options:\n"
+            "• Install the voice extra: <code>pip install -e \".[voice]\"</code>\n"
+            "• Or set <code>WHISPER_BASE_URL</code> / <code>OPENAI_API_KEY</code> "
+            "to use a Whisper API instead.",
             parse_mode="HTML",
         )
         return None
 
-    if _whisper_model is None:
-        _whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+    model_name = getattr(spec, "model", None) or "medium"
+    device = getattr(spec, "device", None) or "cpu"
+    compute_type = getattr(spec, "compute_type", None) or "int8"
+    language = getattr(spec, "language", "es")
+    beam_size = getattr(spec, "beam_size", None) or 5
+
+    key = (model_name, device, compute_type)
+    if _whisper_model is None or _whisper_key != key:
+        _whisper_model = WhisperModel(
+            model_name, device=device, compute_type=compute_type
+        )
+        _whisper_key = key
 
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _run_whisper_model, _whisper_model, path)
+    return await loop.run_in_executor(
+        None, _run_whisper_model, _whisper_model, path, language, beam_size
+    )
 
 
-def _run_whisper_model(model, audio_path: str) -> str:
+def _run_whisper_model(model, audio_path: str, language=None, beam_size: int = 5) -> str:
     """Run faster-whisper transcription synchronously (called in thread pool)."""
-    segments, _ = model.transcribe(audio_path, beam_size=5)
+    segments, _ = model.transcribe(
+        audio_path, beam_size=beam_size, language=language, vad_filter=True
+    )
     return " ".join(seg.text.strip() for seg in segments).strip()
 
 

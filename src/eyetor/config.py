@@ -219,6 +219,26 @@ class ImageProviderConfig(BaseModel):
     extra_params: dict[str, Any] = {}
 
 
+class TranscriptionConfig(BaseModel):
+    """Configuration for voice-note transcription (speech-to-text).
+
+    ``backend: local`` runs faster-whisper in-process (no GPU on this host, so
+    ``device: cpu`` with int8 quantization). ``backend: api`` posts the audio to
+    an OpenAI-compatible ``/v1/audio/transcriptions`` endpoint; ``base_url`` /
+    ``api_key`` override the ``WHISPER_BASE_URL`` / ``OPENAI_API_KEY`` env vars.
+    """
+
+    enabled: bool = True
+    backend: Literal["local", "api"] = "local"
+    model: str = "medium"  # small | medium | large-v3 | local path
+    device: str = "cpu"  # cpu (CTranslate2 only accelerates on CUDA)
+    compute_type: str = "int8"  # int8 = fast and light on CPU
+    language: str | None = "es"  # None = autodetect
+    beam_size: int = 5
+    base_url: str | None = None  # api backend only
+    api_key: str | None = None  # api backend only
+
+
 class KnowledgeChunkConfig(BaseModel):
     """Chunker settings."""
 
@@ -315,6 +335,7 @@ class VectorConfig(BaseModel):
     vision_fallback: list[str] = (
         []
     )  # provider names tried in order when the primary vision provider fails
+    transcription: TranscriptionConfig = TranscriptionConfig()  # voice-note STT
     log_level: str = "INFO"
 
 

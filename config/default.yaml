@@ -242,6 +242,20 @@ vision_model:
 # error). openrouter-vision = gemini-2.0-flash de pago, fiable.
 vision_fallback: [openrouter-vision]
 
+# Transcripción de notas de voz (speech-to-text), para hablarle al bot cuando no
+# se puede escribir. Por defecto local con faster-whisper (requiere el extra:
+# pip install -e ".[voice]"). Esta APU AMD no tiene CUDA, así que va por CPU.
+transcription:
+  enabled: true
+  backend: local      # local = faster-whisper en proceso | api = endpoint OpenAI-compatible
+  model: medium       # equilibrio calidad/velocidad en español (small | medium | large-v3)
+  device: cpu         # CTranslate2 solo acelera en CUDA
+  compute_type: int8  # rápido y ligero en CPU
+  language: es        # vacío/null = autodetección
+  # backend api: base_url/api_key sobrescriben WHISPER_BASE_URL / OPENAI_API_KEY
+  # base_url:
+  # api_key:
+
 mcp_servers: {}
 
 # Knowledge base — hybrid BM25 + semantic retrieval over workspace docs.

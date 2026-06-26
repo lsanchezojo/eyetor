@@ -14,6 +14,8 @@ dependencies = [
 
 [project.optional-dependencies]
 telegram = ["aiogram>=3.0"]
+# Voice notes — local speech-to-text (faster-whisper / CTranslate2)
+voice = ["faster-whisper>=1.0"]
 # Knowledge base — binary document extractors (PDF/DOCX/XLSX/PPTX)
 knowledge = [
     "pypdf>=4.0",

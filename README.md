@@ -66,6 +66,7 @@ detected system; arbitrary shell commands are not enabled through this helper.
 **Dependencies:**
 - Core: `httpx`, `pyyaml`, `pydantic`, `rich`, `click`, `apscheduler`
 - Optional (telegram): `aiogram`
+- Optional (voice): `faster-whisper` — local speech-to-text for voice notes
 - Optional (knowledge): `pypdf`, `python-docx`, `openpyxl`, `python-pptx`
 - Optional (knowledge-vector): `fastembed`, `sqlite-vec`
 
@@ -197,17 +198,37 @@ Any OpenAI-compatible vision model works (Gemini, llama.cpp with a multimodal mo
 
 ### Voice messages (Telegram)
 
-The bot transcribes voice and audio messages automatically. Transcription priority:
+Send a voice (or audio) note and the bot transcribes it, echoes the text back as
+`🎤 …`, and answers it like any typed message — handy for when you can't type.
 
-1. **Local Whisper server** — set `WHISPER_BASE_URL` in `.env` (e.g. `http://localhost:8000`), any OpenAI-compatible `/v1/audio/transcriptions` endpoint
-2. **OpenAI Whisper API** — set `OPENAI_API_KEY` in `.env`
-3. **Local faster-whisper** — install with `pip install faster-whisper`, no server needed
+**Enable it** by installing the `voice` extra (local, no server, fully private):
 
-If none is configured, the bot replies with setup instructions.
+```bash
+pip install -e ".[voice]"
+```
+
+Transcription is configured under `transcription:` in your config (defaults shown):
+
+```yaml
+transcription:
+  enabled: true
+  backend: local      # local = faster-whisper in-process | api = OpenAI-compatible endpoint
+  model: medium       # small | medium | large-v3 (quality vs. speed)
+  device: cpu         # CTranslate2 only accelerates on CUDA
+  compute_type: int8  # fast and light on CPU
+  language: es        # empty/null = autodetect
+```
+
+The first voice note downloads the chosen model (`medium` ≈ 1.5 GB) to the
+HuggingFace cache; afterwards it's loaded from disk.
+
+**Remote backend (optional).** Set `backend: api` (or just provide the env vars
+below) to post the audio to an OpenAI-compatible `/v1/audio/transcriptions`
+endpoint instead — e.g. a local whisper.cpp/Whisper server or the OpenAI API:
 
 ```
-WHISPER_BASE_URL=http://localhost:8000   # optional: local whisper server
-OPENAI_API_KEY=sk-...                    # optional: OpenAI Whisper API
+WHISPER_BASE_URL=http://localhost:8000   # local whisper server (or set base_url in config)
+OPENAI_API_KEY=sk-...                    # OpenAI Whisper API (or set api_key in config)
 ```
 
 ## Deploying as a systemd user service
