@@ -406,10 +406,12 @@ class ChatSession:
         # short sticky window so follow-ups ("cancélalo", "sí") still see them.
         self._gating_enabled = False
         self._sticky_turns = 2
+        self._always_on_groups: set[str] = set()
         if root_config is not None:
             gating_cfg = root_config.sessions.tool_gating
             self._gating_enabled = gating_cfg.enabled
             self._sticky_turns = gating_cfg.sticky_turns
+            self._always_on_groups = set(getattr(gating_cfg, "always_on_groups", []))
         self._sticky_groups: dict[str, int] = {}  # group → turns it stays active
         self._last_active_groups: set[str] = set()  # for confirmation inheritance
 
@@ -1359,7 +1361,11 @@ class ChatSession:
         self._sticky_groups = {
             g: n - 1 for g, n in self._sticky_groups.items() if n - 1 > 0
         }
-        active = select_groups(user_input) | set(self._sticky_groups)
+        active = (
+            select_groups(user_input)
+            | set(self._sticky_groups)
+            | self._always_on_groups
+        )
         if _is_user_confirmation(user_input):
             active |= self._last_active_groups
         self._last_active_groups = set(active)

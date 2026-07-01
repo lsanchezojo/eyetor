@@ -170,6 +170,13 @@ channels:
     bot_token: ${TELEGRAM_BOT_TOKEN}
     streaming_chunk_size: 20
     ssl_verify: false
+    # Documentos adjuntos (F.document). Las imágenes enviadas como archivo van a
+    # visión; PDF/Office/texto se leen con los extractores de knowledge. Docs
+    # cortos se inyectan en el turno; los largos entran en la KB efímera
+    # (ver knowledge.uploads_retention_days).
+    documents_enabled: true
+    document_max_size_bytes: 20971520   # ~20 MB (límite getFile de la Bot API)
+    document_inline_max_chars: 8000     # por encima → base de conocimiento
     auth:
       enabled: true
       allowed_users:
@@ -267,7 +274,11 @@ knowledge:
   db_path: ~/.eyetor/knowledge.db
   auto_reindex_on_start: true
   auto_cwd_workspace: true
-  max_file_size_bytes: 52428800   # 50 MB (admite PDFs grandes escaneados)
+  max_file_size_bytes: 152428800   # 150 MB (admite PDFs grandes escaneados)
+  # Caducidad (en días) de los documentos que entran en la KB por uploads de
+  # Telegram (workspace por chat tg-upload-<chat_id>). Admite fracciones:
+  # 0.5 = 12 h, 0.042 ≈ 1 h. 0 = sin caducidad.
+  uploads_retention_days: 7
   workspaces:
     - name: default
       path: ~/.eyetor/knowledge
@@ -326,6 +337,11 @@ sessions:
   tool_gating:
     enabled: true
     sticky_turns: 2
+    # Grupos siempre disponibles (sin depender de palabras disparadoras). "kb"
+    # aquí permite responder dudas de CONTENIDO sobre los documentos indexados
+    # aunque el usuario no diga "según el manual/documento". Cuesta ~3 esquemas
+    # de tool por turno; quítalo si no usas la base de conocimiento.
+    always_on_groups: [kb]
   chain:
     mode: auto           # auto | always | never — decompose complex queries into plan→execute→synthesize
     complexity_threshold: 300  # min chars to consider a message complex (auto mode)

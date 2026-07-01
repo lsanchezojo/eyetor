@@ -21,6 +21,7 @@ from pathlib import Path
 from eyetor.channels.base import BaseChannel
 from eyetor.chat.manager import SessionManager
 from eyetor.config import TelegramChannelConfig
+from eyetor.knowledge.extractors import get_extractor
 from eyetor.tracking.context import current_channel
 from eyetor.workflows.observer import WorkerObserver
 
@@ -34,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 _TG_MAX_LEN = 4096  # Telegram message character limit
 _IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(.*?)\]")
+# Image documents (sent "as file", uncompressed) route to the vision path.
+_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif"}
 _ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
 _NUMERIC_DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
 _TEXT_DATE_RE = re.compile(
@@ -211,6 +214,78 @@ def _build_image_prompt(
     )
 
 
+def _build_document_prompt(
+    *,
+    user_text: str,
+    file_name: str,
+    text: str,
+    truncated: bool,
+) -> str:
+    """Prompt for a document whose text is inlined directly into the turn."""
+    trunc_note = (
+        "\n\n[El documento se ha truncado por longitud; puede faltar contenido "
+        "final.]"
+        if truncated
+        else ""
+    )
+    if user_text:
+        intro = (
+            f"El usuario ha enviado el documento «{file_name}» con este "
+            f"mensaje: «{user_text}»"
+        )
+        closing = (
+            "Responde a lo que pide el usuario usando el contenido del documento "
+            "como fuente principal. Si una herramienta disponible encaja con la "
+            "petición, puedes usarla."
+        )
+    else:
+        intro = f"El usuario ha enviado el documento «{file_name}» sin mensaje adicional."
+        closing = (
+            "Resume su contenido y destaca lo relevante. Si el usuario luego "
+            "pregunta algo concreto, respóndelo apoyándote en el documento."
+        )
+    return (
+        f"{intro}\n\n"
+        f"Contenido extraído del documento:\n{text}{trunc_note}\n\n"
+        f"{closing}"
+    )
+
+
+def _build_kb_document_prompt(
+    *,
+    user_text: str,
+    file_name: str,
+    workspace: str,
+) -> str:
+    """Prompt for a large document that was indexed into the ephemeral KB."""
+    if user_text:
+        intro = (
+            f"El usuario ha enviado el documento «{file_name}» (demasiado largo "
+            f"para leerlo entero) con este mensaje: «{user_text}»."
+        )
+        task = "responde a la petición del usuario"
+    else:
+        intro = (
+            f"El usuario ha enviado el documento «{file_name}» (demasiado largo "
+            f"para leerlo entero) sin mensaje adicional."
+        )
+        task = "haz un resumen del documento y destaca lo importante"
+    return (
+        f"{intro}\n\n"
+        f"He indexado el documento en la base de conocimiento, en el workspace "
+        f'«{workspace}». Usa kb_search(query, workspace="{workspace}") para '
+        f"recuperar los fragmentos relevantes y kb_read para más contexto. "
+        f"Con eso, {task}."
+    )
+
+
+def _format_caducidad(expires_at: str | None) -> str:
+    """Human-friendly ' (caduca el YYYY-MM-DD)' suffix, or '' when no expiry."""
+    if not expires_at:
+        return ""
+    return f" (caduca el {expires_at[:10]})"
+
+
 class TelegramChannel(BaseChannel):
     """Telegram bot channel using aiogram.
 
@@ -230,6 +305,7 @@ class TelegramChannel(BaseChannel):
         full_config: "VectorConfig | None" = None,
         agent_reg=None,
         chatlog=None,
+        knowledge=None,
     ) -> None:
         self._manager = session_manager
         self._config = config
@@ -238,6 +314,7 @@ class TelegramChannel(BaseChannel):
         self._scheduler = scheduler
         self._tracker = tracker
         self._chatlog = chatlog
+        self._knowledge = knowledge
         self._full_config = full_config
         self._dp = None
         self._bot = None
@@ -637,7 +714,7 @@ class TelegramChannel(BaseChannel):
                 f"{extra}"
                 "/help — show this help\n\n"
                 "Send a message to chat, a voice note to transcribe, "
-                "or a photo to analyze."
+                "a photo to analyze, or a document (PDF, Office, texto) to read."
             )
 
         @dp.message(F.text)
@@ -847,6 +924,164 @@ class TelegramChannel(BaseChannel):
             finally:
                 session._observer = prev_observer
 
+        @dp.message(F.document)
+        async def on_document(msg: Message) -> None:
+            if not _is_authorized(msg):
+                await msg.answer("Unauthorized. Contact the administrator.")
+                return
+
+            doc = msg.document
+            if doc is None or not getattr(self._config, "documents_enabled", True):
+                return
+
+            file_name = doc.file_name or "documento"
+            mime = (doc.mime_type or "").lower()
+            suffix = Path(file_name).suffix.lower()
+            caption = msg.caption or ""
+
+            # Archive the event out of context; skip the work when not addressed.
+            _archive(
+                msg,
+                _sender_label(msg),
+                f"[documento: {file_name}] {caption}".strip(),
+            )
+            if not _is_addressed(msg):
+                return
+
+            max_size = getattr(
+                self._config, "document_max_size_bytes", 20 * 1024 * 1024
+            )
+            if doc.file_size and doc.file_size > max_size:
+                await msg.answer(
+                    f"El documento es demasiado grande (máx {max_size // (1024 * 1024)} MB)."
+                )
+                return
+
+            # Opportunistic purge of expired uploads before adding a new one.
+            if self._knowledge is not None:
+                try:
+                    self._knowledge.purge_expired()
+                except Exception:
+                    pass
+
+            status = TelegramStatus(bot, msg.chat.id)
+            session = None
+            prev_observer = None
+            try:
+                current_channel.set("telegram")
+                uploads_dir = Path.home() / ".eyetor" / "uploads" / str(msg.chat.id)
+                uploads_dir.mkdir(parents=True, exist_ok=True)
+                import time as _time
+
+                dest = uploads_dir / f"{int(_time.time())}_{Path(file_name).name}"
+                tg_file = await bot.get_file(doc.file_id)
+                await bot.download_file(tg_file.file_path, destination=str(dest))
+
+                user_text = (
+                    _format_input(msg, caption.strip()) if caption.strip() else ""
+                )
+                is_image = mime.startswith("image/") or suffix in _IMAGE_SUFFIXES
+
+                async with ChatActionSender.typing(bot=bot, chat_id=msg.chat.id):
+                    if is_image:
+                        await status.set("📷 Analizando imagen…")
+                        import base64 as _b64
+
+                        img_b64 = _b64.b64encode(dest.read_bytes()).decode()
+                        description = await _describe_image(
+                            img_b64, caption, specs=self._vision_specs or None
+                        )
+                        caption_date = _extract_caption_date(user_text)
+                        prompt = _build_image_prompt(
+                            user_text=user_text,
+                            description=description,
+                            img_path=dest,
+                            caption_date=caption_date,
+                        )
+                    else:
+                        extractor = get_extractor(suffix)
+                        if extractor is None:
+                            await status.clear()
+                            await msg.answer(
+                                f"No sé leer archivos «{suffix or file_name}». "
+                                "Envíamelo como foto o pega el texto."
+                            )
+                            return
+                        await status.set("📄 Leyendo el documento…")
+                        extracted = await asyncio.to_thread(extractor, dest)
+                        if not extracted or not extracted.text.strip():
+                            await status.clear()
+                            await msg.answer(
+                                "No he podido extraer texto de ese documento."
+                            )
+                            return
+
+                        text = extracted.text
+                        inline_max = getattr(
+                            self._config, "document_inline_max_chars", 8000
+                        )
+                        if len(text) <= inline_max:
+                            prompt = _build_document_prompt(
+                                user_text=user_text,
+                                file_name=file_name,
+                                text=text,
+                                truncated=False,
+                            )
+                        else:
+                            ingested = await self._ingest_large_document(
+                                msg.chat.id, dest
+                            )
+                            if ingested:
+                                cad = _format_caducidad(ingested.get("expires_at"))
+                                await msg.answer(
+                                    f"📄 He indexado «{file_name}» en mi base de "
+                                    f"conocimiento{cad}. Puedes preguntarme sobre "
+                                    "su contenido."
+                                )
+                                prompt = _build_kb_document_prompt(
+                                    user_text=user_text,
+                                    file_name=file_name,
+                                    workspace=ingested["workspace"],
+                                )
+                            else:
+                                prompt = _build_document_prompt(
+                                    user_text=user_text,
+                                    file_name=file_name,
+                                    text=text[:inline_max],
+                                    truncated=True,
+                                )
+
+                    session_id = f"telegram-{msg.chat.id}"
+                    session = _session_for(msg, session_id)
+                    prev_observer = session._observer
+                    session._observer = status
+
+                    buffer = ""
+                    async for chunk in session.send(prompt):
+                        buffer += chunk
+                await status.clear()
+
+                clean_buffer = _strip_self_label(
+                    _IMAGE_MARKER_RE.sub("", buffer).strip()
+                )
+                image_paths = _collect_image_paths(buffer, session)
+                if clean_buffer:
+                    _archive(msg, "Eyetor", clean_buffer)
+                    await _send_answer(msg, _md_to_html(clean_buffer), clean_buffer)
+                elif not image_paths:
+                    await msg.answer("(no he podido generar una respuesta; reintenta)")
+
+                await _send_images(msg, image_paths)
+            except Exception as exc:
+                logger.exception("Document handler error")
+                await status.clear()
+                await msg.answer(
+                    f"Error procesando el documento: {_format_exc(exc)}"
+                )
+            finally:
+                if session is not None:
+                    session._observer = prev_observer
+
         commands = [
             BotCommand(command="start", description="Start the bot"),
             BotCommand(command="reset", description="Start a new conversation"),
@@ -882,6 +1117,23 @@ class TelegramChannel(BaseChannel):
             await self._dp.stop_polling()
         if self._bot:
             await self._bot.session.close()
+
+    async def _ingest_large_document(self, chat_id, path) -> dict | None:
+        """Ingest a large document into the ephemeral KB. None if unavailable."""
+        if self._knowledge is None:
+            return None
+        retention = 7
+        if self._full_config and self._full_config.knowledge:
+            retention = getattr(
+                self._full_config.knowledge, "uploads_retention_days", 7
+            )
+        try:
+            return await self._knowledge.ingest_upload(
+                chat_id, path, retention_days=retention
+            )
+        except Exception as exc:
+            logger.warning("KB ingest failed for %s: %s", path, exc)
+            return None
 
 
 def _format_exc(exc: BaseException) -> str:

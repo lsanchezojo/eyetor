@@ -328,9 +328,11 @@ def start(
                 cfg.chatlog_db_path, retention_days=cfg.chatlog_retention_days
             )
 
-        # Knowledge base (optional, hybrid BM25 + semantic retrieval)
+        # Knowledge base (optional, hybrid BM25 + semantic retrieval).
+        # Created when enabled even without static workspaces: Telegram document
+        # uploads register their own per-chat ephemeral workspaces on the fly.
         knowledge = None
-        if cfg.knowledge and cfg.knowledge.enabled and cfg.knowledge.workspaces:
+        if cfg.knowledge and cfg.knowledge.enabled:
             from eyetor.knowledge.manager import KnowledgeManager
 
             knowledge = KnowledgeManager.from_config(cfg.knowledge)
@@ -1285,6 +1287,7 @@ def start(
                     full_config=cfg,
                     agent_reg=agent_reg,
                     chatlog=chatlog,
+                    knowledge=knowledge,
                 )
             )
 

@@ -110,6 +110,7 @@ class DocRow:
     sha1: str
     ext: str
     last_indexed: str
+    expires_at: str | None = None
 
 
 _DDL = """
@@ -134,6 +135,7 @@ CREATE TABLE IF NOT EXISTS docs (
     sha1         TEXT NOT NULL,
     ext          TEXT NOT NULL,
     last_indexed TEXT NOT NULL,
+    expires_at   TEXT,
     UNIQUE (workspace, rel_path)
 );
 CREATE INDEX IF NOT EXISTS idx_docs_workspace ON docs(workspace);
@@ -191,9 +193,19 @@ class KnowledgeStore:
         self._conn.row_factory = sqlite3.Row
         self.vector_enabled = self._try_load_sqlite_vec()
         self._conn.executescript(_DDL)
+        self._migrate()
         if self.vector_enabled:
             self._create_vec_table()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Idempotent schema migrations for databases created by older versions."""
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(docs)").fetchall()
+        }
+        if "expires_at" not in cols:
+            self._conn.execute("ALTER TABLE docs ADD COLUMN expires_at TEXT")
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -324,13 +336,14 @@ class KnowledgeStore:
         size_bytes: int,
         sha1: str,
         ext: str,
+        expires_at: str | None = None,
     ) -> int:
         now = datetime.utcnow().isoformat()
         cur = self._conn.execute(
             """
             INSERT INTO docs
-              (workspace, rel_path, abs_path, title, mtime, size_bytes, sha1, ext, last_indexed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              (workspace, rel_path, abs_path, title, mtime, size_bytes, sha1, ext, last_indexed, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(workspace, rel_path) DO UPDATE SET
                 abs_path     = excluded.abs_path,
                 title        = excluded.title,
@@ -338,10 +351,11 @@ class KnowledgeStore:
                 size_bytes   = excluded.size_bytes,
                 sha1         = excluded.sha1,
                 ext          = excluded.ext,
-                last_indexed = excluded.last_indexed
+                last_indexed = excluded.last_indexed,
+                expires_at   = excluded.expires_at
             RETURNING id
             """,
-            (workspace, rel_path, abs_path, title, mtime, size_bytes, sha1, ext, now),
+            (workspace, rel_path, abs_path, title, mtime, size_bytes, sha1, ext, now, expires_at),
         )
         doc_id = cur.fetchone()[0]
         self._conn.commit()
@@ -357,6 +371,24 @@ class KnowledgeStore:
         self._delete_vec_rows(chunk_ids)
         self._conn.execute("DELETE FROM docs WHERE id = ?", (doc_id,))
         self._conn.commit()
+
+    def purge_expired(self, now_iso: str | None = None) -> int:
+        """Delete docs whose ``expires_at`` is in the past. Returns count purged.
+
+        Cascade removes their chunks (FK + trigger) and cleans the vec table,
+        reusing the same per-doc teardown as :meth:`delete_doc`.
+        """
+        now = now_iso or datetime.utcnow().isoformat()
+        doc_ids = [
+            r["id"]
+            for r in self._conn.execute(
+                "SELECT id FROM docs WHERE expires_at IS NOT NULL AND expires_at < ?",
+                (now,),
+            ).fetchall()
+        ]
+        for doc_id in doc_ids:
+            self.delete_doc(doc_id)
+        return len(doc_ids)
 
     def all_doc_rel_paths(self, workspace: str) -> list[tuple[int, str]]:
         rows = self._conn.execute(

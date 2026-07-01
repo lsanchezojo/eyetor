@@ -85,6 +85,83 @@ class Indexer:
             self._index_sync, spec, force=force, prune=prune
         )
 
+    async def index_file(
+        self,
+        workspace: str,
+        path: Path,
+        *,
+        rel_path: str | None = None,
+        expires_at: str | None = None,
+    ) -> int | None:
+        """Index a single ad-hoc file into an existing workspace.
+
+        Runs the same extractor → chunker → embedder → store pipeline as
+        :meth:`_index_sync`, but for one file (e.g. a Telegram upload). The
+        caller must have registered ``workspace`` first (FK requirement).
+        ``expires_at`` (ISO string) makes the doc eligible for
+        :meth:`KnowledgeStore.purge_expired`. Returns the doc id, or ``None``
+        when the file is too large, unsupported, or yields no text.
+        """
+        return await asyncio.to_thread(
+            self._index_file_sync, workspace, path, rel_path, expires_at
+        )
+
+    def _index_file_sync(
+        self,
+        workspace: str,
+        path: Path,
+        rel_path: str | None,
+        expires_at: str | None,
+    ) -> int | None:
+        abs_path = path.expanduser().resolve()
+        if not abs_path.is_file():
+            return None
+        try:
+            if abs_path.stat().st_size > self.max_file_size_bytes:
+                logger.warning("index_file: %s exceeds max size, skipped", abs_path)
+                return None
+            raw = abs_path.read_bytes()
+        except OSError as exc:
+            logger.warning("index_file: cannot read %s: %s", abs_path, exc)
+            return None
+
+        extractor = get_extractor(abs_path.suffix)
+        if extractor is None:
+            return None
+        try:
+            extracted = extractor(abs_path)
+        except Exception as exc:
+            logger.warning("index_file: extractor failed for %s: %s", abs_path, exc)
+            return None
+        if not extracted or not extracted.text.strip():
+            return None
+
+        chunks = self.chunker.chunk(extracted, suffix=abs_path.suffix)
+        if not chunks:
+            return None
+        embeddings = self._embed_chunks(chunks)
+
+        rel = rel_path or abs_path.name
+        sha1 = hashlib.sha1(raw).hexdigest()
+        stat = abs_path.stat()
+        try:
+            doc_id = self.store.upsert_doc(
+                workspace=workspace,
+                rel_path=rel,
+                abs_path=str(abs_path),
+                title=extracted.title,
+                mtime=stat.st_mtime,
+                size_bytes=stat.st_size,
+                sha1=sha1,
+                ext=abs_path.suffix.lower(),
+                expires_at=expires_at,
+            )
+            self.store.replace_chunks(doc_id, chunks, embeddings)
+        except Exception as exc:
+            logger.warning("index_file: store write failed for %s: %s", abs_path, exc)
+            return None
+        return doc_id
+
     def _index_sync(
         self, spec: WorkspaceSpec, *, force: bool, prune: bool
     ) -> IndexReport:

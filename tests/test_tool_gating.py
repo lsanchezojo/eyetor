@@ -49,11 +49,17 @@ def test_known_groups_match_patterns():
 # ChatSession integration
 # ----------------------------------------------------------------------
 
-def _make_session(*, enabled: bool = True, sticky_turns: int = 2) -> ChatSession:
+def _make_session(
+    *,
+    enabled: bool = True,
+    sticky_turns: int = 2,
+    always_on_groups: list[str] | None = None,
+) -> ChatSession:
     cfg = AgentConfig(name="x", provider="p", model="m", system_prompt="")
     root = VectorConfig()
     root.sessions.tool_gating.enabled = enabled
     root.sessions.tool_gating.sticky_turns = sticky_turns
+    root.sessions.tool_gating.always_on_groups = always_on_groups or []
 
     registry = ToolRegistry()
     registry.register(
@@ -80,6 +86,12 @@ def _make_session(*, enabled: bool = True, sticky_turns: int = 2) -> ChatSession
         ToolDefinition(
             name="generate_image", description="img", parameters={"type": "object", "properties": {}},
             handler=None, group="image",
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="kb_search", description="kb", parameters={"type": "object", "properties": {}},
+            handler=None, group="kb",
         )
     )
     return ChatSession(
@@ -117,7 +129,19 @@ def test_gating_disabled_sends_all():
         "shopping_receipt_add",
         "schedule_task",
         "generate_image",
+        "kb_search",
     }
+
+
+def test_always_on_group_sent_without_trigger():
+    # kb is not triggered by a plain content question, but always_on_groups
+    # keeps it available so the model can hit the knowledge base.
+    s = _make_session(always_on_groups=["kb"])
+    defs, groups = s._turn_tool_defs("¿cuáles son las capacidades heroicas del mago?")
+    assert "kb_search" in _names(defs)
+    assert "kb" in groups
+    # Non-always-on gated groups are still excluded.
+    assert "generate_image" not in _names(defs)
 
 
 def test_sticky_keeps_group_for_followups():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _CWD_WORKSPACE = "cwd"
+_UPLOAD_WS_PREFIX = "tg-upload-"
 
 
 class KnowledgeManager:
@@ -104,6 +106,49 @@ class KnowledgeManager:
 
     def list_workspaces(self) -> list[str]:
         return sorted(self.workspaces.keys())
+
+    # ------------------------------------------------------------------
+    # Ephemeral uploads (Telegram documents)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def upload_workspace(chat_id: str | int) -> str:
+        """Name of the per-chat workspace holding that chat's ephemeral uploads."""
+        return f"{_UPLOAD_WS_PREFIX}{chat_id}"
+
+    async def ingest_upload(
+        self, chat_id: str | int, path: Path, *, retention_days: int = 7
+    ) -> dict | None:
+        """Index an uploaded document into a per-chat ephemeral workspace.
+
+        Registers ``tg-upload-{chat_id}`` (rooted at the file's directory) and
+        indexes the file with an ``expires_at`` ``retention_days`` in the future
+        (``retention_days <= 0`` means no expiry). Returns
+        ``{"doc_id", "workspace", "expires_at"}`` on success, else ``None``.
+        """
+        path = Path(path).expanduser().resolve()
+        ws = self.upload_workspace(chat_id)
+        root = path.parent
+        if ws not in self.workspaces:
+            self.workspaces[ws] = WorkspaceSpec(
+                name=ws, root=root, include=[], exclude=[]
+            )
+        self.store.upsert_workspace(ws, str(root))
+
+        expires_at: str | None = None
+        if retention_days and retention_days > 0:
+            expires_at = (
+                datetime.utcnow() + timedelta(days=retention_days)
+            ).isoformat()
+
+        doc_id = await self.indexer.index_file(ws, path, expires_at=expires_at)
+        if doc_id is None:
+            return None
+        return {"doc_id": doc_id, "workspace": ws, "expires_at": expires_at}
+
+    def purge_expired(self) -> int:
+        """Remove docs whose caducidad has passed. Returns count purged."""
+        return self.store.purge_expired()
 
     # ------------------------------------------------------------------
     # Indexing

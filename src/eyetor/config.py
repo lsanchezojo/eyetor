@@ -59,6 +59,13 @@ class TelegramChannelConfig(BaseModel):
     streaming_chunk_size: int = 20
     ssl_verify: bool = True
     auth: TelegramAuthConfig = TelegramAuthConfig()
+    # Attached-document handling (F.document). Images sent as files route to the
+    # vision path; text-extractable files (PDF/Office/text/code) are read via the
+    # knowledge extractors. Small docs are inlined into the turn; larger ones are
+    # ingested into the ephemeral knowledge base (see KnowledgeConfig).
+    documents_enabled: bool = True
+    document_max_size_bytes: int = 20 * 1024 * 1024  # Telegram Bot API getFile ~20 MB
+    document_inline_max_chars: int = 8000  # above this → knowledge base
 
 
 class CliChannelConfig(BaseModel):
@@ -178,6 +185,11 @@ class ToolGatingConfig(BaseModel):
 
     enabled: bool = True
     sticky_turns: int = 2  # keep a group active for N turns after it is used
+    # Groups sent every turn regardless of triggers. Use for capabilities whose
+    # need is not signalled by the user's wording — e.g. "kb" so content
+    # questions ("¿cuáles son las capacidades heroicas?") can hit the knowledge
+    # base without the user naming "el manual/documento".
+    always_on_groups: list[str] = []
 
 
 class SessionsConfig(BaseModel):
@@ -282,6 +294,10 @@ class KnowledgeConfig(BaseModel):
     auto_reindex_on_start: bool = True
     auto_cwd_workspace: bool = True
     max_file_size_bytes: int = 5 * 1024 * 1024
+    # Caducidad (en días) de los documentos que entran en la KB vía uploads de
+    # Telegram (por chat). Admite fracciones: 0.5 = 12 h, 0.042 ≈ 1 h. 0 (o
+    # negativo) = sin caducidad. Purgados por KnowledgeStore.purge_expired.
+    uploads_retention_days: float = 7
     workspaces: list[KnowledgeWorkspaceConfig] = []
     chunk: KnowledgeChunkConfig = KnowledgeChunkConfig()
     retrieval: KnowledgeRetrievalConfig = KnowledgeRetrievalConfig()
