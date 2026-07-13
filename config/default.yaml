@@ -274,7 +274,7 @@ knowledge:
   db_path: ~/.eyetor/knowledge.db
   auto_reindex_on_start: true
   auto_cwd_workspace: true
-  max_file_size_bytes: 152428800   # 150 MB (admite PDFs grandes escaneados)
+  max_file_size_bytes: 314572800   # 300 MB (admite PDFs grandes escaneados)
   # Caducidad (en días) de los documentos que entran en la KB por uploads de
   # Telegram (workspace por chat tg-upload-<chat_id>). Admite fracciones:
   # 0.5 = 12 h, 0.042 ≈ 1 h. 0 = sin caducidad.

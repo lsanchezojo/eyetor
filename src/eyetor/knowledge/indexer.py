@@ -188,7 +188,14 @@ class Indexer:
                 continue
             seen_rel.add(rel)
             try:
-                if abs_path.stat().st_size > self.max_file_size_bytes:
+                size = abs_path.stat().st_size
+                if size > self.max_file_size_bytes:
+                    logger.warning(
+                        "kb: %s skipped, %d bytes exceeds max_file_size_bytes=%d",
+                        abs_path,
+                        size,
+                        self.max_file_size_bytes,
+                    )
                     report.skipped += 1
                     continue
             except OSError:
