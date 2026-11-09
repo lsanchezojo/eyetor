@@ -8,12 +8,12 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from eyetor.cli import (
+from eyetor.cli import cli
+from eyetor.tools.host import (
     _looks_like_package_install_command,
     _make_install_package_handler,
     _shell_requested_timeout,
     _skill_execution_timeout,
-    cli,
 )
 from eyetor.config import VectorConfig
 from eyetor.host_info import (
