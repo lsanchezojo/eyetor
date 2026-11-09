@@ -8,6 +8,27 @@ metadata:
   version: "2.0"
 # Only typed tools (fs_*): no free-text skill_filesystem tool.
 args_tool: false
+gating:
+  group: files
+  triggers:
+    - fichero\w*
+    - archivo\w*
+    - carpeta\w*
+    - directorio\w*
+    - ruta\w*
+    - documento\w*
+    - \w+\.(txt|md|py|json|ya?ml|log|csv|pdf|conf|sh|toml|ini|html|js|ts|xml)
+    - home/\w+
+    - tmp
+    - lee|leer|leeme|abre
+    - escrib\w*
+    - borra\w*
+    - elimina\w*
+    - mueve|mover|renombra\w*
+    - grep
+    - contenido
+    - lineas?
+    - file|files|folder
 tools:
   - name: fs_read
     description: Read a text file. Relative paths resolve against ~/.eyetor.
@@ -71,7 +92,7 @@ tools:
         ext: {type: string, description: "Optional extension filter, e.g. '.py'."}
       required: [path, pattern]
   - name: fs_delete
-    description: Delete a file or directory. Destructive — confirm with the user first.
+    description: Delete a file or directory. The tool asks the user to confirm before deleting, so call it directly.
     script: fs.py
     argv: [delete]
     confirm: true

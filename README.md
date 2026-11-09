@@ -95,6 +95,21 @@ If the service is running, restart it to pick up the new code:
 systemctl --user restart eyetor
 ```
 
+### Tool-choice eval
+
+`evals/tool_choice.py` checks which tool the model picks for a set of requests,
+using the same system prompt, access policy and tool gating as a real session.
+Nothing is executed, so cases like "apaga la luz" are safe:
+
+```bash
+.venv/bin/python evals/tool_choice.py -p bolt -n 3        # 3 attempts per case
+.venv/bin/python evals/tool_choice.py -k shopping          # only matching cases
+```
+
+It reads `~/.eyetor/evals/tool_choice.yaml` (keep your real requests there, out
+of the repo) or falls back to `evals/tool_choice.example.yaml`, which documents
+the case format. Run it before and after changing models, prompts or tools.
+
 ## Configuration
 
 ```bash
@@ -509,6 +524,8 @@ Skills live in `skills/` following the [agentskills.io](https://agentskills.io) 
 | `shell` | Run shell commands on the host |
 | `filesystem` | Read, write, list, search files |
 | `browser` | Open URLs, fetch page content |
+| `shopping` | Shopping list, receipts and prices (typed `shopping_*` tools) |
+| `hyprland-commands` | Screens, volume, screenshots on a Hyprland desktop (typed `desktop_*` tools) |
 | `web-search` | Search the web via DuckDuckGo |
 | `google-workspace` | Google Calendar, Gmail, and Tasks (requires setup) |
 
@@ -557,6 +574,42 @@ commands:
 | `parse_mode` | no | Telegram parse mode for script output (default: `HTML`) |
 
 Reserved command names (`start`, `reset`, `skills`, `tools`, `model`, `tasks`, `usage`, `help`) cannot be overridden by skills.
+
+### Typed tools
+
+By default every skill is one tool, `skill_<name>`, taking a free-text `args`
+string. Small models call that unreliably (missing subcommands, invented
+flags, broken quoting), so a skill can declare **typed tools** instead, each
+mapped to a script command line:
+
+```yaml
+args_tool: false            # hide skill_<name>; expose only the tools below
+gating:                     # optional: send these tools only on matching turns
+  group: shopping
+  triggers: [compra\w*, lista, ticket\w*]   # whole words, no accents, regex ok
+tools:
+  - name: shopping_list_add
+    description: Add an item to the shopping list.
+    script: list.py
+    argv: [add]             # fixed leading arguments
+    parameters:             # JSON Schema; each argument becomes --name=value
+      type: object
+      properties:
+        text: {type: string}
+        quantity: {type: integer}
+      required: [text]
+  - name: desktop_volume
+    script: hypr.py
+    argv: [volume]
+    positional: [action]    # passed without a flag, after the flags
+    confirm: false          # true: the user must confirm through their channel
+    ...
+```
+
+Underscores in parameter names become dashes (`canonical_id` → `--canonical-id`),
+booleans become a bare flag when true, and lists/objects are passed as JSON.
+Access policies allow a typed tool when its skill or its own name is allowed.
+
 
 ### google-workspace setup
 

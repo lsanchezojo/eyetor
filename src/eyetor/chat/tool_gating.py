@@ -22,9 +22,9 @@ import unicodedata
 _GROUP_PATTERNS: dict[str, re.Pattern[str]] = {
     "scheduler": re.compile(
         r"\b("
-        r"record(ar|atorio|aro)|recuerda|recuerdame|"
+        r"record(ar|atorios?|aro)|recuerda|recuerdame|"
         r"program(a|ar|ame|acion)|agend(a|ar|ame)|"
-        r"tarea|alarma|cron|avisame|aviso|notifica(me|r)?|"
+        r"tareas?|alarmas?|cron|avisame|avisos?|notifica(me|r)?|"
         r"todos\s+los|cada\s+\d+\s*(m|h|d|min|hora|dia)|"
         r"cada\s+(dia|semana|mes|hora|lunes|martes|miercoles|jueves|viernes|sabado|domingo|\d)|"
         r"every\s+\d|schedule|reminder|"
@@ -76,9 +76,24 @@ _GROUP_PATTERNS: dict[str, re.Pattern[str]] = {
     ),
 }
 
-# All gating groups known to the system. Used to validate tool tags and as
-# the universe when gating is disabled.
+# Built-in gating groups. Skills add their own with register_group().
 KNOWN_GROUPS: frozenset[str] = frozenset(_GROUP_PATTERNS)
+
+# Groups declared by skills (SKILL.md ``gating:``), registered at startup.
+_SKILL_GROUP_PATTERNS: dict[str, re.Pattern[str]] = {}
+
+
+def register_group(name: str, triggers: list[str]) -> None:
+    """Enable tool group ``name`` on turns mentioning any of ``triggers``.
+
+    Triggers are matched like the built-in ones: whole words, against
+    accent-stripped lowercase text, so write them without accents."""
+    alternatives = "|".join(f"(?:{_normalize(t)})" for t in triggers)
+    _SKILL_GROUP_PATTERNS[name] = re.compile(rf"\b(?:{alternatives})\b")
+
+
+def all_groups() -> set[str]:
+    return set(KNOWN_GROUPS) | set(_SKILL_GROUP_PATTERNS)
 
 
 def _normalize(text: str) -> str:
@@ -90,4 +105,5 @@ def _normalize(text: str) -> str:
 def select_groups(text: str) -> set[str]:
     """Return the conditional tool groups whose triggers appear in ``text``."""
     norm = _normalize(text or "")
-    return {group for group, pat in _GROUP_PATTERNS.items() if pat.search(norm)}
+    patterns = {**_GROUP_PATTERNS, **_SKILL_GROUP_PATTERNS}
+    return {group for group, pat in patterns.items() if pat.search(norm)}

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import AsyncIterator, TYPE_CHECKING
 
 from eyetor.access import Access
-from eyetor.chat.tool_gating import KNOWN_GROUPS, select_groups
+from eyetor.chat.tool_gating import all_groups, select_groups
 from eyetor.models.agents import AgentConfig
 from eyetor.models.messages import Message, ToolCall
 from eyetor.models.tools import ToolRegistry, ToolDefinition
@@ -511,12 +511,12 @@ _NUDGE_EMPTY_REPLY = (
     "proceso interno y sin disculparte. No dejes la respuesta vacía."
 )
 _NUDGE_HOME_CLAIM = (
-    "System reminder: you said you performed an action in the "
-    "house, but no action tool was executed this turn, so nothing "
-    "changed. Emit the structured tool_call now (e.g. "
-    "intent__HassTurnOff / intent__HassTurnOn with one exact "
-    "device name). Only if no action is actually needed, answer "
-    "in Spanish without claiming you did anything."
+    "Recordatorio del sistema: has dicho que hiciste una acción en la casa, "
+    "pero en este turno no se ha ejecutado ninguna herramienta de acción, así "
+    "que no ha cambiado nada. Emite ahora la tool_call estructurada (p. ej. "
+    "intent__HassTurnOff / intent__HassTurnOn con el nombre exacto de un "
+    "dispositivo). Solo si en realidad no hace falta ninguna acción, responde "
+    "sin afirmar que hayas hecho nada."
 )
 _HOME_CLAIM_WARNING = (
     "\n\n⚠️ Ojo: no se ha llegado a ejecutar ninguna acción en "
@@ -540,10 +540,11 @@ _CLAIM_GUARDS: tuple[_ClaimGuard, ...] = (
         offered=lambda t: t.name == "schedule_task",
         done_by=lambda t: t is not None and t.name == "schedule_task",
         nudge=(
-            "System reminder: you said you scheduled a reminder, but schedule_task "
-            "was not executed this turn, so no reminder exists. Emit the structured "
-            "schedule_task tool_call now. Only if no reminder is needed, answer in "
-            "Spanish without claiming you scheduled anything."
+            "Recordatorio del sistema: has dicho que programaste un recordatorio, "
+            "pero en este turno no se ha ejecutado schedule_task, así que no existe "
+            "ninguno. Emite ahora la tool_call estructurada de schedule_task. Solo si "
+            "no hace falta ningún recordatorio, responde sin afirmar que lo hayas "
+            "programado."
         ),
         warning=(
             "\n\n⚠️ Ojo: no se ha llegado a programar ningún recordatorio, "
@@ -557,11 +558,12 @@ _CLAIM_GUARDS: tuple[_ClaimGuard, ...] = (
         # Lists, notes and files are stored by other tools: any tool run backs it.
         done_by=lambda t: t is not None,
         nudge=(
-            "System reminder: you said you saved or noted something, but no tool "
-            "was executed this turn, so nothing was stored. Emit the structured "
-            "tool_call now (remember for facts about the user, or the matching tool "
-            "for lists, notes or files). Only if nothing needs storing, answer in "
-            "Spanish without claiming you saved anything."
+            "Recordatorio del sistema: has dicho que guardaste o apuntaste algo, "
+            "pero en este turno no se ha ejecutado ninguna herramienta, así que no "
+            "se ha guardado nada. Emite ahora la tool_call estructurada (remember "
+            "para datos del usuario, o la herramienta que toque para listas, notas "
+            "o ficheros). Solo si no hay nada que guardar, responde sin afirmar que "
+            "hayas guardado nada."
         ),
         warning="\n\n⚠️ Ojo: no se ha llegado a guardar nada, así que puede que no lo recuerde.",
     ),
@@ -603,9 +605,9 @@ _FORCE_CLEAN_ANSWER = (
     "forma concreta."
 )
 _FORCE_BREAK_LOOP = (
-    "IMPORTANT: You seem to be stuck in a loop calling the same tools repeatedly. "
-    "Please provide your final answer now using the information you already have. "
-    "Do NOT call any more tools."
+    "IMPORTANTE: estás repitiendo las mismas llamadas a herramientas en bucle. "
+    "Da ahora tu respuesta final al usuario, en español, con la información que "
+    "ya tienes. NO llames a más herramientas."
 )
 
 
@@ -1174,7 +1176,10 @@ class ChatSession:
                 for tc in m.tool_calls
             ),
         )
-        msg = "I reached the maximum number of reasoning steps. Please try a simpler question."
+        msg = (
+            "He llegado al máximo de pasos sin terminar la tarea. "
+            "Prueba a pedírmelo de forma más concreta o en partes."
+        )
         max_msg = Message(role="assistant", content=msg)
         self._messages.append(max_msg)
         self._persist_message(max_msg)
@@ -1526,7 +1531,7 @@ class ChatSession:
             all_tools = list(self.tool_registry._tools.values())
             if self._compactor:
                 self._compactor.set_tool_overhead(all_tools)
-            return all_tools, set(KNOWN_GROUPS)
+            return all_tools, all_groups()
         active = self._turn_active_groups(user_input)
         return self._filter_tool_defs(active), active
 

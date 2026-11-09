@@ -5,7 +5,28 @@ license: MIT
 compatibility: Requires Python 3.11+ and httpx
 metadata:
   author: eyetor
-  version: "1.0"
+  version: "2.0"
+# Only typed tools: with free-text args small models dropped --query.
+args_tool: false
+tools:
+  - name: web_search
+    description: Search the web. Returns title, url and snippet per result.
+    script: search.py
+    parameters:
+      type: object
+      properties:
+        query: {type: string, description: All search terms in one string.}
+        max_results: {type: integer, description: "Number of results (default 5)."}
+      required: [query]
+  - name: web_fetch
+    description: Fetch a web page as plain text (HTML stripped).
+    script: search.py
+    parameters:
+      type: object
+      properties:
+        url: {type: string, description: Page URL.}
+        max_chars: {type: integer, description: "Maximum characters returned (default 6000); use ~3000 when you only need one fact."}
+      required: [url]
 ---
 
 # Web Search
@@ -17,24 +38,10 @@ Use this skill when:
 - The user provides a URL to fetch content from
 - You need to verify or look up facts
 
-## MANDATORY rules — call format
-- **ALWAYS** pass `--query "<terms>"`. Positional arguments are NOT supported and will cause an error.
-- The value of `--query` must be a single quoted string with all search terms inside.
-- **NEVER** pass search terms without the `--query` flag.
-
-❌ WRONG: `scripts/search.py "Donald Trump" noticias`
-✅ CORRECT: `scripts/search.py --query "Donald Trump noticias" --max-results 5`
-
 ## How to search the web
-1. Run `scripts/search.py --query "<search terms>" --max-results 5`
-2. The script returns JSON: `[{"title": "...", "url": "...", "snippet": "..."}]`
-3. If the snippets contain enough information to fully answer the question, use them directly.
-4. **If the snippets are too brief or don't contain the actual data needed** (weather, prices, scores, news body, etc.) you MUST fetch the most relevant URL before answering.
-
-## How to fetch a URL
-1. Run `scripts/search.py --fetch "<url>"`
-2. Returns the page content as plain text (HTML stripped)
-3. **Always fetch when the user needs specific data** that cannot be inferred from titles and snippets alone.
+1. Call `web_search` with all the search terms in `query`.
+2. If the snippets contain enough information to fully answer the question, use them directly.
+3. **If the snippets are too brief or don't contain the actual data needed** (weather, prices, scores, news body, etc.) call `web_fetch` on the most relevant URL.
 
 ## When to always fetch (never answer from snippets alone)
 - Weather / forecast queries → fetch a weather site URL from the results

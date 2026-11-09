@@ -88,7 +88,7 @@ def test_memory_claim_is_nudged_into_remember():
     reply = asyncio.run(session.send_sync("mi color favorito es el azul"))
     assert executed == ["remember"]
     assert reply == "¡Apuntado! Tu color favorito es el azul."
-    assert provider.last[1].startswith("System reminder: you said you saved")
+    assert provider.last[1].startswith("Recordatorio del sistema: has dicho que guardaste")
 
 
 def test_persistent_reminder_claim_is_flagged():

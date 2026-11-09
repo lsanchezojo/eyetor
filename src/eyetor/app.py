@@ -84,8 +84,10 @@ def build_system_prompt(cfg, *, use_host_tools: bool, host_profile: dict, skill_
             "You are Eyetor (sounds like Aitor), an AI assistant with tools that can act on the user's computer. "
             "You can run shell commands, manage files, open URLs and search the internet. "
             "Always reply in Spanish (Spain). "
-            "Briefly explain what you are about to do before doing it. "
-            "Ask for confirmation before destructive operations (delete, overwrite, format).\n\n"
+            "Briefly explain what you are doing. "
+            "Tools that delete or wipe data ask the user for confirmation on their own, "
+            "so when the user asks you to delete something, just use the tool. "
+            "Ask first only before destructive operations the user did not request.\n\n"
         )
     else:
         identity = (

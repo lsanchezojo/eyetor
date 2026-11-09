@@ -1,0 +1,32 @@
+# Example tool-choice cases. Put your own (real requests, private) in
+# ~/.eyetor/evals/tool_choice.yaml; the runner prefers that file.
+#   .venv/bin/python evals/tool_choice.py -p <provider> -n 3
+
+- input: "apunta leche en la lista de la compra"
+  expect: shopping_list_add
+  args: {text: leche}
+- input: "¿qué hay en la lista de la compra?"
+  expect: shopping_list_show
+- input: "apaga la luz del salón"
+  expect: [intent__HassTurnOff, homeassistant__GetLiveContext]
+- input: "recuérdame mañana a las 9 llamar al dentista"
+  expect: schedule_task
+  args: {prompt: dentista}
+- input: "mi color favorito es el verde, apúntatelo"
+  expect: remember
+  args: {value: verde}
+- input: "lee las primeras 20 líneas de ~/.eyetor/AGENTS.md"
+  expect: fs_read
+- input: "borra el fichero /tmp/prueba.txt"
+  expect: fs_delete
+- input: "¿qué tiempo hará mañana en Madrid?"
+  expect: web_search
+- input: "sube el volumen del ordenador"
+  expect: desktop_volume
+- input: "Cuéntame un chiste."
+  expect: none
+- input: "sí"
+  history:
+    - user: "hace calor en el salón"
+      assistant: "¿Quieres que encienda el ventilador del salón?"
+  expect: [intent__HassTurnOn, fan__HassFanSetSpeed]

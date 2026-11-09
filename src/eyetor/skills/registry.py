@@ -112,8 +112,9 @@ class SkillRegistry:
                         )
                 if not lines:
                     continue
-                tool_name = f"skill_{name.replace('-', '_')}"
-                parts.append(f"\n### {tool_name}")
+                # Typed-only skills have no skill_<name> tool: never name one.
+                heading = f"skill_{name.replace('-', '_')}" if meta.args_tool else f"{name} skill"
+                parts.append(f"\n### {heading}")
                 parts.extend(lines)
             except KeyError:
                 logger.warning("Skill not found in registry: %s", name)

@@ -45,9 +45,10 @@ class SkillCommand:
 class SkillTool:
     """A typed tool declared by a skill in SKILL.md frontmatter.
 
-    Calling it runs ``scripts/<script> <argv...>`` followed by one
-    ``--<param-name>=<value>`` per argument given (underscores become dashes;
-    booleans become a bare flag when true; lists/objects are passed as JSON).
+    Calling it runs ``scripts/<script> <argv...>``, then the values of the
+    ``positional`` parameters in that order, then one ``--<param-name>=<value>``
+    per other argument given (underscores become dashes; booleans become a bare
+    flag when true; lists/objects are passed as JSON).
     """
 
     name: str
@@ -55,6 +56,7 @@ class SkillTool:
     script: str  # relative to the skill's scripts/ dir
     parameters: dict  # JSON Schema object
     argv: list[str] = field(default_factory=list)  # fixed leading args, e.g. ["add"]
+    positional: list[str] = field(default_factory=list)  # params passed without a flag
     confirm: bool = False  # ask the user before running (destructive operations)
 
 
@@ -81,6 +83,11 @@ class SkillMetadata:
     # False hides the generic ``skill_<name>`` (free-text ``args``) tool, for
     # skills fully covered by their typed tools.
     args_tool: bool = True
+    # Tool-gating group for this skill's tools and the keywords that enable it
+    # on a turn (accent/case-insensitive, whole words; regex allowed). Without
+    # a group the skill's tools are sent on every turn.
+    group: str | None = None
+    triggers: list[str] = field(default_factory=list)
 
 
 _TOOL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -109,9 +116,25 @@ def _parse_skill_tools(skill_name: str, skill_dir: Path, raw_tools) -> list[Skil
             script=script,
             parameters=params,
             argv=[str(a) for a in raw.get("argv", []) or []],
+            positional=[str(a) for a in raw.get("positional", []) or []],
             confirm=bool(raw.get("confirm", False)),
         ))
     return tools
+
+
+_GROUP_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+def _parse_gating(skill_name: str, raw) -> dict:
+    """``gating: {group: shopping, triggers: [compra, ticket, ...]}``."""
+    if not raw:
+        return {}
+    group = raw.get("group") if isinstance(raw, dict) else None
+    triggers = [str(t) for t in (raw.get("triggers") or [])] if isinstance(raw, dict) else []
+    if not group or not _GROUP_NAME_RE.match(str(group)) or not triggers:
+        logger.warning("Skill '%s': ignoring invalid gating %r", skill_name, raw)
+        return {}
+    return {"group": str(group), "triggers": triggers}
 
 
 @dataclass
@@ -218,6 +241,7 @@ def load_skill_metadata(skill_dir: Path) -> SkillMetadata | None:
         on_reset=on_reset,
         tools=_parse_skill_tools(name, skill_dir, fm.get("tools")),
         args_tool=bool(fm.get("args_tool", True)),
+        **_parse_gating(name, fm.get("gating")),
     )
 
 

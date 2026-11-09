@@ -33,11 +33,15 @@ def register_skill_tools(
     host_profile: dict,
 ) -> None:
     """Expose every discovered skill as tools, with host-safety guards."""
+    from eyetor.chat.tool_gating import register_group
+
     for name in skill_reg.list_names():
         meta = skill_reg.get_metadata(name)
         scripts = skill_reg.list_scripts(name)
         if not scripts:
             continue
+        if meta.group and meta.tools:
+            register_group(meta.group, meta.triggers)
         if meta.args_tool:
             tool_registry.register(
                 _args_tool(
@@ -140,14 +144,20 @@ def _args_tool(
 def build_skill_tool_argv(tool: SkillTool, arguments: dict[str, Any]) -> list[str]:
     """Translate typed tool arguments into the script's command line.
 
-    Parameters follow the schema's property order; ``None`` values are
-    skipped. ``--flag=value`` keeps values that start with ``-`` intact.
+    Flags follow the schema's property order and come before the positional
+    values; ``None`` values are skipped. ``--flag=value`` keeps values that
+    start with ``-`` intact.
     """
     argv = list(tool.argv)
+    positional = [
+        value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        for value in (arguments.get(key) for key in tool.positional)
+        if value is not None and value != ""
+    ]
     props = tool.parameters.get("properties", {})
     for key in list(props) + [k for k in arguments if k not in props]:
         value = arguments.get(key)
-        if value is None:
+        if value is None or key in tool.positional:
             continue
         flag = "--" + key.replace("_", "-")
         if isinstance(value, bool):
@@ -157,7 +167,10 @@ def build_skill_tool_argv(tool: SkillTool, arguments: dict[str, Any]) -> list[st
             argv.append(f"{flag}={json.dumps(value, ensure_ascii=False)}")
         else:
             argv.append(f"{flag}={value}")
-    return argv
+    # Positionals go last; "--" keeps a value like "-50 %" from reading as a flag.
+    if any(v.startswith("-") for v in positional):
+        argv.append("--")
+    return argv + positional
 
 
 def _describe_args(arguments: dict[str, Any]) -> str:
@@ -174,7 +187,8 @@ def _typed_tool(
     async def _handler(**arguments: Any) -> str:
         argv = build_skill_tool_argv(tool, arguments)
         if use_host_tools and tool.confirm:
-            refused = await guard(f"{tool.name}: {_describe_args(arguments)}")
+            described = _describe_args(arguments)
+            refused = await guard(f"{tool.name}: {described}" if described else tool.name)
             if refused:
                 return refused
         return await run_script(
@@ -190,4 +204,5 @@ def _typed_tool(
         parameters=tool.parameters,
         handler=_handler,
         skill=skill_name,
+        group=meta.group,
     )

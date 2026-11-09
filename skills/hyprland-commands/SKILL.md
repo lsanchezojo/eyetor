@@ -7,6 +7,90 @@ metadata:
   author: eyetor
   version: "0.1"
 timeout: 30
+args_tool: false
+gating:
+  group: desktop
+  triggers:
+    - pantalla\w*
+    - monitor\w*
+    - escritorio
+    - hyprland|hypr
+    - brillo
+    - captura\w*
+    - pantallazo
+    - bloquea\w*
+    - notifica\w*
+    - volumen
+    - sonido
+    - silencia\w*
+    - mute
+    - musica
+    - cancion\w*
+    - reproduc\w*
+    - pausa\w*
+    - ventana\w*
+    - workspace\w*
+    - ordenador|pc
+tools:
+  - name: desktop_screens_on
+    description: Wake the computer's screens (DPMS on) and restore their brightness.
+    script: hypr.py
+    argv: [hello]
+    parameters: {type: object, properties: {}}
+  - name: desktop_screens_off
+    description: Turn the computer's screens off (DPMS off).
+    script: hypr.py
+    argv: [bye]
+    parameters: {type: object, properties: {}}
+  - name: desktop_lock
+    description: Lock the desktop session.
+    script: hypr.py
+    argv: [lock]
+    parameters: {type: object, properties: {}}
+  - name: desktop_status
+    description: Active window, monitors and workspaces of the desktop.
+    script: hypr.py
+    argv: [status]
+    parameters: {type: object, properties: {}}
+  - name: desktop_screenshot
+    description: Screenshot a desktop workspace and send it to the chat.
+    script: hypr.py
+    argv: [shot]
+    positional: [workspace]
+    parameters:
+      type: object
+      properties:
+        workspace: {type: integer, description: Workspace number; omit for the active one.}
+  - name: desktop_notify
+    description: Show a notification on the computer's screen.
+    script: hypr.py
+    argv: [notify]
+    positional: [text]
+    parameters:
+      type: object
+      properties:
+        text: {type: string, description: Notification text.}
+      required: [text]
+  - name: desktop_volume
+    description: Change the computer's audio volume.
+    script: hypr.py
+    argv: [volume]
+    positional: [action]
+    parameters:
+      type: object
+      properties:
+        action: {type: string, description: "'up', 'down', 'mute', or a percentage like '40'."}
+      required: [action]
+  - name: desktop_media
+    description: Control media playback on the computer.
+    script: hypr.py
+    argv: [media]
+    positional: [action]
+    parameters:
+      type: object
+      properties:
+        action: {type: string, enum: [play-pause, next, prev, stop]}
+      required: [action]
 commands:
   - name: hypr_hello
     description: Despierta las pantallas (DPMS on) y restaura el brillo guardado.

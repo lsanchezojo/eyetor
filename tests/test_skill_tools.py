@@ -93,8 +93,7 @@ def test_filesystem_exposes_only_typed_tools():
     assert "skill_filesystem" not in names
     assert {"fs_read", "fs_write", "fs_grep", "fs_delete"} <= names
     assert _registry()._tools["fs_read"].skill == "filesystem"
-    # Shopping keeps its generic tool and adds the typed one.
-    assert {"skill_shopping", "shopping_receipt_add"} <= names
+    assert {"shopping_list_show", "shopping_receipt_add"} <= names
 
 
 def test_fs_tools_roundtrip(tmp_path: Path, monkeypatch):
@@ -115,3 +114,33 @@ def test_access_allows_skill_tool_via_skill_or_name():
     assert not Access(skills={"web_search"}).allows(tool)
     core = ToolDefinition(name="kb_search", description="", parameters={})
     assert not Access(skills={"shopping"}).allows(core)
+
+
+def test_positionals_go_last_and_dash_values_are_protected():
+    tool = SkillTool(
+        name="t", description="d", script="s.py", argv=["notify"], positional=["text"],
+        parameters={"type": "object", "properties": {"text": {}, "urgent": {}}},
+    )
+    assert build_skill_tool_argv(tool, {"text": "hola", "urgent": True}) == ["notify", "--urgent", "hola"]
+    assert build_skill_tool_argv(tool, {"text": "-50 %"}) == ["notify", "--", "-50 %"]
+    assert build_skill_tool_argv(tool, {}) == ["notify"]
+
+
+def test_skill_gating_groups_route_turns():
+    from eyetor.chat.tool_gating import select_groups
+
+    tools = _registry()._tools
+    assert tools["shopping_list_add"].group == "shopping"
+    assert tools["fs_read"].group == "files"
+    assert tools["desktop_volume"].group == "desktop"
+    assert tools["web_search"].group is None
+    assert "skill_shopping" not in tools
+    assert select_groups("apunta leche en la lista") == {"shopping"}
+    assert select_groups("lee /home/haziel/notas.txt") == {"files"}
+    assert "shopping" not in select_groups("enciende el flexo")
+
+
+def test_invalid_gating_is_ignored(tmp_path: Path):
+    d = _write_skill(tmp_path, "gating: {group: 'Bad Group', triggers: [x]}\n")
+    meta = load_skill_metadata(d)
+    assert meta.group is None and meta.triggers == []
