@@ -77,7 +77,10 @@ class McpRegistry:
         """Register all MCP tools into the given ToolRegistry."""
         count = 0
         for name, client in self._clients.items():
+            group = self._config[name].group
             for tool in client.get_tools():
+                if group:
+                    tool = tool.model_copy(update={"group": group})
                 tool_registry.register(tool)
                 count += 1
         logger.info("Registered %d MCP tools into ToolRegistry", count)
@@ -124,7 +127,7 @@ def _build_client(name: str, cfg: McpServerConfig) -> McpClient:
     elif cfg.transport == "http":
         if not cfg.url:
             raise ValueError(f"MCP server '{name}' with http transport requires 'url'")
-        transport = HttpTransport(url=cfg.url)
+        transport = HttpTransport(url=cfg.url, headers=cfg.headers or None)
     else:
         raise ValueError(f"Unknown MCP transport: {cfg.transport!r}")
     return McpClient(transport)

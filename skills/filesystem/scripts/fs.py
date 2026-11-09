@@ -58,6 +58,12 @@ def cmd_read(path: str, lines: str | None) -> None:
         _err(f"File not found: {path}")
     if not p.is_file():
         _err(f"Not a file: {path}")
+    # Binarios (imágenes, PDF, zip...) volcados como texto revientan el contexto
+    # del modelo: un JPG de Telegram llegó a ~230k tokens.
+    with p.open("rb") as f:
+        if b"\x00" in f.read(8192):
+            _err(f"Binary file, cannot read as text: {path}. Images are already described "
+                 "by the vision model; use the matching skill for PDFs or documents.")
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
     except Exception as e:

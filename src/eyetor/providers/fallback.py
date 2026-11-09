@@ -88,6 +88,14 @@ class FallbackProvider(BaseProvider):
                 "Fallback chain resolved with provider #%d: %s", idx + 1, provider
             )
 
+    async def warm_up(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+    ) -> None:
+        # Only the primary matters: it is the one the next turn will hit.
+        await self._providers[0].warm_up(messages, tools)
+
     async def complete(
         self,
         messages: list[Message],

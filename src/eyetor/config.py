@@ -74,11 +74,50 @@ class CliChannelConfig(BaseModel):
     host_tools: bool = True  # Enable shell/filesystem/browser/web-search skills
 
 
+class VoiceChannelConfig(BaseModel):
+    """Always-listening voice assistant on this host (wake word → STT → agent → TTS).
+
+    Audio goes through PipeWire (``parec``/``pacat``); devices are PulseAudio
+    source/sink names (``pactl list short sources``), None = system default.
+    """
+
+    enabled: bool = False
+    session_id: str = "voice-local"
+    input_device: str | None = None
+    output_device: str | None = None
+    # openWakeWord: the wake word model plus the shared feature models dir
+    wake_word_model: str = "~/.eyetor/voice/oww/hey_jarvis_v0.1.onnx"
+    oww_models_dir: str = "~/.eyetor/voice/oww"
+    wake_threshold: float = 0.5
+    # Std of the noise added before openWakeWord: mics with a noise gate send exact
+    # zeros in silence, which the model never saw in training (0 = off)
+    wake_dither: float = 0.0
+    # Confirm each detection by transcribing the last ~2 s with whisper (cuts
+    # false activations at the cost of ~0.5 s of CPU per detection)
+    wake_verify: bool = False
+    wake_prompt: str = "Aitor."  # whisper hint for the verification (the wake word)
+    # Speech-to-text (faster-whisper): small + greedy ≈ 0.9 s per command on CPU
+    stt_model: str = "small"
+    stt_beam_size: int = 1
+    language: str | None = "es"
+    # Text-to-speech (Piper voice .onnx with its .onnx.json next to it)
+    piper_voice: str = "~/.eyetor/voice/piper/es_ES-davefx-medium.onnx"
+    # End-of-command detection (energy-based, relative to the idle noise floor)
+    silence_seconds: float = 0.8
+    no_speech_timeout: float = 4.0
+    max_command_seconds: float = 10.0
+    min_speech_rms: float = 300.0
+    # After answering, listen this long for a follow-up without the wake word
+    followup_seconds: float = 5.0
+    chime: bool = True
+
+
 class ChannelsConfig(BaseModel):
     """Configuration for communication channels."""
 
     cli: CliChannelConfig = CliChannelConfig()
     telegram: TelegramChannelConfig = TelegramChannelConfig()
+    voice: VoiceChannelConfig = VoiceChannelConfig()
 
 
 class OrchestratorWorkerConfig(BaseModel):
@@ -130,6 +169,8 @@ class McpServerConfig(BaseModel):
     args: list[str] = []
     env: dict[str, str] = {}
     url: str | None = None
+    headers: dict[str, str] = {}  # http only, e.g. Authorization: Bearer ${TOKEN}
+    group: str | None = None  # tool-gating group for every tool (None = always on)
 
 
 class FallbackConfig(BaseModel):
@@ -355,13 +396,15 @@ class VectorConfig(BaseModel):
     log_level: str = "INFO"
 
 
-_ENV_VAR_PATTERN = re.compile(r"\$\{(\w+)\}")
+_ENV_VAR_PATTERN = re.compile(r"\$\{(\w+)(?::-([^}]*))?\}")
 
 
 def _resolve_env_vars(value: Any) -> Any:
-    """Recursively resolve ${ENV_VAR} patterns in config values."""
+    """Recursively resolve ${ENV_VAR} / ${ENV_VAR:-default} patterns in config values."""
     if isinstance(value, str):
-        return _ENV_VAR_PATTERN.sub(lambda m: os.environ.get(m.group(1), ""), value)
+        return _ENV_VAR_PATTERN.sub(
+            lambda m: os.environ.get(m.group(1)) or (m.group(2) or ""), value
+        )
     if isinstance(value, dict):
         return {k: _resolve_env_vars(v) for k, v in value.items()}
     if isinstance(value, list):

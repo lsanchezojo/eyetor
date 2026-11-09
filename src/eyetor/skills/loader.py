@@ -21,7 +21,7 @@ _SKILL_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
 _COMMAND_NAME_RE = re.compile(r"^[a-z0-9_]+$")
 
 # Core commands that skills cannot override
-_RESERVED_COMMANDS = {"start", "reset", "skills", "tasks", "help"}
+_RESERVED_COMMANDS = {"start", "reset", "skills", "tasks", "help", "chats", "chat"}
 
 
 @dataclass
@@ -35,6 +35,10 @@ class SkillCommand:
     args: list[str] = field(default_factory=list)
     prompt: str = ""  # template with {args} placeholder
     parse_mode: str = "HTML"  # Telegram parse mode for script output
+    # If true (script commands only), replying to a result message re-invokes
+    # the script to continue it. The script may emit a "reply_token" in its JSON
+    # output (opaque to the core) that is handed back via EYETOR_REPLY_TOKEN.
+    reply_continue: bool = False
 
 
 @dataclass
@@ -53,6 +57,9 @@ class SkillMetadata:
     version: str = ""
     timeout: float | None = None  # Per-skill timeout override (seconds); None = use default
     commands: list[SkillCommand] = field(default_factory=list)
+    # Optional script (relative to scripts/) run as "<script> --session-reset"
+    # with EYETOR_SESSION_ID when an eyetor conversation is reset.
+    on_reset: str | None = None
 
 
 @dataclass
@@ -132,11 +139,19 @@ def load_skill_metadata(skill_dir: Path) -> SkillMetadata | None:
             args=list(raw_cmd.get("args", []) or []),
             prompt=raw_cmd.get("prompt", ""),
             parse_mode=raw_cmd.get("parse_mode", "HTML"),
+            reply_continue=bool(raw_cmd.get("reply_continue", False)),
         ))
 
     # Optional per-skill timeout (seconds)
     raw_timeout = fm.get("timeout")
     timeout = float(raw_timeout) if raw_timeout is not None else None
+
+    # Optional session-reset hook (script name relative to scripts/).
+    on_reset = fm.get("on_reset") or None
+    if on_reset:
+        if not (skill_dir / "scripts" / on_reset).exists():
+            logger.warning("Skill '%s': on_reset script %r not found", name, on_reset)
+            on_reset = None
 
     return SkillMetadata(
         name=name,
@@ -148,6 +163,7 @@ def load_skill_metadata(skill_dir: Path) -> SkillMetadata | None:
         version=str(meta_block.get("version", "")),
         timeout=timeout,
         commands=commands,
+        on_reset=on_reset,
     )
 
 

@@ -17,6 +17,7 @@ from eyetor.models.messages import Message, ToolCall
 from eyetor.models.tools import ToolRegistry, ToolDefinition
 from eyetor.providers.base import BaseProvider
 from eyetor.tracking.context import (
+    current_conversation_id,
     current_session_id,
     current_trace_id,
     new_trace_id,
@@ -62,6 +63,31 @@ _TOOL_INTENT_RE = re.compile(
     r"|now (i'?ll|let me|i will) (call|use|run|execute|invoke))",
     re.IGNORECASE,
 )
+
+
+# First-person past-tense claims of a smart-home action ("he apagado la luz").
+# A small model sometimes reads the state with GetLiveContext and then *says*
+# it acted without emitting the action call (incident 2026-10-30: "He apagado
+# la luz del salón" with no HassTurnOff). Only "he/hemos + participle" forms:
+# "ya está apagada" is a legitimate answer when nothing needed doing.
+_HOME_ACTION_CLAIM_RE = re.compile(
+    r"\b(he|hemos)\s+(\w+\s+)?"
+    r"(apagad|encendid|prendid|activad|desactivad|abiert|cerrad|subid|bajad|"
+    r"puest|ajustad|cambiad|pausad|reanudad|silenciad|iniciad|lanzad|"
+    r"enviad|dispensad|regulad|bloquead|desbloquead)[oa]s?\b",
+    re.IGNORECASE,
+)
+
+# Read-only tools in the "home" group; anything else in that group acts on the house.
+_HOME_READ_ONLY_SUFFIXES = ("GetLiveContext", "GetDateTime")
+
+
+def _is_home_action_tool(tool: ToolDefinition | None) -> bool:
+    return (
+        tool is not None
+        and tool.group == "home"
+        and not tool.name.endswith(_HOME_READ_ONLY_SUFFIXES)
+    )
 
 
 # Markers that indicate the model is requesting information from the user
@@ -384,8 +410,15 @@ class ChatSession:
         cost_estimator: "CostEstimator | None" = None,
         observer: "WorkerObserver | None" = None,
         access: "Access | None" = None,
+        conversation_id: str | None = None,
+        conversation_index=None,
     ) -> None:
         self.session_id = session_id
+        # ChatGPT-style conversations: session_id stays the stable chat
+        # identity (access/memory/scheduler scoping); conversation_id only
+        # selects which history file this session reads/writes.
+        self.conversation_id = conversation_id
+        self._conv_index = conversation_index
         self.config = config
         self.provider = provider
         self._messages: list[Message] = []
@@ -431,8 +464,11 @@ class ChatSession:
         if root_config and root_config.sessions.persist:
             sessions_dir = Path(root_config.sessions.dir).expanduser()
             sessions_dir.mkdir(parents=True, exist_ok=True)
-            safe_id = re.sub(r"[/:@\\]", "_", session_id)
-            self._persist_path = sessions_dir / f"{safe_id}.jsonl"
+            from eyetor.chat.conversations import sanitize_id
+
+            safe_id = sanitize_id(session_id)
+            stem = f"{safe_id}.{conversation_id}" if conversation_id else safe_id
+            self._persist_path = sessions_dir / f"{stem}.jsonl"
             self._max_messages = root_config.sessions.max_messages
             self._load_history()
 
@@ -641,6 +677,14 @@ class ChatSession:
         When chain mode is active and the query is complex, delegates to
         send_chained() automatically.
         """
+        # Conversation bookkeeping (title from first user message, recency).
+        # Done here — NOT in send_chained, whose persisted prompt is synthetic.
+        if self._conv_index is not None and self.conversation_id:
+            try:
+                self._conv_index.touch(self.session_id, self.conversation_id, user_input)
+            except Exception as exc:  # index must never break a turn
+                logger.warning("Conversation index touch failed: %s", exc)
+
         # Check if chain mode should be used for this query
         if self._is_complex_query(user_input):
             async for chunk in self.send_chained(user_input):
@@ -661,6 +705,7 @@ class ChatSession:
                 ", ".join(sorted(active_groups)) or "none",
             )
         current_session_id.set(self.session_id)
+        current_conversation_id.set(self.conversation_id or "")
         current_trace_id.set(new_trace_id())
 
         full_messages = self._get_full_messages()
@@ -694,6 +739,8 @@ class ChatSession:
         degeneration_recovered = False  # one-shot post-tool synthesis fallback
         scaffold_recovered = False  # one-shot clean-synthesis fallback for leaks
         tools_executed = 0
+        home_actions_ok = 0  # successful smart-home action calls this turn
+        claim_nudged = False  # one retry when an action is claimed but not executed
 
         while iterations < self.config.max_iterations:
             iterations += 1
@@ -789,6 +836,44 @@ class ChatSession:
                         )
                     )
                     continue
+                # Claimed a smart-home action that never ran: retry once with
+                # the tool still available, then flag the reply so the user is
+                # not told the light is off when it is not.
+                if (
+                    content
+                    and home_actions_ok == 0
+                    and tool_defs
+                    and any(_is_home_action_tool(t) for t in tool_defs)
+                    and _HOME_ACTION_CLAIM_RE.search(content)
+                ):
+                    if not claim_nudged:
+                        claim_nudged = True
+                        logger.warning(
+                            "Session '%s' — home action claimed without executing it; nudging",
+                            self.session_id,
+                        )
+                        full_messages.append(
+                            Message(
+                                role="user",
+                                content=(
+                                    "System reminder: you said you performed an action in the "
+                                    "house, but no action tool was executed this turn, so nothing "
+                                    "changed. Emit the structured tool_call now (e.g. "
+                                    "intent__HassTurnOff / intent__HassTurnOn with one exact "
+                                    "device name). Only if no action is actually needed, answer "
+                                    "in Spanish without claiming you did anything."
+                                ),
+                            )
+                        )
+                        continue
+                    logger.warning(
+                        "Session '%s' — home action still claimed without executing it; flagging reply",
+                        self.session_id,
+                    )
+                    content = (
+                        f"{content}\n\n⚠️ Ojo: no se ha llegado a ejecutar ninguna acción en "
+                        "Home Assistant, así que puede que no haya cambiado nada."
+                    )
                 # Some small local models announce "voy a reintentar / I'll call X"
                 # in plain text without emitting the structured tool_call. Nudge
                 # once only before any tool has actually run. After a tool result,
@@ -1089,6 +1174,10 @@ class ChatSession:
                 self._persist_message(tool_msg)
                 full_messages.append(tool_msg)
                 tools_executed += 1
+                if _is_home_action_tool(
+                    self.tool_registry._tools.get(tc.function.name)
+                ) and not result.startswith("Error"):
+                    home_actions_ok += 1
                 self._mark_group_used(tc.function.name)
                 logger.info(
                     "Session '%s' — tool '%s'(%s) → %d chars: %s",
@@ -1137,6 +1226,29 @@ class ChatSession:
         r"|(\bfirst\b.*\bthen\b)",
         re.IGNORECASE,
     )
+
+    async def warm_up(self) -> None:
+        """Prefill the provider's prompt cache with this session's prefix.
+
+        Sends system prompt + history + the always-on tools with a throwaway
+        user message, so the next real turn only processes its new tokens.
+        Nothing is persisted. Only helps when the turn's tool set matches the
+        always-on one (the usual case for short commands).
+        """
+        tools: list[ToolDefinition] | None = None
+        if self.tool_registry._tools:
+            if self._gating_enabled:
+                tools = [
+                    t
+                    for t in self.tool_registry._tools.values()
+                    if t.group is None or t.group in self._always_on_groups
+                ] or None
+            else:
+                tools = list(self.tool_registry._tools.values())
+        messages = self._get_full_messages()
+        messages.append(Message(role="user", content="ok"))
+        with tracking_context(phase="warmup"):
+            await self.provider.warm_up(messages, tools)
 
     def _is_complex_query(self, user_input: str) -> bool:
         """Heuristic: decide if a query should use chain mode.
@@ -1189,6 +1301,7 @@ class ChatSession:
         plan_messages.append(Message(role="user", content=plan_prompt))
 
         current_session_id.set(self.session_id)
+        current_conversation_id.set(self.conversation_id or "")
         current_trace_id.set(new_trace_id())
 
         with tracking_context(phase="chain_plan"):
@@ -1347,6 +1460,8 @@ class ChatSession:
             for t in self.tool_registry._tools.values()
             if t.group is None or t.group in active_groups
         ]
+        if self._compactor:
+            self._compactor.set_tool_overhead(selected)
         return selected or None
 
     def _turn_active_groups(self, user_input: str) -> set[str]:
@@ -1381,9 +1496,14 @@ class ChatSession:
         is a no-op.
         """
         if not self.tool_registry._tools:
+            if self._compactor:
+                self._compactor.set_tool_overhead(None)
             return None, set()
         if not self._gating_enabled:
-            return list(self.tool_registry._tools.values()), set(KNOWN_GROUPS)
+            all_tools = list(self.tool_registry._tools.values())
+            if self._compactor:
+                self._compactor.set_tool_overhead(all_tools)
+            return all_tools, set(KNOWN_GROUPS)
         active = self._turn_active_groups(user_input)
         return self._filter_tool_defs(active), active
 
@@ -1433,7 +1553,7 @@ class ChatSession:
             self._messages,
             system_content,
             self.provider,
-            self.session_id,
+            f"{self.session_id}.{self.conversation_id}" if self.conversation_id else self.session_id,
             force=force,
         )
         if result.compacted:

@@ -44,6 +44,7 @@ class SessionManager:
         root_config: "VectorConfig | None" = None,
         tracker: "UsageTracker | None" = None,
         cost_estimator: "CostEstimator | None" = None,
+        enable_conversations: bool = False,
     ) -> None:
         self._config = config
         self._provider = provider
@@ -56,6 +57,17 @@ class SessionManager:
         self._tracker = tracker
         self._cost_estimator = cost_estimator
         self._sessions: dict[str, ChatSession] = {}
+
+        # ChatGPT-style conversations (opt-in per manager: CLI/Telegram yes,
+        # scheduler no). Requires session persistence for the JSONL files.
+        self._conv_index = None
+        if enable_conversations and root_config and root_config.sessions.persist:
+            from pathlib import Path
+
+            from eyetor.chat.conversations import ConversationIndex
+
+            sessions_dir = Path(root_config.sessions.dir).expanduser()
+            self._conv_index = ConversationIndex(sessions_dir / "conversations.json")
 
         # Pre-build routing structures if enabled
         self._routing_enabled = False
@@ -134,11 +146,28 @@ class SessionManager:
         )
 
     def get_or_create(self, session_id: str) -> ChatSession:
-        """Return the existing session or create a new one."""
+        """Return the existing session or create a new one.
+
+        With conversations enabled the session is bound to the chat's active
+        conversation; ``session_id`` stays the stable chat identity (access
+        policy, memory, scheduler scoping are all keyed by it).
+        """
         if session_id not in self._sessions:
             from eyetor.access import resolve
 
             access = resolve(self._root_config, session_id)
+            conv_id = None
+            if self._conv_index is not None:
+                from pathlib import Path
+
+                from eyetor.chat.conversations import sanitize_id
+
+                # First contact migrates a legacy single-file history, if any.
+                legacy = (
+                    Path(self._root_config.sessions.dir).expanduser()
+                    / f"{sanitize_id(session_id)}.jsonl"
+                )
+                conv_id = self._conv_index.active(session_id, legacy_file=legacy)
             self._sessions[session_id] = ChatSession(
                 session_id=session_id,
                 config=self._config,
@@ -152,8 +181,10 @@ class SessionManager:
                 tracker=self._tracker,
                 cost_estimator=self._cost_estimator,
                 access=access,
+                conversation_id=conv_id,
+                conversation_index=self._conv_index,
             )
-            logger.debug("Created new session: %s", session_id)
+            logger.debug("Created new session: %s (conversation=%s)", session_id, conv_id)
         return self._sessions[session_id]
 
     def close(self, session_id: str) -> None:
@@ -161,12 +192,44 @@ class SessionManager:
         self._sessions.pop(session_id, None)
         logger.debug("Closed session: %s", session_id)
 
-    def reset(self, session_id: str) -> None:
-        """Reset the history of an existing session (or create empty one)."""
-        session = self.get_or_create(session_id)
-        session.reset()
-        if self._tracker:
-            self._tracker.clear_session(session_id)
+    # ------------------------------------------------------------------
+    # Conversations (ChatGPT-style)
+    # ------------------------------------------------------------------
+
+    def new_conversation(self, session_id: str) -> str | None:
+        """Open a fresh conversation for a chat; return its id.
+
+        Without an index (conversations disabled or persist off) it falls back
+        to wiping the single session's history, preserving old behavior.
+        """
+        if self._conv_index is None:
+            self.get_or_create(session_id).reset()
+            return None
+        conv_id = self._conv_index.new(session_id)
+        # Drop the cached session so the next message binds to the new file.
+        self._sessions.pop(session_id, None)
+        return conv_id
+
+    def switch_conversation(self, session_id: str, conv_id: str) -> bool:
+        """Resume a past conversation of this chat."""
+        if self._conv_index is None:
+            return False
+        if not self._conv_index.switch(session_id, conv_id):
+            return False
+        self._sessions.pop(session_id, None)
+        return True
+
+    def list_conversations(self, session_id: str) -> list[dict]:
+        """Conversations of a chat, newest first (empty if disabled)."""
+        if self._conv_index is None:
+            return []
+        return self._conv_index.list(session_id)
+
+    def active_conversation_id(self, session_id: str) -> str | None:
+        """The chat's active conversation id, or None."""
+        if self._conv_index is None:
+            return None
+        return self._conv_index.active_id(session_id)
 
     def list_sessions(self) -> list[str]:
         """Return all active session IDs."""

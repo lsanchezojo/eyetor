@@ -10,7 +10,8 @@ Semantics:
 - ``access`` present: a session uses its own entry. Lookup precedence is
   exact session_id > glob pattern (e.g. ``cli-*``, longest match wins) >
   ``default`` > nothing allowed (restrictive default).
-- ``"*"`` in a list means "all tools" / "all skills".
+- ``"*"`` in a list means "all tools" / "all skills"; other tool entries may be
+  globs (``intent__*``), handy for MCP servers that expose many tools.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ class Access:
 
     all_tools: bool = False
     all_skills: bool = False
-    tools: set[str] = field(default_factory=set)  # exact tool names
+    tools: set[str] = field(default_factory=set)  # tool names or globs (intent__*)
     skills: set[str] = field(default_factory=set)  # normalized skill names
     unrestricted: bool = False  # True when no access config exists at all
 
@@ -47,7 +48,14 @@ class Access:
         if name.startswith(_SKILL_PREFIX):
             sk = name[len(_SKILL_PREFIX):]
             return self.all_skills or sk in self.skills
-        return self.all_tools or name in self.tools
+        return (
+            self.all_tools
+            or name in self.tools
+            or any(
+                any(c in pat for c in "*?[") and fnmatch.fnmatchcase(name, pat)
+                for pat in self.tools
+            )
+        )
 
     def allowed_summary(self) -> str:
         """Human-readable summary for a system-prompt note (restricted only)."""

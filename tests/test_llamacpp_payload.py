@@ -209,3 +209,23 @@ def test_llamacpp_disables_thinking_for_direct_text_phases() -> None:
 
         assert payload["chat_template_kwargs"] == {"enable_thinking": False}
         assert "reasoning_budget_tokens" not in payload
+
+
+def test_warm_up_matches_main_template_and_generates_one_token() -> None:
+    provider = LlamaCppProvider(
+        base_url="http://localhost:8080/v1",
+        model="default",
+        thinking=True,
+        reasoning_budget=384,
+        max_tokens_by_phase={"main": 2048},
+    )
+    transport = _QueuedTransport(provider, [_completion_response(content="o")])
+
+    with tracking_context(phase="warmup"):
+        asyncio.run(provider.warm_up([Message(role="user", content="ok")]))
+
+    (body,) = transport.requests
+    # Same thinking flag as a main turn, or the template prefix would differ.
+    assert body["chat_template_kwargs"] == {"enable_thinking": True}
+    assert body["max_tokens"] == body["n_predict"] == 1
+    assert "reasoning_budget_tokens" not in body

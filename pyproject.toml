@@ -16,6 +16,18 @@ dependencies = [
 telegram = ["aiogram>=3.0"]
 # Voice notes — local speech-to-text (faster-whisper / CTranslate2)
 voice = ["faster-whisper>=1.0"]
+# Local voice assistant (wake word + TTS). openwakeword declares tflite-runtime
+# on Linux, which has no wheels for recent Pythons; eyetor only uses its ONNX
+# backend, so install it with: pip install --no-deps "openwakeword>=0.6"
+voice-assistant = [
+    "faster-whisper>=1.0",
+    "piper-tts>=1.3",
+    "onnxruntime>=1.10",
+    "scipy>=1.3",
+    "scikit-learn>=1",
+    "tqdm>=4",
+    "requests>=2",
+]
 # Knowledge base — binary document extractors (PDF/DOCX/XLSX/PPTX)
 knowledge = [
     "pypdf>=4.0",

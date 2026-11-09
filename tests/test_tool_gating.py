@@ -29,6 +29,10 @@ from eyetor.models.tools import ToolDefinition, ToolRegistry
         ("dibújame un logo", {"image"}),
         ("instala el paquete ffmpeg", {"install"}),
         ("busca en la documentación cómo configurar esto", {"kb"}),
+        ("enciende la luz del salón", {"home"}),
+        ("apaga el flexo", {"home"}),
+        ("¿qué temperatura hace en la terraza?", {"home"}),
+        ("pon el aire a 24 grados", {"home"}),
     ],
 )
 def test_select_groups(text, expected):
@@ -42,7 +46,7 @@ def test_select_groups_accent_insensitive():
 
 
 def test_known_groups_match_patterns():
-    assert KNOWN_GROUPS == {"scheduler", "image", "kb", "install"}
+    assert KNOWN_GROUPS == {"scheduler", "image", "kb", "install", "home"}
 
 
 # ----------------------------------------------------------------------

@@ -162,6 +162,33 @@ class LlamaCppProvider(BaseProvider):
             return retry
         return result
 
+    async def warm_up(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+    ) -> None:
+        """Process the prompt and generate one token, so the slot caches it.
+
+        Uses the same thinking flag as a ``main`` turn: it changes the chat
+        template, and any difference in the prefix defeats the cache.
+        """
+        from eyetor.tracking.context import current_phase
+
+        token = current_phase.set("main")
+        try:
+            payload = self._build_payload(messages, tools, 0.0, stream=False)
+        finally:
+            current_phase.reset(token)
+        payload["max_tokens"] = payload["n_predict"] = 1
+        payload.pop("reasoning_budget_tokens", None)
+        async with self._client(timeout=self.request_timeout) as client:
+            response = await client.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                headers=self._build_headers(),
+            )
+            response.raise_for_status()
+
     async def _complete_once(
         self,
         messages: list[Message],

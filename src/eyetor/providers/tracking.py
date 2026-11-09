@@ -17,6 +17,12 @@ current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "current_session_id", default="unknown"
 )
 
+# Active conversation within the chat ("" = none). The chat identity stays in
+# current_session_id; this only identifies the ChatGPT-style conversation.
+current_conversation_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_conversation_id", default=""
+)
+
 
 def _messages_text(messages: list[Message]) -> str:
     """Compact role-tagged serialization of a request, for the prompt digest."""
@@ -54,6 +60,13 @@ class TrackingProvider(BaseProvider):
         self._tracker = tracker
         self._provider_name = provider_name
         self._cost_estimator = cost_estimator
+
+    async def warm_up(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+    ) -> None:
+        await self._inner.warm_up(messages, tools)
 
     async def complete(
         self,

@@ -209,7 +209,10 @@ def _build_image_prompt(
         f"{intro}\n\n"
         f"{caption_meta}"
         f"Análisis de la imagen (modelo de visión):\n{description}\n\n"
-        f"Imagen guardada en: {img_path}\n\n"
+        f"Imagen guardada en: {img_path}\n"
+        "(El análisis anterior YA es el contenido de la imagen: no leas este "
+        "fichero con herramientas de texto, es binario. La ruta solo sirve para "
+        "herramientas que trabajan con imágenes, como enviarla o editarla.)\n\n"
         f"{closing}"
     )
 
@@ -320,6 +323,11 @@ class TelegramChannel(BaseChannel):
         self._bot = None
 
         self._show_thinking: dict[int, bool] = {}  # per chat_id toggle for /thinking
+        # (chat_id, message_id) -> re-invocation info for reply-continuable
+        # skill commands. Replying to a tracked result message re-runs its script
+        # with the stored opaque reply_token. Generic: no skill-specific logic.
+        from collections import OrderedDict
+        self._reply_continue: "OrderedDict[tuple[int, int], dict]" = OrderedDict()
 
         # Resolve vision provider chain from config (primary + fallbacks).
         # Empty list → _describe_image falls back to VISION_* env vars.
@@ -345,6 +353,10 @@ class TelegramChannel(BaseChannel):
                     "base_url": prov_cfg.base_url,
                     "api_key": prov_cfg.api_key or "",
                     "model": model,
+                    # Un modelo local lento (Bonsai-27B va a ~10 tok/s) puede
+                    # tardar minutos en transcribir un ticket denso, así que el
+                    # plazo lo manda el provider y no un valor fijo.
+                    "request_timeout": prov_cfg.request_timeout,
                 }
                 # Local llama.cpp (Gemma-4) razona por defecto; para describir
                 # imágenes no hace falta y desperdicia el presupuesto de tokens.
@@ -369,6 +381,27 @@ class TelegramChannel(BaseChannel):
                 self._transcription.device,
                 self._transcription.language or "auto",
             )
+
+    def _remember_reply_continue(self, chat_id: int, message_id: int, info: dict | None) -> None:
+        """Tag a sent result message so a reply re-invokes its script (bounded)."""
+        if not info or not info.get("token"):
+            return
+        self._reply_continue[(chat_id, message_id)] = info
+        while len(self._reply_continue) > 500:
+            self._reply_continue.popitem(last=False)
+
+    def _purge_reply_continue(self, chat_id: int) -> None:
+        """Drop a chat's reply-continue anchors (on reset/conversation switch)."""
+        for key in [k for k in self._reply_continue if k[0] == chat_id]:
+            self._reply_continue.pop(key, None)
+
+    def _skill_env(self, chat_id: int) -> dict[str, str]:
+        """Env for skill subprocesses: chat identity + active conversation."""
+        env = {"EYETOR_SESSION_ID": f"telegram-{chat_id}"}
+        conv = self._manager.active_conversation_id(f"telegram-{chat_id}")
+        if conv:
+            env["EYETOR_CONVERSATION_ID"] = conv
+        return env
 
     async def start(self) -> None:
         try:
@@ -526,8 +559,61 @@ class TelegramChannel(BaseChannel):
             if not _is_authorized(msg):
                 return
             session_id = f"telegram-{msg.chat.id}"
-            self._manager.reset(session_id)
-            await msg.answer("Conversación reiniciada. Corto y cambio :)")
+            conv_id = self._manager.new_conversation(session_id)
+            # Run skills' on_reset hooks and drop stale reply-continue tags.
+            from eyetor.skills.lifecycle import run_reset_hooks
+            await run_reset_hooks(self._skill_reg, session_id, conversation_id=conv_id)
+            self._purge_reply_continue(msg.chat.id)
+            await msg.answer(
+                "Conversación nueva abierta. Las anteriores siguen en /chats :)"
+            )
+
+        @dp.message(Command("chats"))
+        async def cmd_chats(msg: Message) -> None:
+            if not _is_authorized(msg):
+                return
+            items = self._manager.list_conversations(f"telegram-{msg.chat.id}")
+            if not items:
+                await msg.answer("No hay conversaciones guardadas.")
+                return
+            lines = ["Conversaciones:"]
+            for n, it in enumerate(items[:15], start=1):
+                mark = "→" if it.get("active") else "  "
+                title = it.get("title") or "(sin título)"
+                date = (it.get("updated_at") or "")[:16].replace("T", " ")
+                lines.append(f"{mark} {n}. {title} — {date}")
+            lines.append("\nUsa /chat N para retomar una.")
+            await msg.answer("\n".join(lines))
+
+        @dp.message(Command("chat"))
+        async def cmd_chat(msg: Message) -> None:
+            if not _is_authorized(msg):
+                return
+            session_id = f"telegram-{msg.chat.id}"
+            parts = (msg.text or "").split(maxsplit=1)
+            items = self._manager.list_conversations(session_id)
+            target = None
+            if len(parts) > 1:
+                try:
+                    n = int(parts[1].strip())
+                    if 1 <= n <= len(items):
+                        target = items[n - 1]
+                except ValueError:
+                    pass
+            if target is None:
+                await msg.answer("Uso: /chat N — consulta los números con /chats.")
+                return
+            if not self._manager.switch_conversation(session_id, target["id"]):
+                await msg.answer("No se pudo cambiar de conversación.")
+                return
+            # Reply-continue anchors point at threads of another conversation.
+            self._purge_reply_continue(msg.chat.id)
+            session = self._manager.get_or_create(session_id)
+            title = target.get("title") or "(sin título)"
+            await msg.answer(
+                f"Conversación retomada: «{title}» "
+                f"({len(session.get_history())} mensajes)."
+            )
 
         @dp.message(Command("skills"))
         async def cmd_skills(msg: Message) -> None:
@@ -619,6 +705,7 @@ class TelegramChannel(BaseChannel):
         # --- Dynamic skill commands ---
         _skill_commands = []
         if self._skill_reg:
+            from eyetor.skills.executor import DEFAULT_TIMEOUT as _DEFAULT_SKILL_TIMEOUT
             from eyetor.skills.executor import run_script as _run_skill_script
 
             for _meta, _cmd in self._skill_reg.get_all_commands():
@@ -636,6 +723,8 @@ class TelegramChannel(BaseChannel):
                         _args=_default_args,
                         _pm=_parse,
                         _skill_name=_meta.name,
+                        _skill_timeout=_meta.timeout,
+                        _reply_continue=_cmd.reply_continue,
                     ) -> None:
                         if not _is_authorized(msg):
                             return
@@ -643,8 +732,32 @@ class TelegramChannel(BaseChannel):
                             await msg.answer("Esa skill no está disponible en este chat.")
                             return
                         user_args = (msg.text or "").split()[1:]
-                        raw = await _run_skill_script(_path, _args + user_args)
-                        await _send_skill_script_result(msg, raw, parse_mode=_pm)
+                        timeout = _skill_timeout if _skill_timeout is not None else _DEFAULT_SKILL_TIMEOUT
+                        # Keep the "typing…" indicator alive while the script
+                        # runs — long commands (e.g. /cc) otherwise look dead.
+                        async with ChatActionSender.typing(bot=bot, chat_id=msg.chat.id):
+                            raw = await _run_skill_script(
+                                _path,
+                                _args + user_args,
+                                timeout=timeout,
+                                env=self._skill_env(msg.chat.id),
+                            )
+                        sent = await _send_skill_script_result(msg, raw, parse_mode=_pm)
+                        # If this command is reply-continuable and the script
+                        # emitted an opaque reply_token, let a reply re-invoke it.
+                        if _reply_continue and sent is not None:
+                            self._remember_reply_continue(
+                                msg.chat.id,
+                                sent.message_id,
+                                {
+                                    "script": _path,
+                                    "default_args": _args,
+                                    "timeout": timeout,
+                                    "parse_mode": _pm,
+                                    "skill": _skill_name,
+                                    "token": _reply_token(raw),
+                                },
+                            )
 
                 elif _cmd.action == "prompt":
                     _template = _cmd.prompt
@@ -687,6 +800,46 @@ class TelegramChannel(BaseChannel):
                         finally:
                             session._observer = prev_observer
 
+            # Generic reply-to-continue: replying to a result message of any
+            # reply-continuable command re-invokes its script with the stored
+            # opaque token. The core knows nothing about what the token means.
+            _has_reply_continue = any(
+                c.action == "script" and c.reply_continue
+                for _m, c in self._skill_reg.get_all_commands()
+            )
+            if _has_reply_continue:
+                def _is_reply_continue(m: Message) -> bool:
+                    r = getattr(m, "reply_to_message", None)
+                    return bool(r and (m.chat.id, r.message_id) in self._reply_continue)
+
+                @dp.message(F.text, _is_reply_continue)
+                async def _reply_continue_handler(msg: Message) -> None:
+                    if not _is_authorized(msg):
+                        return
+                    info = self._reply_continue.get((msg.chat.id, msg.reply_to_message.message_id))
+                    if not info or not _skill_allowed(msg, info["skill"]):
+                        return
+                    reply_text = (msg.text or "").strip()
+                    if not reply_text:
+                        return
+                    async with ChatActionSender.typing(bot=bot, chat_id=msg.chat.id):
+                        raw = await _run_skill_script(
+                            info["script"],
+                            list(info["default_args"]) + [reply_text],
+                            timeout=info["timeout"],
+                            env={
+                                **self._skill_env(msg.chat.id),
+                                "EYETOR_REPLY_TOKEN": info["token"],
+                            },
+                        )
+                    sent = await _send_skill_script_result(msg, raw, parse_mode=info["parse_mode"])
+                    if sent is not None:
+                        self._remember_reply_continue(
+                            msg.chat.id,
+                            sent.message_id,
+                            {**info, "token": _reply_token(raw) or info["token"]},
+                        )
+
         @dp.message(Command("thinking"))
         async def cmd_thinking(msg: Message) -> None:
             chat_id = msg.chat.id
@@ -702,7 +855,9 @@ class TelegramChannel(BaseChannel):
                 extra += f"/{_sc.name} — {_sc.description}\n"
             await msg.answer(
                 "Eyetor commands:\n"
-                "/reset — start a new conversation\n"
+                "/reset — start a new conversation (old ones kept)\n"
+                "/chats — list recent conversations\n"
+                "/chat N — resume conversation N\n"
                 "/skills — list available skills\n"
                 "/agents — list loaded subagent definitions\n"
                 "/tools — list registered tools\n"
@@ -1085,6 +1240,8 @@ class TelegramChannel(BaseChannel):
         commands = [
             BotCommand(command="start", description="Start the bot"),
             BotCommand(command="reset", description="Start a new conversation"),
+            BotCommand(command="chats", description="List recent conversations"),
+            BotCommand(command="chat", description="Resume a conversation (/chat N)"),
             BotCommand(command="skills", description="List available skills"),
             BotCommand(command="agents", description="List loaded subagent definitions"),
             BotCommand(command="tasks", description="List scheduled tasks"),
@@ -1289,7 +1446,8 @@ async def _describe_image(
             "temperature": 0.1,
             **(spec.get("extra") or {}),
         }
-        async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
+        timeout = float(spec.get("request_timeout") or 120.0)
+        async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
             resp = await client.post(
                 f"{base}/chat/completions", json=payload, headers=headers
             )
@@ -1326,10 +1484,6 @@ async def _describe_image(
     raise RuntimeError(
         "Todos los proveedores de visión fallaron — " + "; ".join(errors)
     )
-
-
-_whisper_model = None  # Module-level cache — loaded once on first use
-_whisper_key: tuple | None = None  # (model, device, compute_type) of the cache
 
 
 async def _transcribe_voice(bot, msg, spec=None) -> str | None:
@@ -1417,10 +1571,15 @@ async def _transcribe_via_api(
 
 
 async def _transcribe_local(msg, path: str, spec=None) -> str | None:
-    """Transcribe using local faster-whisper, with module-level model cache."""
-    global _whisper_model, _whisper_key
+    """Transcribe using local faster-whisper (models cached in eyetor.audio.stt)."""
+    from eyetor.audio import stt
+
     try:
-        from faster_whisper import WhisperModel
+        model = stt.get_whisper_model(
+            getattr(spec, "model", None) or "medium",
+            getattr(spec, "device", None) or "cpu",
+            getattr(spec, "compute_type", None) or "int8",
+        )
     except ImportError:
         await msg.answer(
             "Voice transcription is not installed. Options:\n"
@@ -1431,31 +1590,12 @@ async def _transcribe_local(msg, path: str, spec=None) -> str | None:
         )
         return None
 
-    model_name = getattr(spec, "model", None) or "medium"
-    device = getattr(spec, "device", None) or "cpu"
-    compute_type = getattr(spec, "compute_type", None) or "int8"
-    language = getattr(spec, "language", "es")
-    beam_size = getattr(spec, "beam_size", None) or 5
-
-    key = (model_name, device, compute_type)
-    if _whisper_model is None or _whisper_key != key:
-        _whisper_model = WhisperModel(
-            model_name, device=device, compute_type=compute_type
-        )
-        _whisper_key = key
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, _run_whisper_model, _whisper_model, path, language, beam_size
+    return await stt.transcribe(
+        model,
+        path,
+        language=getattr(spec, "language", "es"),
+        beam_size=getattr(spec, "beam_size", None) or 5,
     )
-
-
-def _run_whisper_model(model, audio_path: str, language=None, beam_size: int = 5) -> str:
-    """Run faster-whisper transcription synchronously (called in thread pool)."""
-    segments, _ = model.transcribe(
-        audio_path, beam_size=beam_size, language=language, vad_filter=True
-    )
-    return " ".join(seg.text.strip() for seg in segments).strip()
 
 
 def _split_message(text: str, limit: int = _TG_MAX_LEN) -> list[str]:
@@ -1511,13 +1651,30 @@ async def _send_answer(msg, html: str, plain: str) -> None:
         logger.error("Telegram plain-text answer fallback failed: %s", exc)
 
 
-async def _send_long(msg, text: str, parse_mode: str | None = None) -> None:
-    """Send a potentially long message, splitting if it exceeds Telegram's limit."""
+async def _send_long(msg, text: str, parse_mode: str | None = None):
+    """Send a potentially long message, splitting if it exceeds Telegram's limit.
+
+    Returns the last sent Message (or None if nothing was sent).
+    """
+    sent = None
     for part in _split_message(text):
-        await msg.answer(part, parse_mode=parse_mode)
+        sent = await msg.answer(part, parse_mode=parse_mode)
+    return sent
 
 
-async def _send_skill_script_result(msg, raw: str, parse_mode: str | None = None) -> None:
+def _reply_token(raw: str) -> str | None:
+    """Extract an opaque ``reply_token`` from a skill script's JSON output."""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(data, dict):
+        tok = data.get("reply_token")
+        return tok if isinstance(tok, str) and tok else None
+    return None
+
+
+async def _send_skill_script_result(msg, raw: str, parse_mode: str | None = None):
     """Render a skill script's stdout for a channel command.
 
     Scripts conventionally print a JSON object. When that object carries an
@@ -1531,8 +1688,7 @@ async def _send_skill_script_result(msg, raw: str, parse_mode: str | None = None
         data = None
 
     if not isinstance(data, dict):
-        await _send_long(msg, raw, parse_mode=parse_mode)
-        return
+        return await _send_long(msg, raw, parse_mode=parse_mode)
 
     image_path = data.get("image_path")
     message = data.get("message") or ""
@@ -1540,22 +1696,18 @@ async def _send_skill_script_result(msg, raw: str, parse_mode: str | None = None
         from aiogram.types import FSInputFile
 
         try:
-            await msg.answer_photo(FSInputFile(image_path), caption=message or None)
-            return
+            return await msg.answer_photo(FSInputFile(image_path), caption=message or None)
         except Exception as exc:
             logger.error("Failed to send skill image %s: %s", image_path, exc)
-            await _send_long(msg, message or f"[Image: {image_path}]", parse_mode=parse_mode)
-            return
+            return await _send_long(msg, message or f"[Image: {image_path}]", parse_mode=parse_mode)
 
     if data.get("error"):
-        await _send_long(msg, f"⚠️ {data['error']}", parse_mode=parse_mode)
-        return
+        return await _send_long(msg, f"⚠️ {data['error']}", parse_mode=parse_mode)
 
     if message:
-        await _send_long(msg, message, parse_mode=parse_mode)
-        return
+        return await _send_long(msg, message, parse_mode=parse_mode)
 
-    await _send_long(msg, raw, parse_mode=parse_mode)
+    return await _send_long(msg, raw, parse_mode=parse_mode)
 
 
 def _collect_image_paths(buffer: str, session) -> list[str]:

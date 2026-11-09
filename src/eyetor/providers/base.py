@@ -55,6 +55,16 @@ class BaseProvider(ABC):
     ) -> StreamingResponse:
         """Send messages and return a StreamingResponse with text tokens and usage."""
 
+    async def warm_up(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+    ) -> None:
+        """Prefill the backend's prompt cache with ``messages`` + ``tools``.
+
+        Only meaningful for local servers with prefix caching; a no-op elsewhere.
+        """
+
     # ------------------------------------------------------------------
     # Helpers shared by all concrete providers
     # ------------------------------------------------------------------

@@ -95,3 +95,13 @@ def test_allowed_summary_mentions_allowed_items_when_restricted():
     summary = acc.allowed_summary()
     assert "kb_search" in summary
     assert "shopping" in summary
+
+
+def test_tool_globs_match_mcp_prefixes():
+    from eyetor.access import Access
+
+    acc = Access(tools={"intent__*", "remember"})
+    assert acc.allows_tool("intent__HassTurnOn")
+    assert acc.allows_tool("remember")
+    assert not acc.allows_tool("install_package")
+    assert not acc.allows_tool("delegate")

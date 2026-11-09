@@ -18,10 +18,14 @@ import hashlib
 import uuid
 from typing import Iterator
 
-from eyetor.providers.tracking import current_session_id  # re-export
+from eyetor.providers.tracking import (  # re-export
+    current_conversation_id,
+    current_session_id,
+)
 
 __all__ = [
     "current_session_id",
+    "current_conversation_id",
     "current_agent",
     "current_phase",
     "current_channel",

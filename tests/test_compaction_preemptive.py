@@ -143,3 +143,24 @@ def test_fallback_forces_compaction_when_context_high() -> None:
     session._mark_force_compact_after_fallback("main")
 
     assert session._force_compact_next is True
+
+
+def test_tool_schemas_count_towards_compaction_threshold():
+    from eyetor.chat.compactor import ConversationCompactor
+    from eyetor.models.tools import ToolDefinition
+
+    compactor = ConversationCompactor(
+        CompactionConfig(enabled=True, context_window=1000, trigger_at_percent=0.5)
+    )
+    history = [Message(role="user", content="x" * 1200)]  # ~300 tokens
+    assert not compactor.should_compact(history, "")
+
+    big_tool = ToolDefinition(
+        name="t", description="d" * 1200, parameters={"type": "object"}
+    )
+    compactor.set_tool_overhead([big_tool])
+    assert compactor.tool_tokens >= 300
+    assert compactor.should_compact(history, "")
+
+    compactor.set_tool_overhead(None)
+    assert compactor.tool_tokens == 0

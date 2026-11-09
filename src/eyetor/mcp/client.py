@@ -65,7 +65,15 @@ class McpClient:
                 "clientInfo": {"name": "eyetor", "version": "0.1.0"},
             },
         )
+        await self._notify("notifications/initialized")
         logger.debug("MCP server initialized")
+
+    async def _notify(self, method: str) -> None:
+        msg = {"jsonrpc": "2.0", "method": method}
+        if isinstance(self._transport, HttpTransport):
+            await self._transport.notify(msg)
+        else:
+            await self._transport.send(msg)
 
     async def _discover_tools(self) -> None:
         result = await self._rpc("tools/list")

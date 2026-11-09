@@ -88,31 +88,62 @@ class StdioTransport(BaseTransport):
 
 
 class HttpTransport(BaseTransport):
-    """MCP transport over HTTP POST (Streamable HTTP transport)."""
+    """MCP transport over HTTP POST (Streamable HTTP transport).
 
-    def __init__(self, url: str) -> None:
+    Servers may answer with plain JSON or with a ``text/event-stream`` body
+    carrying the JSON-RPC response as an SSE ``data:`` event. The
+    ``Mcp-Session-Id`` header returned on ``initialize`` is echoed back on
+    every later request.
+    """
+
+    def __init__(self, url: str, headers: dict[str, str] | None = None) -> None:
         self._url = url
+        self._headers = headers or {}
+        self._session_id: str | None = None
         self._client: httpx.AsyncClient | None = None
         self._pending_responses: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async def start(self) -> None:
+        self._session_id = None
         self._client = httpx.AsyncClient(timeout=30.0)
         logger.debug("MCP HTTP transport ready: %s", self._url)
 
-    async def send(self, message: dict[str, Any]) -> dict[str, Any]:
-        """Send a JSON-RPC request and return the response."""
+    def _request_headers(self) -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            **self._headers,
+        }
+        if self._session_id:
+            headers["Mcp-Session-Id"] = self._session_id
+        return headers
+
+    async def _post(self, message: dict[str, Any]) -> httpx.Response:
         if not self._client:
             raise RuntimeError("Transport not started")
-        response = await self._client.post(
-            self._url,
-            json=message,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-        )
-        response.raise_for_status()
+        try:
+            response = await self._client.post(
+                self._url, json=message, headers=self._request_headers()
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            # RuntimeError so McpClient.call_tool retries with a fresh session
+            raise RuntimeError(f"MCP HTTP error: {exc}") from exc
+        session_id = response.headers.get("mcp-session-id")
+        if session_id:
+            self._session_id = session_id
+        return response
+
+    async def send(self, message: dict[str, Any]) -> dict[str, Any]:
+        """Send a JSON-RPC request and return the response."""
+        response = await self._post(message)
+        if response.headers.get("content-type", "").startswith("text/event-stream"):
+            return _parse_sse_response(response.text, message.get("id"))
         return response.json()
+
+    async def notify(self, message: dict[str, Any]) -> None:
+        """Send a JSON-RPC notification (server answers 202 with no body)."""
+        await self._post(message)
 
     async def receive(self) -> dict[str, Any]:
         """Not used for HTTP transport (request/response model)."""
@@ -122,3 +153,17 @@ class HttpTransport(BaseTransport):
         if self._client:
             await self._client.aclose()
             self._client = None
+
+
+def _parse_sse_response(body: str, request_id: Any) -> dict[str, Any]:
+    """Return the JSON-RPC response matching ``request_id`` from an SSE body."""
+    for event in body.split("\n\n"):
+        data = "\n".join(
+            line[5:].lstrip() for line in event.splitlines() if line.startswith("data:")
+        )
+        if not data:
+            continue
+        payload = json.loads(data)
+        if isinstance(payload, dict) and payload.get("id") == request_id:
+            return payload
+    raise RuntimeError("MCP SSE response without a matching JSON-RPC message")

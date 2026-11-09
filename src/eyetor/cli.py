@@ -45,8 +45,12 @@ def _load_cfg(config_path: str | None):
 
 
 def _default_cli_session_id() -> str:
-    """Default CLI session id: stable while the parent shell lives."""
-    return f"cli-{getpass.getuser()}-{os.getppid()}"
+    """Default CLI chat identity: stable per user.
+
+    Each ``eyetor start`` opens a NEW conversation within this chat; past
+    conversations are listed/resumed with /chats and /chat N in the REPL.
+    """
+    return f"cli-{getpass.getuser()}"
 
 
 def _resolve_cli_session_id(session_flag: str | None) -> str:
@@ -265,8 +269,9 @@ def _host_profile_path_for_user(service_user: str) -> Path:
     "session_id",
     default=None,
     help=(
-        "Persistent CLI session id. Resumes if it already exists. "
-        "Precedence: --session > $EYETOR_SESSION > cli-<user>-<ppid>."
+        "CLI chat identity override. Each start opens a new conversation; "
+        "resume past ones with /chats and /chat N. "
+        "Precedence: --session > $EYETOR_SESSION > cli-<user>."
     ),
 )
 @click.pass_context
@@ -500,7 +505,18 @@ def start(
                             if not confirmed:
                                 return json.dumps({"error": "Operation cancelled by user."})
                         timeout = _skill_execution_timeout(skill_name, arg_list, meta.timeout)
-                        return await run_script(script_path, arg_list, timeout=timeout)
+                        from eyetor.providers.tracking import (
+                            current_conversation_id,
+                            current_session_id,
+                        )
+                        _sid = current_session_id.get()
+                        _env = None
+                        if _sid and _sid != "unknown":
+                            _env = {"EYETOR_SESSION_ID": _sid}
+                            _conv = current_conversation_id.get()
+                            if _conv:
+                                _env["EYETOR_CONVERSATION_ID"] = _conv
+                        return await run_script(script_path, arg_list, timeout=timeout, env=_env)
                     return _handler
 
                 _handler = _make_handler(_sn, _router, _meta)
@@ -1252,6 +1268,7 @@ def start(
                 root_config=cfg,
                 tracker=tracker,
                 cost_estimator=cost_estimator,
+                enable_conversations=True,
             )
             channels.append(
                 CliChannel(
@@ -1276,6 +1293,7 @@ def start(
                 root_config=cfg,
                 tracker=tracker,
                 cost_estimator=cost_estimator,
+                enable_conversations=True,
             )
             channels.append(
                 TelegramChannel(
@@ -1290,6 +1308,25 @@ def start(
                     knowledge=knowledge,
                 )
             )
+
+        voice_cfg = cfg.channels.voice
+        if voice_cfg.enabled and not interactive:
+            from eyetor.channels.voice import VOICE_PROMPT_SUFFIX, VoiceChannel
+
+            session_mgr_voice = SessionManager(
+                agent_cfg,
+                prov,
+                tool_registry=tool_registry,
+                system_prompt_suffix=VOICE_PROMPT_SUFFIX,
+                memory_manager=memory,
+                scheduler=scheduler,
+                knowledge=knowledge,
+                root_config=cfg,
+                tracker=tracker,
+                cost_estimator=cost_estimator,
+                enable_conversations=True,
+            )
+            channels.append(VoiceChannel(session_mgr_voice, voice_cfg))
 
         if scheduler:
             channels.append(scheduler)
@@ -2336,7 +2373,8 @@ def sessions_list(ctx: click.Context) -> None:
     table.add_column("Modified", style="dim")
     for f in files:
         name = f.stem
-        marker = "*" if name == current else " "
+        # Conversation files are named <chat_id>.<conv_id>.jsonl — match both.
+        marker = "*" if name == current or name.startswith(current + ".") else " "
         size = f.stat().st_size
         mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
         if size >= 1024 * 1024:
@@ -2348,7 +2386,7 @@ def sessions_list(ctx: click.Context) -> None:
         table.add_row(marker, name, size_s, mtime)
     console.print(table)
     console.print(
-        "[dim]'*' = sesión que este proceso usaría por defecto "
+        "[dim]'*' = conversaciones del chat CLI por defecto "
         f"({current}).[/dim]"
     )
 
@@ -2376,7 +2414,11 @@ def sessions_rm(ctx: click.Context, name: str, yes: bool) -> None:
 @click.option("--dry-run", is_flag=True, default=False, help="Only list, do not delete.")
 @click.pass_context
 def sessions_prune(ctx: click.Context, dry_run: bool) -> None:
-    """Delete `cli-<user>-<ppid>` sessions whose ppid no longer exists."""
+    """Delete LEGACY `cli-<user>-<ppid>` session files whose ppid is gone.
+
+    Current CLI sessions use per-conversation files (`cli-<user>.<conv>.jsonl`)
+    which this command never touches.
+    """
     cfg = ctx.obj["cfg"]
     user = getpass.getuser()
     prefix = f"cli-{user}-"

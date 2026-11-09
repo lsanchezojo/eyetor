@@ -23,7 +23,9 @@ _IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(.*?)\]")
 _HELP = """
 [bold]Eyetor CLI Commands[/bold]
   /help              — show this help
-  /reset             — clear conversation history
+  /reset             — start a new conversation (old one is kept)
+  /chats             — list recent conversations
+  /chat N            — resume conversation N from /chats
   /history           — show conversation history
   /skills            — list available skills with descriptions
   /agents            — list loaded subagent definitions
@@ -59,6 +61,9 @@ class CliChannel(BaseChannel):
             "Type [bold]/help[/bold] for commands, [bold]/exit[/bold] to quit.\n"
         )
 
+        # Each `eyetor start` opens a fresh conversation (the index reuses an
+        # empty one, so quick start-and-quit runs don't accumulate entries).
+        self._manager.new_conversation(self._session_id)
         session = self._manager.get_or_create(self._session_id)
 
         while self._running:
@@ -79,8 +84,24 @@ class CliChannel(BaseChannel):
                 self._console.print("[dim]Goodbye.[/dim]")
                 break
             elif user_input.lower() == "/reset":
-                session.reset()
-                self._console.print("[dim]Conversation reset.[/dim]")
+                conv_id = self._manager.new_conversation(self._session_id)
+                session = self._manager.get_or_create(self._session_id)
+                from eyetor.skills.lifecycle import run_reset_hooks
+                await run_reset_hooks(self._skill_reg, self._session_id, conversation_id=conv_id)
+                self._console.print("[dim]Nueva conversación iniciada.[/dim]")
+                continue
+            elif user_input.lower() == "/chats":
+                self._console.print(self._format_chats())
+                continue
+            elif user_input.lower().startswith("/chat "):
+                switched = self._switch_chat(user_input.split(maxsplit=1)[1])
+                if switched:
+                    session = self._manager.get_or_create(self._session_id)
+                    title = switched.get("title") or "(sin título)"
+                    self._console.print(
+                        f"[dim]Conversación retomada: «{title}» "
+                        f"({len(session.get_history())} mensajes).[/dim]"
+                    )
                 continue
             elif user_input.lower() == "/history":
                 self._show_history(session)
@@ -150,6 +171,36 @@ class CliChannel(BaseChannel):
 
     async def stop(self) -> None:
         self._running = False
+
+    def _format_chats(self) -> str:
+        """Numbered list of this chat's conversations, newest first."""
+        items = self._manager.list_conversations(self._session_id)
+        if not items:
+            return "[dim]No hay conversaciones guardadas (¿persistencia desactivada?).[/dim]"
+        lines = ["[bold]Conversaciones[/bold]"]
+        for n, it in enumerate(items[:15], start=1):
+            mark = "→" if it.get("active") else " "
+            title = it.get("title") or "(sin título)"
+            date = (it.get("updated_at") or "")[:16].replace("T", " ")
+            lines.append(f" {mark} {n}. {title}  [dim]{date}[/dim]")
+        lines.append("[dim]Usa /chat N para retomar una.[/dim]")
+        return "\n".join(lines)
+
+    def _switch_chat(self, arg: str) -> dict | None:
+        """Resolve /chat N against the same ordering /chats prints."""
+        items = self._manager.list_conversations(self._session_id)
+        try:
+            n = int(arg.strip())
+            target = items[n - 1] if 1 <= n <= len(items) else None
+        except ValueError:
+            target = None
+        if target is None:
+            self._console.print("[dim]Uso: /chat N (ver números con /chats).[/dim]")
+            return None
+        if not self._manager.switch_conversation(self._session_id, target["id"]):
+            self._console.print("[red]No se pudo cambiar de conversación.[/red]")
+            return None
+        return target
 
     def _show_history(self, session) -> None:
         history = session.get_history()

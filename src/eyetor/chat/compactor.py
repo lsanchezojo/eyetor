@@ -14,6 +14,7 @@ from eyetor.models.messages import Message
 
 if TYPE_CHECKING:
     from eyetor.config import CompactionConfig
+    from eyetor.models.tools import ToolDefinition
     from eyetor.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
@@ -59,13 +60,43 @@ class ConversationCompactor:
 
     def __init__(self, config: CompactionConfig) -> None:
         self._config = config
+        # Tool schemas sent with every request also live in the context window
+        # (with ~45 tools they are ~7k tokens). Refreshed by the session each
+        # turn via set_tool_overhead().
+        self.tool_tokens = 0
+
+    def set_tool_overhead(self, tools: list[ToolDefinition] | None) -> None:
+        """Record the estimated token cost of the tool schemas sent this turn."""
+        if not tools:
+            self.tool_tokens = 0
+            return
+        schemas = json.dumps(
+            [
+                {"name": t.name, "description": t.description, "parameters": t.parameters}
+                for t in tools
+            ],
+            ensure_ascii=False,
+        )
+        self.tool_tokens = self._count_text(schemas)
+
+    def _count_text(self, text: str) -> int:
+        try:
+            import tiktoken
+
+            return len(tiktoken.get_encoding("cl100k_base").encode(text))
+        except ImportError:
+            ratio = 3.0 if self._config.context_window > 100_000 else 4.0
+            return int(len(text) / ratio)
 
     def estimate_tokens(self, messages: list[Message], system_content: str) -> int:
-        """Estimate token count for messages + system prompt.
+        """Estimate token count for messages + system prompt + tool schemas.
 
         Uses tiktoken if available, otherwise falls back to character count
         with adaptive ratio based on context window size.
         """
+        return self._estimate_messages(messages, system_content) + self.tool_tokens
+
+    def _estimate_messages(self, messages: list[Message], system_content: str) -> int:
         total_chars = len(system_content)
         for msg in messages:
             total_chars += len(msg.content or "")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ async def run_script(
     args: list[str],
     timeout: float = DEFAULT_TIMEOUT,
     cwd: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> str:
     """Execute a skill script and return its stdout as a string.
 
@@ -26,11 +28,14 @@ async def run_script(
         args: Command-line arguments to pass to the script.
         timeout: Maximum execution time in seconds.
         cwd: Working directory for the subprocess (defaults to script's parent).
+        env: Extra environment variables merged onto the current environment
+            (e.g. EYETOR_SESSION_ID so a skill can scope state per chat).
 
     Returns:
         stdout output as string. If the script fails, returns a JSON error object.
     """
     cwd = cwd or script_path.parent
+    proc_env = {**os.environ, **env} if env else None
     # Choose interpreter based on extension
     if script_path.suffix == ".py":
         cmd = [sys.executable, str(script_path)] + args
@@ -47,6 +52,7 @@ async def run_script(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
+            env=proc_env,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         if proc.returncode != 0:

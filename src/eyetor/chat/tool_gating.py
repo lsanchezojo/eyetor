@@ -58,6 +58,22 @@ _GROUP_PATTERNS: dict[str, re.Pattern[str]] = {
         r"en\s+la\s+documentacion"
         r")\b"
     ),
+    # Smart-home control (Home Assistant MCP tools, tagged via
+    # mcp_servers.<name>.group). Generous on purpose: missing a turn means the
+    # model cannot touch the house at all.
+    "home": re.compile(
+        r"\b("
+        r"encien\w*|enciend\w*|apag\w*|prend\w*|enchuf\w*|desenchuf\w*|"
+        r"luz|luces|lampara|flexo|led|wled|bombilla|"
+        r"persiana\w*|puerta|cerradura|abr(e|ir)|cierra|cerrar|"
+        r"aire|clima|climatizacion|calefaccion|termostato|temperatura|humedad|grados|"
+        r"ventilador|aspirador\w*|robot|"
+        r"tele|tv|television|volumen|musica|pausa|reproduc\w*|sube|baja|"
+        r"salon|cocina|oficina|dormitorio|entrada|terraza|comedor|"
+        r"casa|domotica|home\s*assistant|sensor\w*|nevera|frigorifico|"
+        r"pixi|racion|comedero"
+        r")\b"
+    ),
 }
 
 # All gating groups known to the system. Used to validate tool tags and as

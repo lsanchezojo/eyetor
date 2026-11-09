@@ -1,0 +1,16 @@
+{
+  "binary": "/home/haziel/.local/bin/claude",
+  "model": null,
+  "max_turns": 30,
+  "output_max_chars": 4000,
+  "claude_timeout_seconds": 1700,
+  "default_repo": "home",
+  "repos": {
+    "home": "~",
+    "eyetor": "~/dev/workspace/eyetor",
+    "odysseus": "~/dev/odysseus",
+    "triage-peskahouse": "~/dev/triage-peskahouse",
+    "game-translate": "~/dev/game-translate"
+  },
+  "allowed_dirs": ["~"]
+}
