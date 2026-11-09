@@ -27,3 +27,7 @@ CLAUDE.md
 
 #github copilot
 .github/
+
+#Skills locales (no se publican)
+skills/claude-code/
+skills/filesystem/
