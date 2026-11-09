@@ -1,15 +1,9 @@
-"""Workflow pattern implementations based on Anthropic's agent patterns."""
+"""Agent workflow building blocks.
 
-from eyetor.workflows.chain import PromptChain
+- ``router``: classify a message to pick an agent (used by SessionManager).
+- ``observer``: progress events for long multi-step turns (Telegram).
+"""
+
 from eyetor.workflows.router import Router
-from eyetor.workflows.parallel import Parallel
-from eyetor.workflows.orchestrator import OrchestratorWorkflow
-from eyetor.workflows.evaluator import EvaluatorOptimizer
 
-__all__ = [
-    "PromptChain",
-    "Router",
-    "Parallel",
-    "OrchestratorWorkflow",
-    "EvaluatorOptimizer",
-]
+__all__ = ["Router"]
