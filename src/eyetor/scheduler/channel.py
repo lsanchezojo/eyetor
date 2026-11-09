@@ -32,6 +32,13 @@ _REL_WEEKDAY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Relative offset (one-shot): 'in 30 seconds', 'in 10m', 'en 2 horas', 'dentro de 5 minutos'
+_REL_OFFSET_RE = re.compile(
+    r"^(?:in|en|dentro\s+de)\s+(\d+)\s*"
+    r"(s|secs?|seconds?|segundos?|m|mins?|minutes?|minutos?|h|hours?|horas?)$",
+    re.IGNORECASE,
+)
+
 # Tomorrow: 'tomorrow at 18:00'
 _TOMORROW_RE = re.compile(
     r"^tomorrow(?:\s+at\s+(\d{1,2})(?::(\d{2}))?)?$",
@@ -57,6 +64,16 @@ def _resolve_relative_date(expr: str, tz: str) -> datetime | None:
     except Exception:
         zone = ZoneInfo("UTC")
     now = datetime.now(zone)
+
+    m = _REL_OFFSET_RE.match(expr.strip())
+    if m:
+        value = int(m.group(1))
+        unit = m.group(2).lower()
+        if unit.startswith("s"):
+            return now + timedelta(seconds=value)
+        if unit.startswith("m"):
+            return now + timedelta(minutes=value)
+        return now + timedelta(hours=value)
 
     m = _REL_WEEKDAY_RE.match(expr.strip())
     if m:
@@ -141,6 +158,34 @@ def _parse_trigger(schedule: str, tz: str):
     return CronTrigger.from_crontab(expr, timezone=tz)
 
 
+def _is_one_shot(task: ScheduledTask) -> bool:
+    from apscheduler.triggers.date import DateTrigger
+
+    try:
+        return isinstance(
+            _parse_trigger(task.schedule, task.timezone or "Europe/Madrid"), DateTrigger
+        )
+    except Exception:
+        return False
+
+
+def _scheduled_prompt(task: ScheduledTask) -> str:
+    """Wrap a task's prompt so the agent knows it is running a scheduled task.
+
+    Without this the prompt arrives as a bare user message; models often store
+    reminders as text addressed to the user ("te aviso de que...") and then
+    answer it as if it were an odd request.
+    """
+    return (
+        f"[Tarea programada «{task.name}»: el usuario la creó antes y la hora es AHORA. "
+        "Tu respuesta le llega tal cual como notificación. Si es un recordatorio, "
+        "escribe directamente el aviso en presente y en una frase, p. ej. «Es la hora: "
+        "saca la basura.» No digas que se lo recordarás ni repitas estas instrucciones. "
+        "Si pide hacer algo o consultar algo, hazlo y resume el resultado.]\n\n"
+        f"Contenido de la tarea: {task.prompt}"
+    )
+
+
 def _write_task_log(task: ScheduledTask, response: str, log_path: str) -> None:
     path = Path(log_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -198,7 +243,21 @@ class SchedulerChannel(BaseChannel):
     # ------------------------------------------------------------------
 
     def add_task(self, task: ScheduledTask) -> ScheduledTask:
-        """Persist and schedule a new task."""
+        """Persist and schedule a new task.
+
+        Raises ValueError if the schedule can't be parsed, before persisting —
+        otherwise the tool reports ok while the task never fires.
+        """
+        from apscheduler.triggers.date import DateTrigger
+
+        try:
+            trigger = _parse_trigger(task.schedule, task.timezone or self._default_tz)
+        except Exception as exc:
+            raise ValueError(f"Formato de 'schedule' no válido ({task.schedule!r}): {exc}") from exc
+        # Persist relative one-shots ('in 30 seconds', 'tomorrow at 8') as absolute
+        # datetimes, or a restart would re-resolve them against the new "now".
+        if isinstance(trigger, DateTrigger):
+            task.schedule = trigger.run_date.strftime("%Y-%m-%d %H:%M:%S")
         self._store.add(task)
         if self._scheduler and task.enabled:
             self._add_job(task)
@@ -266,12 +325,18 @@ class SchedulerChannel(BaseChannel):
             session = self._session_mgr.get_or_create(task.session_id)
             session.reset()
             current_channel.set("scheduler")
-            response = await session.send_sync(task.prompt)
+            response = await session.send_sync(_scheduled_prompt(task))
 
             await self._deliver(task, response)
             self._store.update_last_run(task_id)
         except Exception as exc:
             logger.exception("Error running task '%s': %s", task.name, exc)
+        finally:
+            # One-shots are done once fired. Left in the store, a restart within
+            # misfire_grace_time would fire them again.
+            if _is_one_shot(task):
+                self._store.delete(task_id)
+                logger.info("One-shot task '%s' done and removed", task.name)
 
     async def _deliver(self, task: ScheduledTask, response: str) -> None:
         if task.notify == "telegram":

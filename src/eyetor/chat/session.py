@@ -1701,7 +1701,8 @@ class ChatSession:
                 name="schedule_task",
                 description=(
                     "Schedule an automatic task. 3 'schedule' modes: "
-                    "ONE-SHOT ('2026-04-16 09:00', 'next thursday at 9', 'tomorrow at 8'); "
+                    "ONE-SHOT ('2026-04-16 09:00', 'next thursday at 9', 'tomorrow at 8', "
+                    "'in 30 seconds', 'in 10 minutes', 'in 2 hours'); "
                     "RECURRING 5-field cron m h dom mon dow ('0 9 * * 4' = Thursday 9:00, "
                     "dow 0=Sun..6=Sat); INTERVAL ('every 30m', 'every 2h', 'every 1d'). "
                     "Spanish input rules: 'el jueves' (singular) = ONE-SHOT next Thursday, "
@@ -1718,13 +1719,18 @@ class ChatSession:
                         },
                         "prompt": {
                             "type": "string",
-                            "description": "The message sent to the agent when the task fires",
+                            "description": (
+                                "Instruction for the agent when the task fires, written "
+                                "TO the agent (e.g. 'Recuérdale al usuario que saque la "
+                                "basura'), not a message to the user."
+                            ),
                         },
                         "schedule": {
                             "type": "string",
                             "description": (
                                 "When to run. One-shot: '2026-04-16 09:00', "
-                                "'next thursday at 9', 'tomorrow at 18:00'. "
+                                "'next thursday at 9', 'tomorrow at 18:00', "
+                                "'in 30 seconds', 'in 10 minutes'. "
                                 "Recurring: 5-field cron '0 9 * * 4'. "
                                 "Interval: 'every 30m', 'every 2h', 'every 1d'."
                             ),
