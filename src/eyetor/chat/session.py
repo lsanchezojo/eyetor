@@ -390,6 +390,121 @@ def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     return len(a & b) / len(union) if union else 0.0
 
 
+class _LoopDetector:
+    """Detects a turn stuck calling the same tools. Two layers:
+
+    1. Exact match on normalized token-bag signature (catches pure keyword
+       permutations: "a b c" ≡ "c a b").
+    2. Jaccard soft-loop: N same-tool calls whose token bags pairwise overlap
+       ≥ threshold (catches "same core + varying satellite words" — the real
+       failure mode of small models).
+    """
+
+    def __init__(self, max_repeat: int = 3) -> None:
+        self.max_repeat = max_repeat  # consecutive similar calls before forcing an answer
+        self._calls: list[str] = []  # normalized sig for exact-match detection
+        self._bags: list[list[tuple[str, frozenset[str]]]] = []  # for Jaccard
+
+    def observe(self, tool_calls: list[ToolCall]) -> str | None:
+        """Record this iteration's calls; return a reason string if looping."""
+        signatures = [
+            _normalize_tool_call(tc.function.name, tc.function.arguments) for tc in tool_calls
+        ]
+        self._calls.append("|".join(sorted(signatures)))
+        self._bags.append(
+            [_tool_call_bag(tc.function.name, tc.function.arguments) for tc in tool_calls]
+        )
+        self._calls = self._calls[-self.max_repeat:]
+        self._bags = self._bags[-self.max_repeat:]
+
+        if len(self._calls) == self.max_repeat and len(set(self._calls)) == 1:
+            return f"exact repetition of {[tc.function.name for tc in tool_calls]}"
+        if (
+            len(self._bags) == self.max_repeat
+            and all(len(b) == 1 for b in self._bags)
+            and len({b[0][0] for b in self._bags}) == 1
+        ):
+            # Soft loop: among the last N same-tool calls, require every
+            # pair to overlap above threshold. This still catches true
+            # repeated loops while allowing legitimate retries that change
+            # strategy, parameters, or timeout after a failed attempt.
+            bags = [b[0][1] for b in self._bags]
+            pairwise = [
+                _jaccard(bags[i], bags[j])
+                for i in range(len(bags))
+                for j in range(i + 1, len(bags))
+            ]
+            min_jaccard = min(pairwise) if pairwise else 0.0
+            if pairwise and min_jaccard >= _LOOP_JACCARD_THRESHOLD:
+                return (
+                    f"{self.max_repeat} near-duplicate '{self._bags[-1][0][0]}' "
+                    f"calls (min Jaccard {min_jaccard:.2f} ≥ {_LOOP_JACCARD_THRESHOLD})"
+                )
+        return None
+
+
+# Instructions injected into the turn by send()'s recovery paths. They are
+# addressed to the model, never shown to the user.
+_NUDGE_CONFIRMED_ACTION = (
+    "El usuario acaba de confirmar la acción que propusiste. "
+    "DEBES ejecutarla AHORA emitiendo la tool_call estructurada "
+    "correspondiente en esta misma respuesta. No respondas solo "
+    "con texto: si hay una herramienta adecuada, llama a la "
+    "herramienta con los parámetros correctos."
+)
+_NUDGE_INVALID_TOOL_ARGS = (
+    "La tool_call anterior tenía arguments que no eran JSON "
+    "válido y se ha descartado. Vuelve a intentarlo ahora "
+    "emitiendo una tool_call estructurada válida. No construyas "
+    "JSON dentro de strings largos si existe una herramienta con "
+    "parámetros estructurados."
+)
+_NUDGE_EMPTY_REPLY = (
+    "Recordatorio del sistema: aún no hay respuesta visible ni tool_call "
+    "estructurada. Continúa ahora: si necesitas actuar en el ordenador, "
+    "emite la tool_call correcta; si no necesitas herramientas, responde "
+    "directamente a la consulta del usuario en español, sin hablar de tu "
+    "proceso interno y sin disculparte. No dejes la respuesta vacía."
+)
+_NUDGE_HOME_CLAIM = (
+    "System reminder: you said you performed an action in the "
+    "house, but no action tool was executed this turn, so nothing "
+    "changed. Emit the structured tool_call now (e.g. "
+    "intent__HassTurnOff / intent__HassTurnOn with one exact "
+    "device name). Only if no action is actually needed, answer "
+    "in Spanish without claiming you did anything."
+)
+_HOME_CLAIM_WARNING = (
+    "\n\n⚠️ Ojo: no se ha llegado a ejecutar ninguna acción en "
+    "Home Assistant, así que puede que no haya cambiado nada."
+)
+_NUDGE_ANNOUNCED_CALL = (
+    "Recordatorio del sistema: para usar una herramienta debes emitir la "
+    "tool_call estructurada; describirla en texto no la ejecuta. Si necesitas "
+    "una herramienta, emítela ahora con los parámetros correctos. Si no, "
+    "responde directamente a la consulta del usuario en español, sin hablar "
+    "de herramientas ni de tu proceso interno y sin disculparte."
+)
+_FORCE_SYNTHESIS = (
+    "Sintetiza ahora una respuesta clara y breve al usuario "
+    "usando ÚNICAMENTE la información obtenida en las herramientas "
+    "anteriores. No llames más herramientas. Responde en lenguaje "
+    "natural, en español."
+)
+_FORCE_CLEAN_ANSWER = (
+    "Responde directamente a la consulta original del usuario "
+    "en español. No menciones herramientas, llamadas, tool_calls, "
+    "planes ni tu proceso interno; no te disculpes. Si ya tienes la "
+    "información, da la respuesta; si te falta un dato, pídelo de "
+    "forma concreta."
+)
+_FORCE_BREAK_LOOP = (
+    "IMPORTANT: You seem to be stuck in a loop calling the same tools repeatedly. "
+    "Please provide your final answer now using the information you already have. "
+    "Do NOT call any more tools."
+)
+
+
 class ChatSession:
     """A single ongoing conversation with an agent.
 
@@ -720,22 +835,9 @@ class ChatSession:
                 "Session '%s' — user confirmed a pending action; nudging tool execution",
                 self.session_id,
             )
-            full_messages.append(
-                Message(
-                    role="system",
-                    content=(
-                        "El usuario acaba de confirmar la acción que propusiste. "
-                        "DEBES ejecutarla AHORA emitiendo la tool_call estructurada "
-                        "correspondiente en esta misma respuesta. No respondas solo "
-                        "con texto: si hay una herramienta adecuada, llama a la "
-                        "herramienta con los parámetros correctos."
-                    ),
-                )
-            )
+            full_messages.append(Message(role="system", content=_NUDGE_CONFIRMED_ACTION))
         iterations = 0
-        recent_calls: list[str] = []  # normalized sig for exact-match detection
-        recent_bags: list[list[tuple[str, frozenset[str]]]] = []  # for Jaccard
-        max_repeat = 3  # max consecutive identical tool calls before forcing answer
+        loops = _LoopDetector()
         nudged = False  # allow at most one "announce-without-call" nudge per turn
         empty_nudged = False  # allow one retry for immediate empty/no-tool replies
         degeneration_recovered = False  # one-shot post-tool synthesis fallback
@@ -770,30 +872,10 @@ class ChatSession:
                     self.config.max_iterations,
                     "; ".join(invalid_tool_args),
                 )
-                full_messages.append(
-                    Message(
-                        role="assistant",
-                        content=response.content,
-                    )
-                )
-                full_messages.append(
-                    Message(
-                        role="user",
-                        content=(
-                            "La tool_call anterior tenía arguments que no eran JSON "
-                            "válido y se ha descartado. Vuelve a intentarlo ahora "
-                            "emitiendo una tool_call estructurada válida. No construyas "
-                            "JSON dentro de strings largos si existe una herramienta con "
-                            "parámetros estructurados."
-                        ),
-                    )
-                )
+                full_messages.append(Message(role="assistant", content=response.content))
+                full_messages.append(Message(role="user", content=_NUDGE_INVALID_TOOL_ARGS))
                 continue
-            if result.reasoning_content:
-                self.last_reasoning = (
-                    (self.last_reasoning + "\n\n" if self.last_reasoning else "")
-                    + result.reasoning_content
-                )
+            self._append_reasoning(result.reasoning_content)
             # Ghost turns (empty content, no tool_calls) are NOT added to the
             # cross-turn history: persisting them teaches the model that
             # empty replies are normal. We still append to ``full_messages``
@@ -825,18 +907,7 @@ class ChatSession:
                         iterations,
                         len((result.reasoning_content or "").strip()),
                     )
-                    full_messages.append(
-                        Message(
-                            role="user",
-                            content=(
-                                "Recordatorio del sistema: aún no hay respuesta visible ni tool_call "
-                                "estructurada. Continúa ahora: si necesitas actuar en el ordenador, "
-                                "emite la tool_call correcta; si no necesitas herramientas, responde "
-                                "directamente a la consulta del usuario en español, sin hablar de tu "
-                                "proceso interno y sin disculparte. No dejes la respuesta vacía."
-                            ),
-                        )
-                    )
+                    full_messages.append(Message(role="user", content=_NUDGE_EMPTY_REPLY))
                     continue
                 # Claimed a smart-home action that never ran: retry once with
                 # the tool still available, then flag the reply so the user is
@@ -854,28 +925,13 @@ class ChatSession:
                             "Session '%s' — home action claimed without executing it; nudging",
                             self.session_id,
                         )
-                        full_messages.append(
-                            Message(
-                                role="user",
-                                content=(
-                                    "System reminder: you said you performed an action in the "
-                                    "house, but no action tool was executed this turn, so nothing "
-                                    "changed. Emit the structured tool_call now (e.g. "
-                                    "intent__HassTurnOff / intent__HassTurnOn with one exact "
-                                    "device name). Only if no action is actually needed, answer "
-                                    "in Spanish without claiming you did anything."
-                                ),
-                            )
-                        )
+                        full_messages.append(Message(role="user", content=_NUDGE_HOME_CLAIM))
                         continue
                     logger.warning(
                         "Session '%s' — home action still claimed without executing it; flagging reply",
                         self.session_id,
                     )
-                    content = (
-                        f"{content}\n\n⚠️ Ojo: no se ha llegado a ejecutar ninguna acción en "
-                        "Home Assistant, así que puede que no haya cambiado nada."
-                    )
+                    content = f"{content}{_HOME_CLAIM_WARNING}"
                 # Some small local models announce "voy a reintentar / I'll call X"
                 # in plain text without emitting the structured tool_call. Nudge
                 # once only before any tool has actually run. After a tool result,
@@ -909,18 +965,7 @@ class ChatSession:
                                 self.session_id,
                                 ", ".join(sorted(missing)),
                             )
-                    full_messages.append(
-                        Message(
-                            role="user",
-                            content=(
-                                "Recordatorio del sistema: para usar una herramienta debes emitir la "
-                                "tool_call estructurada; describirla en texto no la ejecuta. Si necesitas "
-                                "una herramienta, emítela ahora con los parámetros correctos. Si no, "
-                                "responde directamente a la consulta del usuario en español, sin hablar "
-                                "de herramientas ni de tu proceso interno y sin disculparte."
-                            ),
-                        )
-                    )
+                    full_messages.append(Message(role="user", content=_NUDGE_ANNOUNCED_CALL))
                     continue
                 # Post-tool degeneration recovery: model already ran at least
                 # one tool this turn and now returned NOTHING usable (empty
@@ -941,42 +986,12 @@ class ChatSession:
                         iterations,
                         len((result.reasoning_content or "").strip()),
                     )
-                    full_messages.append(
-                        Message(
-                            role="user",
-                            content=(
-                                "Sintetiza ahora una respuesta clara y breve al usuario "
-                                "usando ÚNICAMENTE la información obtenida en las herramientas "
-                                "anteriores. No llames más herramientas. Responde en lenguaje "
-                                "natural, en español."
-                            ),
-                        )
-                    )
-                    with tracking_context(phase="degeneration_recovery"):
-                        full_messages = await self._compact_before_llm(
-                            full_messages, reason="degeneration_recovery"
-                        )
-                        result = await self.provider.complete(
-                            messages=full_messages,
-                            tools=None,
-                            temperature=self.config.temperature,
-                        )
-                    self._mark_force_compact_after_fallback("degeneration_recovery")
-                    forced = result.message
-                    if result.reasoning_content:
-                        self.last_reasoning = (
-                            (self.last_reasoning + "\n\n" if self.last_reasoning else "")
-                            + result.reasoning_content
-                        )
-                    self._remember_assistant(
-                        forced,
-                        reasoning=result.reasoning_content,
+                    yield await self._forced_answer(
+                        full_messages,
+                        _FORCE_SYNTHESIS,
+                        phase="degeneration_recovery",
                         context="degeneration recovery",
                     )
-                    content = _final_text(forced.content, result.reasoning_content)
-                    if self._observer:
-                        self._observer.on_done(content)
-                    yield content
                     return
                 # Scaffolding-leak recovery: after a nudge this turn, the model
                 # sometimes replies *to the nudge* — apologizing and narrating
@@ -996,43 +1011,12 @@ class ChatSession:
                         self.session_id,
                         iterations,
                     )
-                    full_messages.append(
-                        Message(
-                            role="user",
-                            content=(
-                                "Responde directamente a la consulta original del usuario "
-                                "en español. No menciones herramientas, llamadas, tool_calls, "
-                                "planes ni tu proceso interno; no te disculpes. Si ya tienes la "
-                                "información, da la respuesta; si te falta un dato, pídelo de "
-                                "forma concreta."
-                            ),
-                        )
-                    )
-                    with tracking_context(phase="scaffold_recovery"):
-                        full_messages = await self._compact_before_llm(
-                            full_messages, reason="scaffold_recovery"
-                        )
-                        result = await self.provider.complete(
-                            messages=full_messages,
-                            tools=None,
-                            temperature=self.config.temperature,
-                        )
-                    self._mark_force_compact_after_fallback("scaffold_recovery")
-                    forced = result.message
-                    if result.reasoning_content:
-                        self.last_reasoning = (
-                            (self.last_reasoning + "\n\n" if self.last_reasoning else "")
-                            + result.reasoning_content
-                        )
-                    self._remember_assistant(
-                        forced,
-                        reasoning=result.reasoning_content,
+                    yield await self._forced_answer(
+                        full_messages,
+                        _FORCE_CLEAN_ANSWER,
+                        phase="scaffold_recovery",
                         context="scaffold recovery",
                     )
-                    content = _final_text(forced.content, result.reasoning_content)
-                    if self._observer:
-                        self._observer.on_done(content)
-                    yield content
                     return
                 # Final answer — yield it token by token (character-level).
                 content = _final_text(content, result.reasoning_content)
@@ -1042,7 +1026,6 @@ class ChatSession:
                 return
 
             # Log tool calls at INFO level for observability
-            call_names = [tc.function.name for tc in response.tool_calls]
             call_details = [
                 f"{tc.function.name}({_truncate(tc.function.arguments, 200)})"
                 for tc in response.tool_calls
@@ -1055,140 +1038,29 @@ class ChatSession:
                 " | ".join(call_details),
             )
 
-            # Loop detection — two layers:
-            # 1. Exact match on normalized token-bag signature (catches pure
-            #    keyword permutations: "a b c" ≡ "c a b").
-            # 2. Jaccard soft-loop: N same-tool calls whose token bags
-            #    pairwise overlap ≥ threshold (catches "same core + varying
-            #    satellite words" — the real failure mode of small models).
-            call_signatures = [
-                _normalize_tool_call(tc.function.name, tc.function.arguments)
-                for tc in response.tool_calls
-            ]
-            current_bags = [
-                _tool_call_bag(tc.function.name, tc.function.arguments)
-                for tc in response.tool_calls
-            ]
-            current_sig = "|".join(sorted(call_signatures))
-            recent_calls.append(current_sig)
-            recent_bags.append(current_bags)
-            if len(recent_calls) > max_repeat:
-                recent_calls = recent_calls[-max_repeat:]
-                recent_bags = recent_bags[-max_repeat:]
-
-            loop_reason: str | None = None
-            if len(recent_calls) == max_repeat and len(set(recent_calls)) == 1:
-                loop_reason = f"exact repetition of {call_names}"
-            elif (
-                len(recent_bags) == max_repeat
-                and all(len(b) == 1 for b in recent_bags)
-                and len({b[0][0] for b in recent_bags}) == 1
-            ):
-                # Soft loop: among the last N same-tool calls, require every
-                # pair to overlap above threshold. This still catches true
-                # repeated loops while allowing legitimate retries that change
-                # strategy, parameters, or timeout after a failed attempt.
-                bags = [b[0][1] for b in recent_bags]
-                pairwise = [
-                    _jaccard(bags[i], bags[j])
-                    for i in range(len(bags))
-                    for j in range(i + 1, len(bags))
-                ]
-                min_jaccard = min(pairwise) if pairwise else 0.0
-                if pairwise and min_jaccard >= _LOOP_JACCARD_THRESHOLD:
-                    loop_reason = (
-                        f"{max_repeat} near-duplicate '{recent_bags[-1][0][0]}' "
-                        f"calls (min Jaccard {min_jaccard:.2f} ≥ {_LOOP_JACCARD_THRESHOLD})"
-                    )
-
+            loop_reason = loops.observe(response.tool_calls)
             if loop_reason:
                 logger.warning(
                     "Session '%s' — loop detected: %s. Forcing final answer.",
                     self.session_id,
                     loop_reason,
                 )
-                # Ask the model to answer without tools
-                full_messages.append(
-                    Message(
-                        role="user",
-                        content=(
-                            "IMPORTANT: You seem to be stuck in a loop calling the same tools repeatedly. "
-                            "Please provide your final answer now using the information you already have. "
-                            "Do NOT call any more tools."
-                        ),
-                    )
-                )
-                with tracking_context(phase="loop_break"):
-                    full_messages = await self._compact_before_llm(
-                        full_messages, reason="loop_break"
-                    )
-                    result = await self.provider.complete(
-                        messages=full_messages,
-                        tools=None,  # no tools — force text response
-                        temperature=self.config.temperature,
-                    )
-                self._mark_force_compact_after_fallback("loop_break")
-                forced = result.message
-                if result.reasoning_content:
-                    self.last_reasoning = (
-                        (self.last_reasoning + "\n\n" if self.last_reasoning else "")
-                        + result.reasoning_content
-                    )
-                self._remember_assistant(
-                    forced,
-                    reasoning=result.reasoning_content,
+                yield await self._forced_answer(
+                    full_messages,
+                    _FORCE_BREAK_LOOP,
+                    phase="loop_break",
                     context="loop break",
                 )
-                content = _final_text(forced.content, result.reasoning_content)
-                if self._observer:
-                    self._observer.on_done(content)
-                yield content
                 return
 
-            # Execute tool calls in parallel
-            async def _exec_tool(tc: ToolCall) -> tuple[ToolCall, str]:
-                if self._observer:
-                    self._observer.on_tool_start(
-                        tc.function.name, tc.function.arguments
-                    )
-                r = await self.tool_registry.execute(
-                    tc.function.name, tc.function.arguments
-                )
-                if self._observer:
-                    self._observer.on_tool_end(tc.function.name, r)
-                return tc, r
-
-            exec_results = await asyncio.gather(
-                *[_exec_tool(tc) for tc in response.tool_calls],
-                return_exceptions=True,
-            )
-            for entry in exec_results:
-                if isinstance(entry, BaseException):
-                    logger.error(
-                        "Session '%s' — tool error: %s", self.session_id, entry
-                    )
-                    if self._observer:
-                        self._observer.on_tool_error("?", str(entry))
-                    continue
-                tc, result = entry
-                tool_msg = Message(role="tool", tool_call_id=tc.id, content=result)
-                self._messages.append(tool_msg)
-                self._persist_message(tool_msg)
-                full_messages.append(tool_msg)
+            for tc, tool_result in await self._execute_tool_calls(
+                response.tool_calls, full_messages
+            ):
                 tools_executed += 1
                 if _is_home_action_tool(
                     self.tool_registry._tools.get(tc.function.name)
-                ) and not result.startswith("Error"):
+                ) and not tool_result.startswith("Error"):
                     home_actions_ok += 1
-                self._mark_group_used(tc.function.name)
-                logger.info(
-                    "Session '%s' — tool '%s'(%s) → %d chars: %s",
-                    self.session_id,
-                    tc.function.name,
-                    _truncate(tc.function.arguments, 200),
-                    len(result),
-                    _truncate(result, 200),
-                )
 
         # Max iterations reached
         logger.warning(
@@ -1207,6 +1079,78 @@ class ChatSession:
         self._messages.append(max_msg)
         self._persist_message(max_msg)
         yield msg
+
+    def _append_reasoning(self, reasoning: str | None) -> None:
+        """Accumulate this turn's reasoning across LLM calls (``last_reasoning``)."""
+        if reasoning:
+            self.last_reasoning = (
+                (self.last_reasoning + "\n\n" if self.last_reasoning else "") + reasoning
+            )
+
+    async def _forced_answer(
+        self, full_messages: list[Message], instruction: str, *, phase: str, context: str
+    ) -> str:
+        """Recovery pass: append ``instruction`` and ask once WITHOUT tools, so
+        the model must answer in plain text from what it already has."""
+        full_messages.append(Message(role="user", content=instruction))
+        with tracking_context(phase=phase):
+            full_messages = await self._compact_before_llm(full_messages, reason=phase)
+            result = await self.provider.complete(
+                messages=full_messages,
+                tools=None,  # no tools — force text response
+                temperature=self.config.temperature,
+            )
+        self._mark_force_compact_after_fallback(phase)
+        forced = result.message
+        self._append_reasoning(result.reasoning_content)
+        self._remember_assistant(forced, reasoning=result.reasoning_content, context=context)
+        content = _final_text(forced.content, result.reasoning_content)
+        if self._observer:
+            self._observer.on_done(content)
+        return content
+
+    async def _execute_tool_calls(
+        self, tool_calls: list[ToolCall], full_messages: list[Message]
+    ) -> list[tuple[ToolCall, str]]:
+        """Run tool calls in parallel and record each result as a tool message
+        (history, persistence and ``full_messages``). Returns the successful
+        (call, result) pairs; exceptions are logged and skipped."""
+
+        async def _exec_tool(tc: ToolCall) -> tuple[ToolCall, str]:
+            if self._observer:
+                self._observer.on_tool_start(tc.function.name, tc.function.arguments)
+            r = await self.tool_registry.execute(tc.function.name, tc.function.arguments)
+            if self._observer:
+                self._observer.on_tool_end(tc.function.name, r)
+            return tc, r
+
+        exec_results = await asyncio.gather(
+            *[_exec_tool(tc) for tc in tool_calls],
+            return_exceptions=True,
+        )
+        done: list[tuple[ToolCall, str]] = []
+        for entry in exec_results:
+            if isinstance(entry, BaseException):
+                logger.error("Session '%s' — tool error: %s", self.session_id, entry)
+                if self._observer:
+                    self._observer.on_tool_error("?", str(entry))
+                continue
+            tc, result = entry
+            tool_msg = Message(role="tool", tool_call_id=tc.id, content=result)
+            self._messages.append(tool_msg)
+            self._persist_message(tool_msg)
+            full_messages.append(tool_msg)
+            self._mark_group_used(tc.function.name)
+            logger.info(
+                "Session '%s' — tool '%s'(%s) → %d chars: %s",
+                self.session_id,
+                tc.function.name,
+                _truncate(tc.function.arguments, 200),
+                len(result),
+                _truncate(result, 200),
+            )
+            done.append((tc, result))
+        return done
 
     async def send_sync(self, user_input: str) -> str:
         """Send a user message and return the complete response (non-streaming)."""
@@ -1352,11 +1296,7 @@ class ChatSession:
                 )
             self._mark_force_compact_after_fallback("chain_execute")
             response = result.message
-            if result.reasoning_content:
-                self.last_reasoning = (
-                    (self.last_reasoning + "\n\n" if self.last_reasoning else "")
-                    + result.reasoning_content
-                )
+            self._append_reasoning(result.reasoning_content)
             self._messages.append(response)
             self._persist_message(response, reasoning=result.reasoning_content)
             full_messages.append(response)
@@ -1365,26 +1305,7 @@ class ChatSession:
                 execution_output = response.content or ""
                 break
 
-            # Execute tool calls (same logic as send())
-            async def _exec_tool(tc: ToolCall) -> tuple[ToolCall, str]:
-                return tc, await self.tool_registry.execute(
-                    tc.function.name, tc.function.arguments
-                )
-
-            exec_results = await asyncio.gather(
-                *[_exec_tool(tc) for tc in response.tool_calls],
-                return_exceptions=True,
-            )
-            for entry in exec_results:
-                if isinstance(entry, BaseException):
-                    logger.error("Session '%s' chain exec error: %s", self.session_id, entry)
-                    continue
-                tc, tool_result = entry
-                tool_msg = Message(role="tool", tool_call_id=tc.id, content=tool_result)
-                self._messages.append(tool_msg)
-                self._persist_message(tool_msg)
-                full_messages.append(tool_msg)
-                self._mark_group_used(tc.function.name)
+            await self._execute_tool_calls(response.tool_calls, full_messages)
 
         # --- Phase 3: Synthesize (no tools) ---
         synth_prompt = (
