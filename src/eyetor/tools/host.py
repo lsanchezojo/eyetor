@@ -247,7 +247,6 @@ _DANGEROUS_PATTERNS = [
             "reboot",
         ],
     ),
-    ("filesystem", "fs.py", ["delete --recursive", "delete"]),
 ]
 
 

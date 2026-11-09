@@ -1,12 +1,22 @@
-"""One tool per discovered skill (``skill_<name>``, single ``args`` string)."""
+"""Tools provided by skills.
+
+Every skill gets a generic ``skill_<name>`` tool (single free-text ``args``
+string routed to its scripts), unless its SKILL.md sets ``args_tool: false``.
+Skills may also declare typed tools in their frontmatter (``tools:``), which
+small models call far more reliably than a hand-built command line.
+"""
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import Any
 
 from eyetor.models.tools import ToolDefinition, ToolRegistry
 from eyetor.skills.executor import run_script
+from eyetor.skills.loader import SkillMetadata, SkillTool
 from eyetor.skills.registry import SkillRegistry
+from eyetor.skills.router import RoutingError, ScriptRouter
 from eyetor.tools.host import (
     _ask_confirm,
     _is_dangerous,
@@ -22,183 +32,157 @@ def register_skill_tools(
     use_host_tools: bool,
     host_profile: dict,
 ) -> None:
-    """Expose every discovered skill as a tool, with host-safety guards."""
-    skill_names = skill_reg.list_names()
-    if not skill_names:
-        return
-    from eyetor.skills.router import RoutingError, ScriptRouter
-
-    # Register one tool per skill — always just an "args" param.
-    # ScriptRouter handles mapping the first token to the correct
-    # script for multi-script skills; single-script skills pass
-    # everything through unchanged.
-    for _sn in skill_names:
-        _meta = skill_reg.get_metadata(_sn)
-        _scripts = skill_reg.list_scripts(_sn)
-        if not _scripts:
+    """Expose every discovered skill as tools, with host-safety guards."""
+    for name in skill_reg.list_names():
+        meta = skill_reg.get_metadata(name)
+        scripts = skill_reg.list_scripts(name)
+        if not scripts:
             continue
-
-        _router = ScriptRouter(_sn, _scripts)
-
-        def _make_handler(skill_name: str, router: ScriptRouter, meta):
-            async def _handler(args: str = "") -> str:
-                try:
-                    script_path, arg_list = router.route(args)
-                except RoutingError as exc:
-                    return json.dumps({"error": str(exc)})
-                routed_args = " ".join(arg_list)
-                if (
-                    use_host_tools
-                    and skill_name == "shell"
-                    and host_profile.get("can_install_system_packages")
-                    and _looks_like_package_install_command(routed_args)
-                ):
-                    return json.dumps(
-                        {
-                            "ok": False,
-                            "error": (
-                                "Do not install system packages through skill_shell. "
-                                "Use the install_package tool with a package name."
-                            ),
-                            "tool": "install_package",
-                            "example": {
-                                "package": "megatools",
-                                "binary": "megadl",
-                            },
-                        },
-                        ensure_ascii=False,
-                    )
-                if use_host_tools and _is_dangerous(skill_name, script_path.name, routed_args):
-                    confirmed = await _ask_confirm(skill_name, script_path.name, routed_args)
-                    if not confirmed:
-                        return json.dumps({"error": "Operation cancelled by user."})
-                timeout = _skill_execution_timeout(skill_name, arg_list, meta.timeout)
-                from eyetor.providers.tracking import (
-                    current_conversation_id,
-                    current_session_id,
+        if meta.args_tool:
+            tool_registry.register(
+                _args_tool(
+                    name,
+                    meta,
+                    ScriptRouter(name, scripts),
+                    use_host_tools=use_host_tools,
+                    host_profile=host_profile,
                 )
-                _sid = current_session_id.get()
-                _env = None
-                if _sid and _sid != "unknown":
-                    _env = {"EYETOR_SESSION_ID": _sid}
-                    _conv = current_conversation_id.get()
-                    if _conv:
-                        _env["EYETOR_CONVERSATION_ID"] = _conv
-                return await run_script(script_path, arg_list, timeout=timeout, env=_env)
-            return _handler
-
-        _handler = _make_handler(_sn, _router, _meta)
-
-        _desc = _meta.description[:200]
-        _public = _router.public_scripts
-        if len(_public) > 1:
-            _desc += f" Scripts: {', '.join(s.stem for s in _public)}."
-
-        tool_registry.register(
-            ToolDefinition(
-                name=f"skill_{_sn.replace('-', '_')}",
-                description=_desc,
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "args": {
-                            "type": "string",
-                            "description": (
-                                "Subcommand and flags only (no script name/interpreter/"
-                                "vars). E.g. 'open https://example.com --headed'."
-                            ),
-                        },
-                    },
-                    "required": [],
-                },
-                handler=_handler,
             )
+        for tool in meta.tools:
+            tool_registry.register(_typed_tool(name, tool, meta, use_host_tools=use_host_tools))
+
+
+def _session_env() -> dict[str, str] | None:
+    """Env passed to skill scripts so they can scope state to the chat."""
+    from eyetor.providers.tracking import current_conversation_id, current_session_id
+
+    sid = current_session_id.get()
+    if not sid or sid == "unknown":
+        return None
+    env = {"EYETOR_SESSION_ID": sid}
+    conv = current_conversation_id.get()
+    if conv:
+        env["EYETOR_CONVERSATION_ID"] = conv
+    return env
+
+
+def _args_tool(
+    skill_name: str,
+    meta: SkillMetadata,
+    router: ScriptRouter,
+    *,
+    use_host_tools: bool,
+    host_profile: dict,
+) -> ToolDefinition:
+    """``skill_<name>``: one free-text ``args`` param. ScriptRouter maps the
+    first token to the right script for multi-script skills; single-script
+    skills pass everything through unchanged."""
+
+    async def _handler(args: str = "") -> str:
+        try:
+            script_path, arg_list = router.route(args)
+        except RoutingError as exc:
+            return json.dumps({"error": str(exc)})
+        routed_args = " ".join(arg_list)
+        if (
+            use_host_tools
+            and skill_name == "shell"
+            and host_profile.get("can_install_system_packages")
+            and _looks_like_package_install_command(routed_args)
+        ):
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        "Do not install system packages through skill_shell. "
+                        "Use the install_package tool with a package name."
+                    ),
+                    "tool": "install_package",
+                    "example": {
+                        "package": "megatools",
+                        "binary": "megadl",
+                    },
+                },
+                ensure_ascii=False,
+            )
+        if use_host_tools and _is_dangerous(skill_name, script_path.name, routed_args):
+            confirmed = await _ask_confirm(skill_name, script_path.name, routed_args)
+            if not confirmed:
+                return json.dumps({"error": "Operation cancelled by user."})
+        timeout = _skill_execution_timeout(skill_name, arg_list, meta.timeout)
+        return await run_script(script_path, arg_list, timeout=timeout, env=_session_env())
+
+    desc = meta.description[:200]
+    public = router.public_scripts
+    if len(public) > 1:
+        desc += f" Scripts: {', '.join(s.stem for s in public)}."
+
+    return ToolDefinition(
+        name=f"skill_{skill_name.replace('-', '_')}",
+        description=desc,
+        parameters={
+            "type": "object",
+            "properties": {
+                "args": {
+                    "type": "string",
+                    "description": (
+                        "Subcommand and flags only (no script name/interpreter/"
+                        "vars). E.g. 'open https://example.com --headed'."
+                    ),
+                },
+            },
+            "required": [],
+        },
+        handler=_handler,
+    )
+
+
+def build_skill_tool_argv(tool: SkillTool, arguments: dict[str, Any]) -> list[str]:
+    """Translate typed tool arguments into the script's command line.
+
+    Parameters follow the schema's property order; ``None`` values are
+    skipped. ``--flag=value`` keeps values that start with ``-`` intact.
+    """
+    argv = list(tool.argv)
+    props = tool.parameters.get("properties", {})
+    for key in list(props) + [k for k in arguments if k not in props]:
+        value = arguments.get(key)
+        if value is None:
+            continue
+        flag = "--" + key.replace("_", "-")
+        if isinstance(value, bool):
+            if value:
+                argv.append(flag)
+        elif isinstance(value, (list, dict)):
+            argv.append(f"{flag}={json.dumps(value, ensure_ascii=False)}")
+        else:
+            argv.append(f"{flag}={value}")
+    return argv
+
+
+def _typed_tool(
+    skill_name: str, tool: SkillTool, meta: SkillMetadata, *, use_host_tools: bool
+) -> ToolDefinition:
+    """A typed tool declared in SKILL.md, run as its script's command line."""
+    script_path = Path(meta.path) / "scripts" / tool.script
+
+    async def _handler(**arguments: Any) -> str:
+        argv = build_skill_tool_argv(tool, arguments)
+        if use_host_tools and tool.confirm:
+            confirmed = await _ask_confirm(skill_name, script_path.name, " ".join(argv))
+            if not confirmed:
+                return json.dumps({"error": "Operation cancelled by user."})
+        return await run_script(
+            script_path,
+            argv,
+            timeout=_skill_execution_timeout(skill_name, argv, meta.timeout),
+            env=_session_env(),
         )
 
-        if _sn == "shopping":
-            receipt_script = next(
-                (s for s in _scripts if s.name == "receipt.py"), None
-            )
-            if receipt_script is not None:
-
-                async def shopping_receipt_add_handler(
-                    store: str,
-                    date: str,
-                    items: list[dict],
-                    total: float | None = None,
-                    image_path: str | None = None,
-                    _receipt_script=receipt_script,
-                    _meta_timeout=_meta.timeout,
-                ) -> str:
-                    args = [
-                        "add",
-                        "--store",
-                        store,
-                        "--date",
-                        date,
-                        "--items",
-                        json.dumps(items, ensure_ascii=False),
-                    ]
-                    if total is not None:
-                        args.extend(["--total", str(total)])
-                    if image_path:
-                        args.extend(["--image-path", image_path])
-                    return await run_script(
-                        _receipt_script,
-                        args,
-                        timeout=_skill_execution_timeout(
-                            "shopping", args, _meta_timeout
-                        ),
-                    )
-
-                tool_registry.register(
-                    ToolDefinition(
-                        name="shopping_receipt_add",
-                        description=(
-                            "Register a shopping receipt from structured data. "
-                            "Prefer this over skill_shopping receipt.py add for "
-                            "photo receipts or long item lists."
-                        ),
-                        parameters={
-                            "type": "object",
-                            "properties": {
-                                "store": {
-                                    "type": "string",
-                                    "description": "Store name from the receipt.",
-                                },
-                                "date": {
-                                    "type": "string",
-                                    "description": "Purchase date in YYYY-MM-DD format.",
-                                },
-                                "items": {
-                                    "type": "array",
-                                    "description": (
-                                        "One entry per purchased unit. Do not include "
-                                        "items with unknown prices."
-                                    ),
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "name": {"type": "string"},
-                                            "price": {"type": "number"},
-                                        },
-                                        "required": ["name", "price"],
-                                    },
-                                },
-                                "total": {
-                                    "type": "number",
-                                    "description": "Receipt total if visible.",
-                                },
-                                "image_path": {
-                                    "type": "string",
-                                    "description": (
-                                        "Absolute path under ~/.eyetor/images for the "
-                                        "saved receipt image."
-                                    ),
-                                },
-                            },
-                            "required": ["store", "date", "items"],
-                        },
-                        handler=shopping_receipt_add_handler,
-                    )
-                )
+    return ToolDefinition(
+        name=tool.name,
+        description=tool.description,
+        parameters=tool.parameters,
+        handler=_handler,
+        skill=skill_name,
+    )

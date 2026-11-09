@@ -30,6 +30,9 @@ class ToolDefinition(BaseModel):
     # selects it — see eyetor.chat.tool_gating. Keeps rarely-used tool schemas
     # out of the prompt on trivial turns.
     group: str | None = None
+    # Skill that provides this tool (typed tools declared in SKILL.md), so
+    # per-chat access can allow it through the skill. None for core tools.
+    skill: str | None = None
 
     def to_openai_format(self) -> dict[str, Any]:
         """Serialize to OpenAI tools array element."""

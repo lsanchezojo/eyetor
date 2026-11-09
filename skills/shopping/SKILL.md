@@ -45,6 +45,38 @@ commands:
       comprar la lista actual. Modo "cheapest": precio mínimo por producto entre tiendas.
       Modo "fewer-stores": minimiza el número de tiendas visitadas (greedy set-cover,
       opcional --max-stores N). Petición: {args}
+tools:
+  - name: shopping_receipt_add
+    description: >-
+      Register a shopping receipt from structured data. Prefer this over
+      skill_shopping receipt.py add for photo receipts or long item lists.
+    script: receipt.py
+    argv: [add]
+    parameters:
+      type: object
+      properties:
+        store:
+          type: string
+          description: Store name from the receipt.
+        date:
+          type: string
+          description: Purchase date in YYYY-MM-DD format.
+        items:
+          type: array
+          description: One entry per purchased unit. Do not include items with unknown prices.
+          items:
+            type: object
+            properties:
+              name: {type: string}
+              price: {type: number}
+            required: [name, price]
+        total:
+          type: number
+          description: Receipt total if visible.
+        image_path:
+          type: string
+          description: Absolute path under ~/.eyetor/images for the saved receipt image.
+      required: [store, date, items]
 ---
 
 # shopping — compras, lista y optimización

@@ -95,7 +95,7 @@ def register_kb_tools(tool_registry: ToolRegistry, knowledge) -> None:
                 "Search the workspace knowledge base for documentation, guides, "
                 "specs and notes. Returns ranked snippets. Use this for conceptual "
                 "or factual questions about project docs. For literal string matching "
-                "in code, prefer the filesystem grep skill. "
+                "in code, prefer the fs_grep tool. "
                 f"Available workspaces: {_kb_ws_desc}."
             ),
             parameters={

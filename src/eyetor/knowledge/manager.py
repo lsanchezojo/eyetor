@@ -248,6 +248,6 @@ class KnowledgeManager:
             "Use kb_search(query) to retrieve ranked snippets from documentation, guides, specs and notes.",
             "Use kb_read(doc_id, section) for more context around a match.",
             "Use kb_list_sources() to discover available documents.",
-            "Prefer kb_search for conceptual or factual questions; use the filesystem grep skill for literal strings.",
+            "Prefer kb_search for conceptual or factual questions; use the fs_grep tool for literal strings.",
         ]
         return "\n".join(lines)

@@ -42,6 +42,23 @@ class SkillCommand:
 
 
 @dataclass
+class SkillTool:
+    """A typed tool declared by a skill in SKILL.md frontmatter.
+
+    Calling it runs ``scripts/<script> <argv...>`` followed by one
+    ``--<param-name>=<value>`` per argument given (underscores become dashes;
+    booleans become a bare flag when true; lists/objects are passed as JSON).
+    """
+
+    name: str
+    description: str
+    script: str  # relative to the skill's scripts/ dir
+    parameters: dict  # JSON Schema object
+    argv: list[str] = field(default_factory=list)  # fixed leading args, e.g. ["add"]
+    confirm: bool = False  # ask the user before running (destructive operations)
+
+
+@dataclass
 class SkillMetadata:
     """Lightweight metadata loaded from SKILL.md frontmatter.
 
@@ -60,6 +77,41 @@ class SkillMetadata:
     # Optional script (relative to scripts/) run as "<script> --session-reset"
     # with EYETOR_SESSION_ID when an eyetor conversation is reset.
     on_reset: str | None = None
+    tools: list[SkillTool] = field(default_factory=list)
+    # False hides the generic ``skill_<name>`` (free-text ``args``) tool, for
+    # skills fully covered by their typed tools.
+    args_tool: bool = True
+
+
+_TOOL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _parse_skill_tools(skill_name: str, skill_dir: Path, raw_tools) -> list[SkillTool]:
+    tools: list[SkillTool] = []
+    for raw in raw_tools or []:
+        if not isinstance(raw, dict):
+            continue
+        name = raw.get("name", "")
+        script = raw.get("script", "")
+        params = raw.get("parameters") or {"type": "object", "properties": {}}
+        if not _TOOL_NAME_RE.match(name or "") or not raw.get("description"):
+            logger.warning("Skill '%s': skipping invalid tool %r", skill_name, name)
+            continue
+        if not script or not (skill_dir / "scripts" / script).exists():
+            logger.warning("Skill '%s': tool %r script %r not found", skill_name, name, script)
+            continue
+        if not isinstance(params, dict) or params.get("type") != "object":
+            logger.warning("Skill '%s': tool %r parameters must be a JSON Schema object", skill_name, name)
+            continue
+        tools.append(SkillTool(
+            name=name,
+            description=raw["description"].strip(),
+            script=script,
+            parameters=params,
+            argv=[str(a) for a in raw.get("argv", []) or []],
+            confirm=bool(raw.get("confirm", False)),
+        ))
+    return tools
 
 
 @dataclass
@@ -164,6 +216,8 @@ def load_skill_metadata(skill_dir: Path) -> SkillMetadata | None:
         timeout=timeout,
         commands=commands,
         on_reset=on_reset,
+        tools=_parse_skill_tools(name, skill_dir, fm.get("tools")),
+        args_tool=bool(fm.get("args_tool", True)),
     )
 
 

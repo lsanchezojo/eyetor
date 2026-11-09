@@ -493,7 +493,7 @@ class ChatSession:
             allowed = ToolRegistry()
             removed: list[str] = []
             for tool in self.tool_registry._tools.values():
-                if access.allows_tool(tool.name):
+                if access.allows(tool):
                     allowed.register(tool)
                 else:
                     removed.append(tool.name)

@@ -98,7 +98,9 @@ class SkillRegistry:
                         f"/{c.name} ({c.description})" for c in meta.commands
                     )
                     lines.append(f"Telegram commands: {cmds}")
-                if scripts:
+                # Skills without the free-text tool expose only typed tools,
+                # whose schemas already document their parameters.
+                if scripts and meta.args_tool:
                     strip_script_prefix = len(scripts) == 1
                     for script in scripts:
                         usage = _script_usage_summary(

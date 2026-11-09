@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from eyetor.config import VectorConfig
+    from eyetor.models.tools import ToolDefinition
 
 _SKILL_PREFIX = "skill_"
 
@@ -56,6 +57,13 @@ class Access:
                 for pat in self.tools
             )
         )
+
+    def allows(self, tool: "ToolDefinition") -> bool:
+        """Like :meth:`allows_tool`, but a skill's typed tool is also allowed
+        when its skill is."""
+        if self.allows_tool(tool.name):
+            return True
+        return bool(tool.skill) and self.allows_tool(_SKILL_PREFIX + _norm_skill(tool.skill))
 
     def allowed_summary(self) -> str:
         """Human-readable summary for a system-prompt note (restricted only)."""
