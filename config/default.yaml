@@ -1,3 +1,10 @@
+# Configuración por defecto de Eyetor.
+#
+# Para personalizarla en un equipo, NO edites este fichero: crea
+# ~/.eyetor/config.yaml con solo las claves que cambian. Se mezcla encima de
+# este: los diccionarios se fusionan clave a clave y las listas/valores
+# sustituyen al de aquí. (Con `eyetor -c fichero.yaml` se usa solo ese fichero.)
+
 providers:
   openrouter:
     type: openrouter
@@ -9,8 +16,6 @@ providers:
   ollama:
     type: ollama
     base_url: http://localhost:11434/v1
-    # Gemma-4 12B QAT importado en Ollama desde
-    # ~/dev/modelos/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf.
     # thinking=true permite razonamiento solo en fases útiles. Eyetor envía
     # reasoning.effort=none en fases directas/sensibles (compaction,
     # degeneration_recovery, loop_break, chain_synthesize) para evitar
@@ -19,28 +24,6 @@ providers:
     temperature: 0.3
     thinking: true
     request_timeout: 300
-    max_tokens: 1024
-    max_tokens_by_phase:
-      main: 1536
-      degeneration_recovery: 512
-      loop_break: 512
-      chain_plan: 512
-      chain_execute: 768
-      chain_synthesize: 768
-      agent: 768
-
-  llamacpp-mtp:
-    type: llamacpp
-    base_url: http://localhost:8081/v1
-    # Gemma-4 12B QAT + drafter MTP (decodificación especulativa, ~2x tok/s)
-    # vía llama.cpp b9585 Vulkan (~/.local/bin/llamacpp-gemma4-mtp.sh,
-    # llamacpp-gemma4-mtp.service). n_ctx real del server = 16384 (CTX en la
-    # unidad); si se cambia, sincronizar sessions.compaction.context_window.
-    model: default
-    temperature: 0.3
-    thinking: true
-    request_timeout: 300
-    reasoning_budget: 384
     max_tokens: 1024
     max_tokens_by_phase:
       main: 1536
@@ -70,21 +53,20 @@ providers:
       chain_execute: 768
       chain_synthesize: 768
       agent: 768
-    
+
   llamacpp-vision:
     type: llamacpp
     base_url: http://localhost:8082/v1
     model: default
 
-  # Modelo de visión de PAGO en OpenRouter — solo se usa como fallback cuando el
-  # primario (nemotron :free) o el llamacpp-vision local fallan. OCR fiable y barato.
+  # Modelo de visión de PAGO en OpenRouter, como respaldo del local. OCR
+  # fiable y barato. (google/gemini-2.0-flash-001 fue retirado de OpenRouter.)
   openrouter-vision:
     type: openrouter
     ssl_verify: false
     base_url: https://openrouter.ai/api/v1
     api_key: ${OPENROUTER_API_KEY}
-    model: google/gemini-2.0-flash-001
-
+    model: qwen/qwen3.7-flash
 
   gemini:
     type: gemini
@@ -93,12 +75,8 @@ providers:
     model: gemini-2.0-flash
 
 fallback:
-  # llamacpp-mtp = Gemma-4 12B QAT + drafter MTP en :8081 (~2x tok/s).
-  # ollama = mismo Gemma-4 12B QAT sin MTP en :11434 (fallback local).
-  # llamacpp = backup Qwen3.6-35B-A3B Q4_K_XL vía llama.cpp Vulkan + mmap
-  # (~/.local/bin/llamacpp-eyetor.sh, llamacpp-eyetor.service, disabled). Para
-  # volver a Qwen, arranca ese servicio y mueve llamacpp al primer lugar.
-  fallback_chain: [llamacpp-mtp, openrouter, gemini]
+  # Proveedores probados en orden si el anterior falla (ver retry_on).
+  fallback_chain: [llamacpp, openrouter, gemini]
   retry_on:
     - timeout
     - connection_error
@@ -141,6 +119,8 @@ chatlog_retention_days: 0   # 0 = keep forever; e.g. 90 purges messages older th
 #   - lookup precedence: exact id > glob pattern (longest) > "default" > nothing
 #   - "*" in a list means "all tools" / "all skills"
 #   - skills are listed by skill name (e.g. "web-search"); tools by tool name
+# Añade tus chats en ~/.eyetor/config.yaml, p. ej.:
+#   "telegram-123456789":  {tools: ["*"], skills: ["*"]}
 access:
   default:                          # any chat not listed → conversation only, no tools
     tools: []
@@ -148,12 +128,6 @@ access:
   "cli-*":                          # all local CLI sessions → everything
     tools: ["*"]
     skills: ["*"]
-  "telegram-7874955":               # owner private chat → everything
-    tools: ["*"]
-    skills: ["*"]
-  "telegram--1004368034361":        # group of three → chat + web search + KB + group history
-    tools: [kb_search, kb_read, kb_list_sources, chat_history_search, chat_history_read_day, chat_history_list_days]
-    skills: [web-search]
 
 tracking:
   db_path: ~/.eyetor/tracking.db
@@ -185,9 +159,15 @@ channels:
       # to it). Use the group's numeric chat_id (negative, e.g. -1001234567890).
       # To let the bot read the full group history, disable its privacy mode in
       # BotFather: /setprivacy -> select the bot -> Disable.
-      allowed_chats:
-        - -1004368034361    # grupo de los tres (supergrupo)
-        # - -1001234567890
+      allowed_chats: []
+
+  # Asistente de voz local: palabra de activación → whisper → agente → Piper.
+  # Requiere: pip install -e ".[voice-assistant]" && pip install --no-deps "openwakeword>=0.6"
+  # Modelos en ~/.eyetor/voice (oww/ y piper/). Dispositivos = nombres de PipeWire
+  # (pactl list short sources / sinks); vacío = el predeterminado del sistema.
+  # Actívalo en ~/.eyetor/config.yaml con enabled, input_device, wake_word_model…
+  voice:
+    enabled: false
 
 scheduler:
   enabled: true
@@ -240,18 +220,16 @@ default_image_provider: gemini-flash
 
 # Vision provider: used to describe images sent by users (multimodal LLM call).
 # References one of the providers above — inherits its base_url and api_key.
-# Primario: Gemma-4 12B multimodal local en :8081 (provider llamacpp-mtp, mismo
-# server de texto con --mmproj). Gratis y privado; el thinking se desactiva por
-# petición para describir imágenes. vision_model vacío → usa el modelo cargado.
-vision_provider: llamacpp-mtp
+# vision_model vacío → usa el modelo cargado en el servidor.
+vision_provider: llamacpp-vision
 vision_model:
-# Respaldo probado en orden si el local falla (server caído, cuerpo sin 'choices',
-# error). openrouter-vision = gemini-2.0-flash de pago, fiable.
+# Respaldo probado en orden si el primario falla (server caído, cuerpo sin
+# 'choices', error).
 vision_fallback: [openrouter-vision]
 
 # Transcripción de notas de voz (speech-to-text), para hablarle al bot cuando no
 # se puede escribir. Por defecto local con faster-whisper (requiere el extra:
-# pip install -e ".[voice]"). Esta APU AMD no tiene CUDA, así que va por CPU.
+# pip install -e ".[voice]"). Sin GPU NVIDIA va por CPU.
 transcription:
   enabled: true
   backend: local      # local = faster-whisper en proceso | api = endpoint OpenAI-compatible
@@ -263,6 +241,14 @@ transcription:
   # base_url:
   # api_key:
 
+# Servidores MCP. Ejemplo (Home Assistant, integración "Model Context Protocol
+# Server"); ponlo en ~/.eyetor/config.yaml con HA_URL y HA_TOKEN en .env:
+#   homeassistant:
+#     transport: http
+#     url: ${HA_URL}/api/mcp
+#     headers:
+#       Authorization: Bearer ${HA_TOKEN}
+#     group: home   # solo se envían al modelo si el mensaje habla de la casa (ver tool_gating)
 mcp_servers: {}
 
 # Knowledge base — hybrid BM25 + semantic retrieval over workspace docs.
@@ -348,7 +334,7 @@ sessions:
     plan_votes: 1         # voting rounds for planning step (1 = no voting)
   compaction:
     enabled: true
-    context_window: 16384     # = n_ctx real del servidor primario (llamacpp-mtp :8081, CTX=16384; verificable con curl localhost:8081/props). ollama gemma4 usa 32768; mantener sincronizado con el primario si se cambia
+    context_window: 16384     # = n_ctx real del servidor primario; mantener sincronizado si se cambia
     trigger_at_percent: 0.70
     tool_output_max_chars: 2000
     keep_last_n_user_turns: 2

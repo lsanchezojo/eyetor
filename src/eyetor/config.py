@@ -427,32 +427,45 @@ def _load_dotenv() -> None:
                     os.environ[key] = value
 
 
-def load_config(path: Path | None = None) -> VectorConfig:
-    """Load configuration from YAML file with env var substitution.
+DEFAULT_CONFIG_PATH = Path("config/default.yaml")
+LOCAL_CONFIG_PATH = Path.home() / ".eyetor" / "config.yaml"
 
-    Search order:
-    1. Explicit path argument
-    2. ./config/default.yaml
-    3. ~/.eyetor/config.yaml
-    4. Empty defaults
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Merge ``override`` into ``base``: dicts merge recursively, anything else
+    (scalars, lists, null) replaces the base value."""
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _read_yaml(path: Path) -> dict:
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return raw if isinstance(raw, dict) else {}
+
+
+def load_config(
+    path: Path | None = None, *, local_path: Path | None = None
+) -> VectorConfig:
+    """Load configuration from YAML with env var substitution.
+
+    - Explicit ``path``: that file alone, as a complete config.
+    - Otherwise ``./config/default.yaml`` (repo defaults) with the per-host
+      ``~/.eyetor/config.yaml`` deep-merged on top. The local file only needs
+      the keys it changes: dicts merge key by key, lists and scalars replace.
     """
     _load_dotenv()
 
-    search_paths = []
-    if path:
-        search_paths.append(path)
-    search_paths.extend(
-        [
-            Path("config/default.yaml"),
-            Path.home() / ".eyetor" / "config.yaml",
-        ]
-    )
+    if path is not None:
+        raw = _read_yaml(path) if path.exists() else {}
+    else:
+        raw = {}
+        for layer in (DEFAULT_CONFIG_PATH, local_path or LOCAL_CONFIG_PATH):
+            if layer.exists():
+                raw = _deep_merge(raw, _read_yaml(layer))
 
-    for config_path in search_paths:
-        if config_path.exists():
-            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-            if raw:
-                resolved = _resolve_env_vars(raw)
-                return VectorConfig(**resolved)
-
-    return VectorConfig()
+    return VectorConfig(**_resolve_env_vars(raw)) if raw else VectorConfig()

@@ -109,7 +109,10 @@ OPENROUTER_API_KEY=     # only if using OpenRouter provider
 GEMINI_API_KEY=         # only if using Gemini provider (LLM and/or images)
 ```
 
-Main config: `config/default.yaml`. Key sections:
+Main config: `config/default.yaml` (repo defaults). Per-host settings go in
+`~/.eyetor/config.yaml`, which is deep-merged on top: write only the keys you
+change (dicts merge key by key; lists and scalars replace). `eyetor -c file.yaml`
+uses that file alone. Key sections:
 
 ```yaml
 providers:
