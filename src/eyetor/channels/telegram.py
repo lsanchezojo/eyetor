@@ -14,6 +14,7 @@ from datetime import date
 import json
 import logging
 import re
+import secrets
 import tempfile
 import os
 from pathlib import Path
@@ -22,6 +23,7 @@ from eyetor.channels.base import BaseChannel
 from eyetor.chat.manager import SessionManager
 from eyetor.config import TelegramChannelConfig
 from eyetor.knowledge.extractors import get_extractor
+from eyetor.tools.confirm import CONFIRM_TIMEOUT, Confirmer, current_confirmer
 from eyetor.tracking.context import current_channel
 from eyetor.workflows.observer import WorkerObserver
 
@@ -373,6 +375,8 @@ class TelegramChannel(BaseChannel):
 
         # Voice-note transcription (speech-to-text) config.
         self._transcription = full_config.transcription if full_config else None
+        # Pending Sí/No confirmations: key → (future, user allowed to answer).
+        self._pending_confirms: dict[str, tuple[asyncio.Future[bool], int | None]] = {}
         if self._transcription and self._transcription.enabled:
             logger.info(
                 "Transcription: backend=%s model=%s device=%s lang=%s",
@@ -381,6 +385,56 @@ class TelegramChannel(BaseChannel):
                 self._transcription.device,
                 self._transcription.language or "auto",
             )
+
+    def _confirmer(self, bot, msg) -> Confirmer:
+        """Confirmation through Sí/No buttons in the chat the turn came from.
+
+        Only the user who sent the message can answer (matters in groups);
+        no answer within CONFIRM_TIMEOUT counts as a no."""
+        chat_id = msg.chat.id
+        user_id = msg.from_user.id if msg.from_user else None
+
+        async def _ask(description: str) -> bool:
+            from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+            key = secrets.token_hex(6)
+            future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            self._pending_confirms[key] = (future, user_id)
+            text = (
+                "⚠️ <b>Necesito tu confirmación para:</b>\n"
+                f"<code>{_escape_html(description[:3500])}</code>"
+            )
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(text="✅ Sí", callback_data=f"cfm:{key}:y"),
+                    InlineKeyboardButton(text="❌ No", callback_data=f"cfm:{key}:n"),
+                ]]
+            )
+            try:
+                sent = await bot.send_message(
+                    chat_id, text, parse_mode="HTML", reply_markup=keyboard
+                )
+                try:
+                    answer: bool | None = await asyncio.wait_for(future, CONFIRM_TIMEOUT)
+                except asyncio.TimeoutError:
+                    answer = None
+            finally:
+                self._pending_confirms.pop(key, None)
+            outcome = {True: "✅ Confirmado", False: "❌ Cancelado"}.get(
+                answer, "⌛ Sin respuesta: cancelado"
+            )
+            try:  # replacing the text also removes the buttons
+                await bot.edit_message_text(
+                    f"{text}\n\n{outcome}",
+                    chat_id=chat_id,
+                    message_id=sent.message_id,
+                    parse_mode="HTML",
+                )
+            except Exception as exc:
+                logger.debug("Could not update confirmation message: %s", exc)
+            return bool(answer)
+
+        return _ask
 
     def _remember_reply_continue(self, chat_id: int, message_id: int, info: dict | None) -> None:
         """Tag a sent result message so a reply re-invokes its script (bounded)."""
@@ -416,6 +470,7 @@ class TelegramChannel(BaseChannel):
                 BotCommandScopeAllPrivateChats,
                 BotCommandScopeChat,
                 BotCommandScopeDefault,
+                CallbackQuery,
             )
         except ImportError:
             raise ImportError(
@@ -541,6 +596,21 @@ class TelegramChannel(BaseChannel):
                         f"{base}\n\n{_GROUP_HINT}".strip()
                     )
             return session
+
+        @dp.callback_query(F.data.startswith("cfm:"))
+        async def on_confirm_button(cb: CallbackQuery) -> None:
+            _, key, choice = (cb.data or "::").split(":", 2)
+            pending = self._pending_confirms.get(key)
+            if pending is None:
+                await cb.answer("Esta confirmación ya no está activa.")
+                return
+            future, user_id = pending
+            if user_id is not None and cb.from_user.id != user_id:
+                await cb.answer("Solo quien lo pidió puede confirmarlo.", show_alert=True)
+                return
+            if not future.done():
+                future.set_result(choice == "y")
+            await cb.answer()
 
         @dp.message(Command("start"))
         async def cmd_start(msg: Message) -> None:
@@ -785,6 +855,7 @@ class TelegramChannel(BaseChannel):
                         session._observer = status
                         try:
                             current_channel.set("telegram")
+                            current_confirmer.set(self._confirmer(bot, msg))
                             async with ChatActionSender.typing(
                                 bot=bot, chat_id=msg.chat.id
                             ):
@@ -895,6 +966,7 @@ class TelegramChannel(BaseChannel):
             session._observer = status
             try:
                 current_channel.set("telegram")
+                current_confirmer.set(self._confirmer(bot, msg))
                 async with ChatActionSender.typing(bot=bot, chat_id=msg.chat.id):
                     async for chunk in session.send(_format_input(msg, msg.text or "")):
                         buffer += chunk
@@ -970,6 +1042,7 @@ class TelegramChannel(BaseChannel):
                 img_path.write_bytes(img_bytes)
 
                 current_channel.set("telegram")
+                current_confirmer.set(self._confirmer(bot, msg))
                 async with ChatActionSender.typing(bot=bot, chat_id=msg.chat.id):
                     await status.set("📷 Analizando imagen…")
 
@@ -1058,6 +1131,7 @@ class TelegramChannel(BaseChannel):
             session._observer = status
             try:
                 current_channel.set("telegram")
+                current_confirmer.set(self._confirmer(bot, msg))
                 async with ChatActionSender.typing(bot=bot, chat_id=msg.chat.id):
                     async for chunk in session.send(_format_input(msg, transcription)):
                         buffer += chunk
@@ -1124,6 +1198,7 @@ class TelegramChannel(BaseChannel):
             prev_observer = None
             try:
                 current_channel.set("telegram")
+                current_confirmer.set(self._confirmer(bot, msg))
                 uploads_dir = Path.home() / ".eyetor" / "uploads" / str(msg.chat.id)
                 uploads_dir.mkdir(parents=True, exist_ok=True)
                 import time as _time

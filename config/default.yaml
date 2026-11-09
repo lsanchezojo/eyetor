@@ -329,7 +329,10 @@ sessions:
     # de tool por turno; quítalo si no usas la base de conocimiento.
     always_on_groups: [kb]
   chain:
-    mode: auto           # auto | always | never — decompose complex queries into plan→execute→synthesize
+    # auto | always | never — plan→execute→synthesize for long multi-step queries.
+    # Off: with small models the extra plan step rarely helps, and this path
+    # lacks send()'s loop and empty-reply guards.
+    mode: never
     complexity_threshold: 300  # min chars to consider a message complex (auto mode)
     plan_votes: 1         # voting rounds for planning step (1 = no voting)
   compaction:

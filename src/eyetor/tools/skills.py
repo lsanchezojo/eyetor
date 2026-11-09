@@ -17,8 +17,8 @@ from eyetor.skills.executor import run_script
 from eyetor.skills.loader import SkillMetadata, SkillTool
 from eyetor.skills.registry import SkillRegistry
 from eyetor.skills.router import RoutingError, ScriptRouter
+from eyetor.tools.confirm import guard
 from eyetor.tools.host import (
-    _ask_confirm,
     _is_dangerous,
     _looks_like_package_install_command,
     _skill_execution_timeout,
@@ -106,9 +106,9 @@ def _args_tool(
                 ensure_ascii=False,
             )
         if use_host_tools and _is_dangerous(skill_name, script_path.name, routed_args):
-            confirmed = await _ask_confirm(skill_name, script_path.name, routed_args)
-            if not confirmed:
-                return json.dumps({"error": "Operation cancelled by user."})
+            refused = await guard(f"{skill_name}: {routed_args}")
+            if refused:
+                return refused
         timeout = _skill_execution_timeout(skill_name, arg_list, meta.timeout)
         return await run_script(script_path, arg_list, timeout=timeout, env=_session_env())
 
@@ -160,6 +160,11 @@ def build_skill_tool_argv(tool: SkillTool, arguments: dict[str, Any]) -> list[st
     return argv
 
 
+def _describe_args(arguments: dict[str, Any]) -> str:
+    """``path=/tmp/x, recursive=True`` — readable in a confirmation prompt."""
+    return ", ".join(f"{k}={v}" for k, v in arguments.items() if v is not None)
+
+
 def _typed_tool(
     skill_name: str, tool: SkillTool, meta: SkillMetadata, *, use_host_tools: bool
 ) -> ToolDefinition:
@@ -169,9 +174,9 @@ def _typed_tool(
     async def _handler(**arguments: Any) -> str:
         argv = build_skill_tool_argv(tool, arguments)
         if use_host_tools and tool.confirm:
-            confirmed = await _ask_confirm(skill_name, script_path.name, " ".join(argv))
-            if not confirmed:
-                return json.dumps({"error": "Operation cancelled by user."})
+            refused = await guard(f"{tool.name}: {_describe_args(arguments)}")
+            if refused:
+                return refused
         return await run_script(
             script_path,
             argv,

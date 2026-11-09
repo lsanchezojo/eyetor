@@ -6,11 +6,9 @@ import asyncio
 import json
 from pathlib import Path
 
-from rich.console import Console
 
 from eyetor.models.tools import ToolDefinition, ToolRegistry
 
-console = Console()
 
 
 def register_install_tool(tool_registry: ToolRegistry, host_profile: dict) -> None:
@@ -258,19 +256,6 @@ def _is_dangerous(skill: str, script: str, args: str) -> bool:
                 if p in args_lower:
                     return True
     return False
-
-
-async def _ask_confirm(skill: str, script: str, args: str) -> bool:
-    console.print(
-        f"\n[bold red]⚠  Dangerous operation requested:[/bold red]\n"
-        f"  Skill: [cyan]{skill}[/cyan]  Script: [cyan]{script}[/cyan]\n"
-        f"  Args:  [yellow]{args}[/yellow]\n"
-    )
-    loop = asyncio.get_event_loop()
-    answer = await loop.run_in_executor(
-        None, lambda: input("  Confirm? [y/N] ").strip().lower()
-    )
-    return answer in {"y", "yes"}
 
 
 def _split_args(args: str) -> list[str]:

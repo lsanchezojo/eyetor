@@ -31,6 +31,7 @@ import numpy as np
 from eyetor.channels.base import BaseChannel
 from eyetor.chat.manager import SessionManager
 from eyetor.config import VoiceChannelConfig
+from eyetor.tools.confirm import current_confirmer, is_yes
 from eyetor.tracking.context import current_channel
 
 logger = logging.getLogger(__name__)
@@ -437,6 +438,7 @@ class VoiceChannel(BaseChannel):
 
     async def _ask(self, text: str) -> str:
         current_channel.set("voice")
+        current_confirmer.set(self._confirm_by_voice)
         session = self._manager.get_or_create(self._cfg.session_id)
         try:
             reply = await session.send_sync(text)
@@ -444,6 +446,27 @@ class VoiceChannel(BaseChannel):
             logger.error("Voice: agent error: %s", exc)
             return "Lo siento, ha habido un error al procesar la orden."
         return reply.strip() or "No he podido generar una respuesta."
+
+    async def _confirm_by_voice(self, description: str) -> bool:
+        """Ask out loud and listen for a yes. Silence or anything unclear is a no."""
+        from eyetor.audio import stt
+
+        await self._say(f"Antes necesito tu confirmación para esto: {description}. ¿Lo hago?")
+        audio = await self._record_command(self._cfg.followup_seconds)
+        if audio is None:
+            logger.info("Voice: no answer to the confirmation, cancelling")
+            await self._say("Sin respuesta, lo cancelo.")
+            return False
+        answer = await stt.transcribe(
+            self._whisper,
+            audio,
+            language=self._cfg.language,
+            beam_size=self._cfg.stt_beam_size,
+            condition_on_previous_text=False,
+        )
+        confirmed = is_yes(_strip_wake_phrase(answer or ""))
+        logger.info("Voice: confirmation answer %r → %s", answer, confirmed)
+        return confirmed
 
     async def _say(self, text: str) -> None:
         from eyetor.audio import tts

@@ -7,6 +7,8 @@ import json
 import logging
 import re
 import shlex
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, TYPE_CHECKING
 
@@ -90,6 +92,48 @@ def _is_home_action_tool(tool: ToolDefinition | None) -> bool:
         and tool.group == "home"
         and not tool.name.endswith(_HOME_READ_ONLY_SUFFIXES)
     )
+
+
+# "Lo he guardado", "¡Apuntado!", "lo recordaré", "tomo nota"… (not "no he guardado").
+_MEMORY_CLAIM_RE = re.compile(
+    r"(?<!no )\b(he|hemos)\s+(\w+\s+)?"
+    r"(guardad|apuntad|anotad|memorizad|registrad|almacenad)[oa]s?\b"
+    r"|^\W*(guardad|apuntad|anotad|memorizad)[oa]\b"
+    r"|(?<!te )\b(lo|la|los|las)\s+recordaré\b"
+    r"|\btomo\s+nota\b|\bnota\s+tomada\b|\bme\s+lo\s+apunto\b"
+    r"|\blo\s+tendré\s+en\s+cuenta\b"
+    r"|\bqueda(n)?\s+(guardad|apuntad|anotad|registrad)[oa]s?\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# "Te avisaré", "te lo recordaré", "he programado un recordatorio", "alarma puesta"…
+_REMINDER_CLAIM_RE = re.compile(
+    r"\bte\s+(lo\s+|la\s+)?(avisaré|recordaré)\b"
+    r"|(?<!no )\b(he|hemos)\s+(\w+\s+)?(programad|cread|configurad|puest|añadid)[oa]s?"
+    r"\s+(\w+\s+)?(recordatorio|aviso|alarma|alerta)s?\b"
+    r"|\b(recordatorio|aviso|alarma|alerta)\s+(creado|programado|configurado|puesto|listo)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class _ClaimGuard:
+    """An action the model may claim in text without having called its tool.
+
+    The guard applies on turns where an ``offered`` tool was sent; a successful
+    call of a ``done_by`` tool this turn backs the claim."""
+
+    name: str
+    claim_re: re.Pattern[str]
+    offered: Callable[[ToolDefinition], bool]
+    done_by: Callable[[ToolDefinition | None], bool]
+    nudge: str
+    warning: str
+
+
+def _tool_failed(result: str) -> bool:
+    head = result.lstrip()[:80]
+    return head.startswith(("Error", '{"error"')) or '"ok": false' in head
 
 
 # Markers that indicate the model is requesting information from the user
@@ -478,6 +522,66 @@ _HOME_CLAIM_WARNING = (
     "\n\n⚠️ Ojo: no se ha llegado a ejecutar ninguna acción en "
     "Home Assistant, así que puede que no haya cambiado nada."
 )
+
+# Checked in order; the first claim that matches wins. Reminders go before
+# memory so "te lo recordaré" counts as a reminder.
+_CLAIM_GUARDS: tuple[_ClaimGuard, ...] = (
+    _ClaimGuard(
+        name="home",
+        claim_re=_HOME_ACTION_CLAIM_RE,
+        offered=_is_home_action_tool,
+        done_by=_is_home_action_tool,
+        nudge=_NUDGE_HOME_CLAIM,
+        warning=_HOME_CLAIM_WARNING,
+    ),
+    _ClaimGuard(
+        name="reminder",
+        claim_re=_REMINDER_CLAIM_RE,
+        offered=lambda t: t.name == "schedule_task",
+        done_by=lambda t: t is not None and t.name == "schedule_task",
+        nudge=(
+            "System reminder: you said you scheduled a reminder, but schedule_task "
+            "was not executed this turn, so no reminder exists. Emit the structured "
+            "schedule_task tool_call now. Only if no reminder is needed, answer in "
+            "Spanish without claiming you scheduled anything."
+        ),
+        warning=(
+            "\n\n⚠️ Ojo: no se ha llegado a programar ningún recordatorio, "
+            "así que no te avisaré."
+        ),
+    ),
+    _ClaimGuard(
+        name="memory",
+        claim_re=_MEMORY_CLAIM_RE,
+        offered=lambda t: t.name == "remember",
+        # Lists, notes and files are stored by other tools: any tool run backs it.
+        done_by=lambda t: t is not None,
+        nudge=(
+            "System reminder: you said you saved or noted something, but no tool "
+            "was executed this turn, so nothing was stored. Emit the structured "
+            "tool_call now (remember for facts about the user, or the matching tool "
+            "for lists, notes or files). Only if nothing needs storing, answer in "
+            "Spanish without claiming you saved anything."
+        ),
+        warning="\n\n⚠️ Ojo: no se ha llegado a guardar nada, así que puede que no lo recuerde.",
+    ),
+)
+
+
+def _unbacked_claim(
+    content: str, tool_defs: list[ToolDefinition] | None, backed: set[str]
+) -> _ClaimGuard | None:
+    """The first guard whose action is claimed in ``content`` but never ran."""
+    if not content or not tool_defs:
+        return None
+    for guard in _CLAIM_GUARDS:
+        if (
+            guard.name not in backed
+            and any(guard.offered(t) for t in tool_defs)
+            and guard.claim_re.search(content)
+        ):
+            return guard
+    return None
 _NUDGE_ANNOUNCED_CALL = (
     "Recordatorio del sistema: para usar una herramienta debes emitir la "
     "tool_call estructurada; describirla en texto no la ejecuta. Si necesitas "
@@ -843,7 +947,7 @@ class ChatSession:
         degeneration_recovered = False  # one-shot post-tool synthesis fallback
         scaffold_recovered = False  # one-shot clean-synthesis fallback for leaks
         tools_executed = 0
-        home_actions_ok = 0  # successful smart-home action calls this turn
+        backed_claims: set[str] = set()  # _ClaimGuard names whose tool ran OK this turn
         claim_nudged = False  # one retry when an action is claimed but not executed
 
         while iterations < self.config.max_iterations:
@@ -909,29 +1013,26 @@ class ChatSession:
                     )
                     full_messages.append(Message(role="user", content=_NUDGE_EMPTY_REPLY))
                     continue
-                # Claimed a smart-home action that never ran: retry once with
-                # the tool still available, then flag the reply so the user is
-                # not told the light is off when it is not.
-                if (
-                    content
-                    and home_actions_ok == 0
-                    and tool_defs
-                    and any(_is_home_action_tool(t) for t in tool_defs)
-                    and _HOME_ACTION_CLAIM_RE.search(content)
-                ):
+                # Claimed an action (house, reminder, memory) that never ran:
+                # retry once with the tool still available, then flag the reply
+                # so the user is not told the light is off when it is not.
+                claim = _unbacked_claim(content, tool_defs, backed_claims)
+                if claim is not None:
                     if not claim_nudged:
                         claim_nudged = True
                         logger.warning(
-                            "Session '%s' — home action claimed without executing it; nudging",
+                            "Session '%s' — %s action claimed without executing it; nudging",
                             self.session_id,
+                            claim.name,
                         )
-                        full_messages.append(Message(role="user", content=_NUDGE_HOME_CLAIM))
+                        full_messages.append(Message(role="user", content=claim.nudge))
                         continue
                     logger.warning(
-                        "Session '%s' — home action still claimed without executing it; flagging reply",
+                        "Session '%s' — %s action still claimed without executing it; flagging reply",
                         self.session_id,
+                        claim.name,
                     )
-                    content = f"{content}{_HOME_CLAIM_WARNING}"
+                    content = f"{content}{claim.warning}"
                 # Some small local models announce "voy a reintentar / I'll call X"
                 # in plain text without emitting the structured tool_call. Nudge
                 # once only before any tool has actually run. After a tool result,
@@ -1057,10 +1158,9 @@ class ChatSession:
                 response.tool_calls, full_messages
             ):
                 tools_executed += 1
-                if _is_home_action_tool(
-                    self.tool_registry._tools.get(tc.function.name)
-                ) and not tool_result.startswith("Error"):
-                    home_actions_ok += 1
+                if not _tool_failed(tool_result):
+                    tool = self.tool_registry._tools.get(tc.function.name)
+                    backed_claims.update(g.name for g in _CLAIM_GUARDS if g.done_by(tool))
 
         # Max iterations reached
         logger.warning(
