@@ -8,12 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 FS = Path(__file__).resolve().parents[1] / "skills" / "filesystem" / "scripts" / "fs.py"
-
-# The filesystem skill is local-only (gitignored); skip on clones without it.
-pytestmark = pytest.mark.skipif(not FS.exists(), reason="local filesystem skill not present")
 
 
 def _run(args: list[str], base: str | None) -> dict:
