@@ -34,6 +34,11 @@ knowledge = [
     "python-docx>=1.1",
     "openpyxl>=3.1",
     "python-pptx>=0.6",
+    # Snowball stems for BM25 queries ("recupero" → "recuper*")
+    "py-rust-stemmers>=0.1",
+    # Vector store; the embeddings themselves can come from an HTTP server
+    # (knowledge.embedding.backend: http), without fastembed
+    "sqlite-vec>=0.1",
 ]
 # Knowledge base — semantic retrieval (local embeddings + vector store)
 knowledge-vector = [
@@ -46,6 +51,7 @@ knowledge-full = [
     "python-docx>=1.1",
     "openpyxl>=3.1",
     "python-pptx>=0.6",
+    "py-rust-stemmers>=0.1",
     "fastembed>=0.3",
     "sqlite-vec>=0.1",
 ]
@@ -56,6 +62,7 @@ dev = [
     "ruff>=0.6",
     # KB vector tests (they use a fake embedder, so no fastembed/model)
     "sqlite-vec>=0.1",
+    "py-rust-stemmers>=0.1",
 ]
 
 [build-system]

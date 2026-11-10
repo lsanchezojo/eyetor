@@ -305,16 +305,31 @@ knowledge:
     snippet_chars: 400
     rrf_k: 60
     candidate_multiplier: 3
+    full_text_hits: 3   # kb_search devuelve el texto entero de los N mejores
+  # Embeddings. Lo recomendado es un servidor aparte en GPU (backend: http,
+  # llama-server --embedding --pooling last con Qwen3-Embedding-0.6B): eyetor
+  # no carga ningún modelo. backend: fastembed los calcula en CPU dentro del
+  # proceso (~1,1 GB RSS con MiniLM). Medido con evals/kb_retrieval.py sobre
+  # unos manuales de rol en PDF (30 preguntas): solo BM25 hit@5 15/30; con
+  # Qwen3-Embedding 23/30; con embeddings + rerank 25/30 (MRR 0,42 → 0,72).
+  # Al activarlo, los chunks ya indexados se embeben solos al reindexar y
+  # cambiar de modelo regenera los vectores.
   embedding:
-    # BM25-only: fastembed/ONNX deja el proceso en ~1,1 GB RSS (medido con
-    # MiniLM y potion-multilingual sobre la KB de Dragonbane) para una mejora
-    # ligera. Al activarlo, los chunks ya indexados se embeben solos al
-    # arrancar, y cambiar de modelo regenera los vectores.
     enabled: false
+    backend: fastembed            # fastembed | http
+    # base_url: http://127.0.0.1:8090/v1   # http: endpoint OpenAI /embeddings
     model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
     model_dir: ~/.eyetor/models/fastembed
-    dim: 384
+    dim: 384                      # Qwen3-Embedding-0.6B: 1024
     batch_size: 64
+  # Rerank: un cross-encoder (llama-server --rerank, p. ej. Qwen3-Reranker-0.6B)
+  # reordena los mejores candidatos de BM25 + vectores. ~1,2 s por consulta en
+  # una Radeon 890M con 12 candidatos; más candidatos dieron peor resultado.
+  rerank:
+    enabled: false
+    # base_url: http://127.0.0.1:8091/v1
+    candidates: 12
+    max_chars: 1700
 
 # Session persistence and compaction settings
 sessions:

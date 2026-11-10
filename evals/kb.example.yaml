@@ -1,0 +1,14 @@
+# Example KB retrieval cases. Write your own in ~/.eyetor/evals/kb.yaml, about
+# the documents in YOUR knowledge base; the runner prefers that file.
+#   .venv/bin/python evals/kb_retrieval.py [-k 5] [-v]
+# A case passes when one of the top-k chunks contains one of its "needles"
+# (case-insensitive, whitespace collapsed). Phrase questions the way you would
+# ask them, not with the document's wording: that is what retrieval must bridge.
+# Pick needles from the passage that answers, distinctive enough to appear in
+# one or two chunks (check with sqlite3 ~/.eyetor/knowledge.db "select ...").
+
+- q: "¿cómo reinicio el servicio después de cambiar la configuración?"
+  needles: ["systemctl --user restart eyetor"]
+- q: "¿dónde guardo mis casos de prueba para que no acaben en el repositorio?"
+  needles: ["~/.eyetor/evals/tool_choice.yaml"]
+  workspace: default

@@ -42,3 +42,15 @@ def test_legacy_free_text_equivalent_when_typed_tool_not_offered():
 def test_example_cases_are_well_formed():
     cases = yaml.safe_load(tc.EXAMPLE_CASES.read_text(encoding="utf-8"))
     assert cases and all("input" in c and "expect" in c for c in cases)
+
+
+def test_kb_eval_ranks_and_example_file():
+    path = Path(__file__).resolve().parents[1] / "evals" / "kb_retrieval.py"
+    spec = importlib.util.spec_from_file_location("kb_retrieval_eval", path)
+    kb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(kb)
+    case = {"q": "x", "needles": ["tres  tiradas de\nmuerte", "otra"]}
+    assert kb.first_hit_rank(case, ["nada", "Tras TRES tiradas de muerte fallidas"]) == 2
+    assert kb.first_hit_rank(case, ["nada"]) is None
+    cases = yaml.safe_load(kb.EXAMPLE_CASES.read_text(encoding="utf-8"))
+    assert cases and all("q" in c and c["needles"] for c in cases)

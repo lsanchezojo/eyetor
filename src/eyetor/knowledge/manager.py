@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from eyetor.knowledge.chunker import CHUNKER_VERSION
 from eyetor.knowledge.embedder import Embedder
+from eyetor.knowledge.reranker import Reranker
 from eyetor.knowledge.indexer import IndexReport, Indexer, WorkspaceSpec
 from eyetor.knowledge.retriever import ReadResult, Retriever, SearchHit
 from eyetor.knowledge.store import KnowledgeStore
@@ -31,6 +34,7 @@ class KnowledgeManager:
         *,
         top_k_default: int = 5,
         snippet_chars: int = 400,
+        full_text_hits: int = 3,
     ) -> None:
         self.store = store
         self.indexer = indexer
@@ -38,6 +42,7 @@ class KnowledgeManager:
         self.workspaces = workspaces
         self.top_k_default = top_k_default
         self.snippet_chars = snippet_chars
+        self.full_text_hits = full_text_hits
 
     # ------------------------------------------------------------------
     # Factory
@@ -64,6 +69,8 @@ class KnowledgeManager:
             embedder=embedder,
             rrf_k=cfg.retrieval.rrf_k,
             candidate_multiplier=cfg.retrieval.candidate_multiplier,
+            reranker=Reranker.from_config(cfg.rerank),
+            rerank_candidates=cfg.rerank.candidates,
         )
         workspaces: dict[str, WorkspaceSpec] = {}
         for ws in cfg.workspaces:
@@ -81,6 +88,7 @@ class KnowledgeManager:
             workspaces=workspaces,
             top_k_default=cfg.retrieval.top_k_default,
             snippet_chars=cfg.retrieval.snippet_chars,
+            full_text_hits=cfg.retrieval.full_text_hits,
         )
 
     # ------------------------------------------------------------------
@@ -175,14 +183,28 @@ class KnowledgeManager:
         # SQLITE_MISUSE ("bad parameter or other API misuse"), so we serialize.
         if not self.workspaces:
             return {}
+        try:
+            purged = await asyncio.to_thread(self.store.purge_expired)
+            if purged:
+                logger.info("kb: purged %d expired upload(s)", purged)
+        except Exception as exc:
+            logger.warning("kb: purge of expired uploads failed: %s", exc)
+        version = str(CHUNKER_VERSION)
+        rechunk = self.store.get_meta("chunker_version") != version
+        if rechunk and not force:
+            logger.info("kb: chunker changed (v%s), re-chunking every document", version)
         out: dict[str, IndexReport] = {}
+        failed = False
         for name, spec in self.workspaces.items():
             try:
                 out[name] = await self.indexer.index_workspace(
-                    spec, force=force, prune=prune
+                    spec, force=force or rechunk, prune=prune
                 )
             except Exception as exc:
+                failed = True
                 logger.warning("kb: workspace %s failed: %s", name, exc)
+        if rechunk and not failed:
+            self.store.set_meta("chunker_version", version)
         return out
 
     # ------------------------------------------------------------------
@@ -192,6 +214,12 @@ class KnowledgeManager:
     async def search(
         self, query: str, workspace: str | None = None, top_k: int | None = None
     ) -> list[SearchHit]:
+        # Expired uploads must not answer; purging is a cheap SELECT when
+        # there is nothing to delete.
+        try:
+            await asyncio.to_thread(self.store.purge_expired)
+        except Exception as exc:
+            logger.debug("kb: purge before search failed: %s", exc)
         return await self.retriever.search(
             query=query,
             workspace=workspace,
@@ -241,15 +269,18 @@ class KnowledgeManager:
         for ws in ws_rows:
             docs = self.store.list_docs(workspace=ws["name"], limit=1000)
             summaries.append(f"{ws['name']} ({len(docs)} docs)")
+        semantic = stats.get("vector_enabled") and self.indexer.embedder is not None
         vector_note = (
-            " (hybrid BM25 + semantic)"
-            if stats.get("vector_enabled")
-            else " (BM25 only — install eyetor[knowledge-vector] for semantic)"
+            " (hybrid BM25 + semantic" + (" + rerank)" if self.retriever.reranker else ")")
+            if semantic
+            else " (BM25 only)"
         )
         lines = [
             "## Knowledge Base (on-demand)" + vector_note,
             "Workspaces available: " + ", ".join(summaries) + ".",
-            "Use kb_search(query) to retrieve ranked snippets from documentation, guides, specs and notes.",
+            "Use kb_search(query) with the question in natural language; it returns the full "
+            "text of the best passages (with their page/section) and snippets of the rest. "
+            "Answer from those passages and say where the answer comes from.",
             "Use kb_read(doc_id, section) for more context around a match.",
             "Use kb_list_sources() to discover available documents.",
             "Prefer kb_search for conceptual or factual questions; use the fs_grep tool for literal strings.",

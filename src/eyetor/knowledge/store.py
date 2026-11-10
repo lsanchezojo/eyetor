@@ -27,6 +27,51 @@ logger = logging.getLogger(__name__)
 _FTS5_EXPLICIT_OPS = {"AND", "OR", "NOT", "NEAR"}
 _WORDLIKE_RE = re.compile(r"^[\w]+$", re.UNICODE)
 
+# Function words dropped from natural-language queries: in an OR query they
+# match nearly every chunk and only add noise to the BM25 candidates.
+_STOPWORDS = frozenset(
+    """
+    a al algo algun alguna algunas alguno algunos ante antes aqui asi aun
+    cada como con contra cual cuales cuando cuanta cuantas cuanto cuantos de
+    del desde donde dos el ella ellas ello ellos en entre era eres es esa esas
+    ese eso esos esta estas este esto estos fue ha han has hay hasta la las le
+    les lo los mas me mi mis mucho muy nada ni no nos o os otra otro para pero
+    poco por porque puede pueden que quien se sea ser si sin sobre son su sus
+    tambien te ti tiene tienen todo tu tus un una unas uno unos y ya yo
+    the of and or to in on at for with is are be by from as it this that what
+    how which who can do does an
+    """.split()
+)
+
+try:  # optional: Snowball stems turn "recupero" into the prefix "recuper*"
+    from py_rust_stemmers import SnowballStemmer  # type: ignore
+
+    _STEMMER = SnowballStemmer("spanish")
+except Exception:  # pragma: no cover - depends on the environment
+    _STEMMER = None
+
+_MIN_STEM = 4  # shorter stems as prefixes match too much (e.g. "ca*")
+
+
+def _fold(word: str) -> str:
+    import unicodedata
+
+    return "".join(
+        c for c in unicodedata.normalize("NFD", word.lower()) if unicodedata.category(c) != "Mn"
+    )
+
+
+def _query_term(word: str) -> str | None:
+    """FTS5 term for one plain word: None for stopwords, ``stem*`` if stemmable."""
+    folded = _fold(word)
+    if folded in _STOPWORDS or (len(folded) < 2 and not folded.isdigit()):
+        return None
+    if _STEMMER is not None and not folded.isdigit():
+        stem = _STEMMER.stem_word(folded)
+        if len(stem) >= _MIN_STEM and stem != folded:
+            return f"{stem}*"
+    return folded
+
 
 def sanitize_fts5_query(query: str) -> str:
     """Make a natural-language query safe for FTS5.
@@ -49,6 +94,8 @@ def sanitize_fts5_query(query: str) -> str:
         return q
 
     tokens = q.split()
+    # ":" only means a column filter when glued to a word ("title:foo");
+    # "en Trey: ¿cómo...?" is natural language.
     has_explicit_op = any(t in _FTS5_EXPLICIT_OPS for t in tokens)
     if (
         has_explicit_op
@@ -56,20 +103,24 @@ def sanitize_fts5_query(query: str) -> str:
         or "(" in q
         or ")" in q
         or "*" in q
-        or ":" in q
+        or re.search(r"\w:\w", q)
     ):
         return q
 
     out: list[str] = []
     for tok in tokens:
-        stripped = tok.strip(".,;:!?")
+        stripped = tok.strip(".,;:!?¿¡()«»\"'")
         if not stripped:
             continue
         if _WORDLIKE_RE.match(stripped):
-            out.append(stripped)
+            term = _query_term(stripped)
+            if term and term not in out:
+                out.append(term)
             continue
         escaped = stripped.replace('"', '""')
         out.append(f'"{escaped}"')
+    if not out:  # only stopwords: search them rather than nothing
+        out = [w for w in (t.strip(".,;:!?¿¡") for t in tokens) if _WORDLIKE_RE.match(w)]
     return " OR ".join(out)
 
 _SQLITE_VEC_WARNING_LOGGED = False
@@ -741,6 +792,16 @@ class KnowledgeStore:
     # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
+
+    def get_meta(self, key: str) -> str | None:
+        row = self._conn.execute("SELECT value FROM kb_meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO kb_meta (key, value) VALUES (?, ?)", (key, value)
+        )
+        self._conn.commit()
 
     def stats(self) -> dict:
         ws = self._conn.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0]

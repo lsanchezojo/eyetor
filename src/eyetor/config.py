@@ -306,18 +306,49 @@ class KnowledgeRetrievalConfig(BaseModel):
     snippet_chars: int = 400
     rrf_k: int = 60
     candidate_multiplier: int = 3
+    # kb_search returns the full text of this many top hits (snippets for
+    # the rest): small models answer from what they get instead of calling
+    # kb_read, so the passage itself must be in the result.
+    full_text_hits: int = 3
 
 
 class KnowledgeEmbeddingConfig(BaseModel):
-    """Local embedding model settings (fastembed + sqlite-vec)."""
+    """Embedding model settings (vectors stored with sqlite-vec).
+
+    backend "fastembed" runs the model in-process on CPU; "http" calls an
+    OpenAI-compatible /embeddings endpoint (e.g. llama-server --embedding),
+    so the model can live on the GPU in its own process.
+    """
 
     enabled: bool = True
+    backend: str = "fastembed"  # fastembed | http
+    base_url: str = ""  # http: e.g. http://127.0.0.1:8090/v1
+    api_key: str = ""
+    timeout: float = 120.0
+    # None = by model family (see knowledge/embedder.py _PREFIXES).
+    query_prefix: str | None = None
+    passage_prefix: str | None = None
     # Must be a fastembed-supported model (TextEmbedding.list_supported_models());
     # dim must match it.
     model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     model_dir: str = "~/.eyetor/models/fastembed"
     dim: int = 384
     batch_size: int = 64
+
+
+class KnowledgeRerankConfig(BaseModel):
+    """Cross-encoder reranking of the fused BM25+vector candidates.
+
+    Calls an OpenAI/Jina-style /rerank endpoint (llama-server --rerank).
+    """
+
+    enabled: bool = False
+    base_url: str = ""  # e.g. http://127.0.0.1:8091/v1
+    model: str = ""
+    api_key: str = ""
+    candidates: int = 20  # fused candidates sent to the reranker
+    max_chars: int = 2000  # per candidate (longer chunks are cut)
+    timeout: float = 30.0
 
 
 class KnowledgeWorkspaceConfig(BaseModel):
@@ -345,6 +376,7 @@ class KnowledgeConfig(BaseModel):
     chunk: KnowledgeChunkConfig = KnowledgeChunkConfig()
     retrieval: KnowledgeRetrievalConfig = KnowledgeRetrievalConfig()
     embedding: KnowledgeEmbeddingConfig = KnowledgeEmbeddingConfig()
+    rerank: KnowledgeRerankConfig = KnowledgeRerankConfig()
 
 
 class AccessPolicy(BaseModel):

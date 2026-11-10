@@ -26,6 +26,13 @@ _CODE_BOUNDARY_RE = re.compile(
     re.MULTILINE,
 )
 
+# Bump when chunk boundaries change: KnowledgeManager.index_all re-chunks every
+# document once when the stored version differs.
+# 2: long PDF paragraphs were never split (chunks up to ~6k chars); page
+#    headings took the first marker even when the chunk started on the
+#    previous page.
+CHUNKER_VERSION = 2
+
 # Matches the page markers that ``extract_pdf`` inserts, e.g. ``[Page 12]``.
 _PAGE_MARKER_RE = re.compile(r"\[Page (\d+)\]")
 
@@ -76,38 +83,79 @@ class Chunker:
         return chunks
 
     def _split_oversized(self, text: str) -> list[str]:
+        """Pack ``text`` into pieces of at most ``max_chars`` (+ overlap).
+
+        Units are paragraphs; a paragraph longer than ``max_chars`` (common in
+        PDFs, where a whole page may have no blank line) is split by lines,
+        then sentences, then at a space. Each new piece starts with the tail
+        of the previous one (``overlap_chars``, cut at a word boundary).
+        """
         if len(text) <= self.max_chars:
             return [text]
+        units: list[str] = []
+        for para in re.split(r"\n\s*\n", text):
+            units.extend(self._fit_units(para.strip()))
         parts: list[str] = []
         buf: list[str] = []
         buf_len = 0
-        for para in re.split(r"\n\s*\n", text):
-            para = para.strip()
-            if not para:
+        for unit in units:
+            if not unit:
                 continue
-            para_len = len(para) + 2
-            if buf and buf_len + para_len > self.max_chars:
+            sep = 2 if buf else 0
+            if buf and buf_len + sep + len(unit) > self.max_chars:
                 parts.append("\n\n".join(buf))
-                if self.overlap_chars and parts[-1]:
-                    tail = parts[-1][-self.overlap_chars :]
-                    buf = [tail, para]
-                    buf_len = len(tail) + para_len
-                else:
-                    buf = [para]
-                    buf_len = para_len
-            else:
-                buf.append(para)
-                buf_len += para_len
-            while buf_len > self.max_chars and len(buf) == 1:
-                # Single paragraph exceeds cap: hard split
-                chunk = buf[0][: self.max_chars]
-                parts.append(chunk)
-                rest = buf[0][self.max_chars - self.overlap_chars :]
-                buf = [rest]
-                buf_len = len(rest)
+                tail = self._overlap_tail(parts[-1])
+                buf = [tail] if tail else []
+                buf_len = len(tail)
+                sep = 2 if buf else 0
+            buf.append(unit)
+            buf_len += sep + len(unit)
         if buf:
             parts.append("\n\n".join(buf))
         return [p for p in parts if p.strip()]
+
+    def _fit_units(self, text: str) -> list[str]:
+        """Split ``text`` into units no longer than ``max_chars``."""
+        if len(text) <= self.max_chars:
+            return [text]
+        for pattern in (r"\n", r"(?<=[.!?:;])\s+"):
+            pieces = [p.strip() for p in re.split(pattern, text) if p.strip()]
+            if len(pieces) > 1:
+                return self._pack(pieces, " " if pattern != r"\n" else "\n")
+        # One huge run without breaks: cut at the last space before the cap.
+        out: list[str] = []
+        rest = text
+        while len(rest) > self.max_chars:
+            cut = rest.rfind(" ", 0, self.max_chars)
+            if cut <= 0:
+                cut = self.max_chars
+            out.append(rest[:cut].strip())
+            rest = rest[cut:].strip()
+        if rest:
+            out.append(rest)
+        return out
+
+    def _pack(self, pieces: list[str], joiner: str) -> list[str]:
+        """Greedily join ``pieces`` into units of at most ``max_chars``."""
+        out: list[str] = []
+        cur = ""
+        for piece in pieces:
+            for sub in self._fit_units(piece) if len(piece) > self.max_chars else [piece]:
+                if cur and len(cur) + len(joiner) + len(sub) > self.max_chars:
+                    out.append(cur)
+                    cur = sub
+                else:
+                    cur = f"{cur}{joiner}{sub}" if cur else sub
+        if cur:
+            out.append(cur)
+        return out
+
+    def _overlap_tail(self, text: str) -> str:
+        if not self.overlap_chars or len(text) <= self.overlap_chars:
+            return ""
+        tail = text[-self.overlap_chars :]
+        space = tail.find(" ")
+        return tail[space + 1 :] if 0 <= space < len(tail) - 1 else tail
 
     # ------------------------------------------------------------------
     # Paragraph chunking (generic text)
@@ -122,12 +170,17 @@ class Chunker:
         # top of the page, the rest of the page has no marker).
         current_page: int | None = None
         for i, piece in enumerate(pieces):
-            match = _PAGE_MARKER_RE.search(piece)
-            if match:
-                current_page = int(match.group(1))
+            # The heading is the page the piece starts on: text before the
+            # first marker still belongs to the previous page.
+            markers = list(_PAGE_MARKER_RE.finditer(piece))
+            start_page = current_page
+            if markers and (start_page is None or not piece[: markers[0].start()].strip()):
+                start_page = int(markers[0].group(1))
+            if markers:
+                current_page = int(markers[-1].group(1))
             heading: str | None
-            if current_page is not None:
-                heading = f"Page {current_page}"
+            if start_page is not None:
+                heading = f"Page {start_page}"
             else:
                 heading = title if title else None
             chunks.append(

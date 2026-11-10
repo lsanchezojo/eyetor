@@ -12,31 +12,23 @@ def register_kb_tools(tool_registry: ToolRegistry, knowledge) -> None:
     _kb_ws_names = knowledge.list_workspaces()
     _kb_ws_desc = ", ".join(_kb_ws_names) if _kb_ws_names else "none"
 
+    full_text_hits = max(0, getattr(knowledge, "full_text_hits", 3))
+
     async def kb_search_handler(
         query: str, top_k: int = 5, workspace: str | None = None
     ) -> str:
         top_k = max(1, min(int(top_k or 5), 20))
         hits = await knowledge.search(query, workspace=workspace, top_k=top_k)
+        results = []
+        for i, h in enumerate(hits):
+            item = {"doc_id": h.doc_id, "path": h.path, "heading": h.heading}
+            if i < full_text_hits and h.content:
+                item["text"] = h.content
+            else:
+                item["snippet"] = h.snippet
+            results.append(item)
         return json.dumps(
-            {
-                "query": query,
-                "count": len(hits),
-                "results": [
-                    {
-                        "doc_id": h.doc_id,
-                        "chunk_id": h.chunk_id,
-                        "workspace": h.workspace,
-                        "path": h.path,
-                        "title": h.title,
-                        "heading": h.heading,
-                        "snippet": h.snippet,
-                        "score": round(h.score, 4),
-                        "sources": h.sources,
-                    }
-                    for h in hits
-                ],
-            },
-            ensure_ascii=False,
+            {"query": query, "count": len(hits), "results": results}, ensure_ascii=False
         )
 
     async def kb_read_handler(
@@ -93,7 +85,8 @@ def register_kb_tools(tool_registry: ToolRegistry, knowledge) -> None:
             name="kb_search",
             description=(
                 "Search the workspace knowledge base for documentation, guides, "
-                "specs and notes. Returns ranked snippets. Use this for conceptual "
+                "specs and notes. Returns the full text of the best passages and "
+                "snippets of the rest, with document and page. Use this for conceptual "
                 "or factual questions about project docs. For literal string matching "
                 "in code, prefer the fs_grep tool. "
                 f"Available workspaces: {_kb_ws_desc}."
@@ -104,8 +97,8 @@ def register_kb_tools(tool_registry: ToolRegistry, knowledge) -> None:
                     "query": {
                         "type": "string",
                         "description": (
-                            "Query string. Supports FTS5 syntax: AND, OR, NEAR, "
-                            '"quoted phrase".'
+                            "The question in natural language, in the documents' "
+                            "language (e.g. '¿qué pasa al llegar a cero puntos de golpe?')."
                         ),
                     },
                     "top_k": {

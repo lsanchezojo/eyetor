@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from eyetor.knowledge.embedder import Embedder
+from eyetor.knowledge.reranker import Reranker
 from eyetor.knowledge.store import ChunkRow
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ class SearchHit:
     snippet: str
     score: float
     sources: list[str]
+    content: str = ""  # full chunk text
 
 
 @dataclass
@@ -77,11 +79,15 @@ class Retriever:
         *,
         rrf_k: int = 60,
         candidate_multiplier: int = 3,
+        reranker: Reranker | None = None,
+        rerank_candidates: int = 20,
     ) -> None:
         self.backend = backend
         self.embedder = embedder
         self.rrf_k = rrf_k
         self.candidate_multiplier = max(1, candidate_multiplier)
+        self.reranker = reranker
+        self.rerank_candidates = max(1, rerank_candidates)
 
     async def search(
         self,
@@ -92,6 +98,8 @@ class Retriever:
         if not query.strip() or top_k <= 0:
             return []
         k_candidates = top_k * self.candidate_multiplier
+        if self.reranker is not None:
+            k_candidates = max(k_candidates, self.rerank_candidates)
 
         async def run_bm25() -> list[int]:
             return await asyncio.to_thread(
@@ -119,12 +127,31 @@ class Retriever:
         for cid in vec_ids:
             sources_map.setdefault(cid, []).append("vector")
 
-        fused_ids = rrf_fuse([bm25_ids, vec_ids], k=self.rrf_k)[:top_k]
+        fused_ids = rrf_fuse([bm25_ids, vec_ids], k=self.rrf_k)
         if not fused_ids:
             return []
 
+        rank_score: dict[int, float] = {}
+        if self.reranker is not None:
+            candidates = fused_ids[: self.rerank_candidates]
+            cand_rows = await asyncio.to_thread(self.backend.fetch_chunks, candidates)
+            try:
+                scores = await asyncio.to_thread(
+                    self.reranker.rerank, query, [r.content for r in cand_rows]
+                )
+            except Exception as exc:
+                logger.warning("Rerank failed, keeping fused order: %s", exc)
+            else:
+                order = sorted(range(len(cand_rows)), key=lambda i: scores[i], reverse=True)
+                fused_ids = [cand_rows[i].chunk_id for i in order]
+                rank_score = {cand_rows[i].chunk_id: scores[i] for i in order}
+                for cid in fused_ids[:top_k]:
+                    sources_map.setdefault(cid, []).append("rerank")
+        fused_ids = fused_ids[:top_k]
+
         rows = await asyncio.to_thread(self.backend.fetch_chunks, fused_ids)
-        rank_score = {cid: 1.0 / (1 + i) for i, cid in enumerate(fused_ids)}
+        if not rank_score:
+            rank_score = {cid: 1.0 / (1 + i) for i, cid in enumerate(fused_ids)}
         hits: list[SearchHit] = []
         for row in rows:
             snippet = row.content[:400] + ("…" if len(row.content) > 400 else "")
@@ -146,6 +173,7 @@ class Retriever:
                     snippet=snippet,
                     score=rank_score.get(row.chunk_id, 0.0),
                     sources=sources_map.get(row.chunk_id, []),
+                    content=row.content,
                 )
             )
         return hits

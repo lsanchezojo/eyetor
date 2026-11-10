@@ -67,8 +67,11 @@ detected system; arbitrary shell commands are not enabled through this helper.
 - Core: `httpx`, `pyyaml`, `pydantic`, `rich`, `click`, `apscheduler`
 - Optional (telegram): `aiogram`
 - Optional (voice): `faster-whisper` — local speech-to-text for voice notes
-- Optional (knowledge): `pypdf`, `python-docx`, `openpyxl`, `python-pptx`
-- Optional (knowledge-vector): `fastembed`, `sqlite-vec`
+- Optional (knowledge): `pypdf`, `python-docx`, `openpyxl`, `python-pptx`,
+  `py-rust-stemmers` (Spanish stems for BM25), `sqlite-vec`
+- Optional (knowledge-vector): `fastembed` — only for in-process CPU embeddings;
+  embeddings and reranking can instead come from llama-server on the GPU, see
+  [Knowledge base retrieval](#knowledge-base-retrieval)
 
 To install knowledge-base extras too:
 
@@ -117,6 +120,43 @@ Nothing is executed, so cases like "apaga la luz" are safe:
 It reads `~/.eyetor/evals/tool_choice.yaml` (keep your real requests there, out
 of the repo) or falls back to `evals/tool_choice.example.yaml`, which documents
 the case format. Run it before and after changing models, prompts or tools.
+
+### Knowledge base retrieval
+
+`kb_search` combines BM25 (FTS5, with stopwords dropped and Snowball stem
+prefixes) and vector search, fuses them with RRF and, optionally, reranks the
+top candidates with a cross-encoder. The best passages come back in full, the
+rest as snippets. For embeddings and reranking on the GPU, run two
+llama-server instances and point eyetor at them in `~/.eyetor/config.yaml`:
+
+```bash
+llama-server -m Qwen3-Embedding-0.6B-Q8_0.gguf --embedding --pooling last -c 4096 -b 2048 -ub 2048 --port 8090
+llama-server -m qwen3-reranker-0.6b-q8_0.gguf --rerank -c 4096 -b 2048 -ub 2048 --port 8091
+```
+
+```yaml
+knowledge:
+  embedding: {enabled: true, backend: http, base_url: http://127.0.0.1:8090/v1,
+              model: Qwen3-Embedding-0.6B, dim: 1024, batch_size: 16}
+  rerank: {enabled: true, base_url: http://127.0.0.1:8091/v1, candidates: 12}
+```
+
+Existing chunks get their vectors on the next reindex, and changing the model
+rebuilds them. If a server is down, search falls back to BM25 (and to the
+fused order without reranking).
+
+`evals/kb_retrieval.py` measures it: each case is a question plus phrases from
+the passage that answers it, and the script reports hit@1/3/k, MRR and latency.
+`--set` overrides `knowledge` keys to compare variants, `--db` points at a copy
+of the database, and `--reindex` re-chunks it:
+
+```bash
+cp ~/.eyetor/knowledge.db /tmp/kb.db
+.venv/bin/python evals/kb_retrieval.py --db /tmp/kb.db --set rerank.enabled=false -v
+```
+
+It reads `~/.eyetor/evals/kb.yaml` (questions about your own documents) or
+falls back to `evals/kb.example.yaml`.
 
 ## Configuration
 
