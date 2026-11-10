@@ -110,6 +110,17 @@ class VoiceChannelConfig(BaseModel):
     # After answering, listen this long for a follow-up without the wake word
     followup_seconds: float = 5.0
     chime: bool = True
+    # Idle housekeeping, run when a conversation ends (nobody is waiting) and
+    # followed by a prompt-cache warm-up: archive all but the last
+    # history_keep_turns once there are more than history_max_turns, and
+    # stub tool results older than stale_tool_turns (stale home snapshots).
+    # Keeps the prompt small so the 70% compaction never fires mid-command.
+    history_max_turns: int = 20
+    history_keep_turns: int = 12
+    stale_tool_turns: int = 3
+    # Re-warm the prompt cache every N seconds while idle: costs ~0.2 s when
+    # it is still warm and refills it after the LLM server restarts (0 = off).
+    rewarm_interval: float = 600.0
 
 
 class ChannelsConfig(BaseModel):

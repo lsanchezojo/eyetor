@@ -62,6 +62,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Start of the note that replaces stale tool results (see trim_history).
+_STALE_TOOL_PREFIX = '{"omitted": '
+
 
 class ChatSession:
     """A single ongoing conversation with an agent.
@@ -1081,20 +1084,104 @@ class ChatSession:
             logger.info("Archived pre-compaction messages to %s", result.archived_path)
 
         self._messages = result.new_messages
+        if self._rewrite_persisted():
+            logger.info(
+                "Rewrote session JSONL after compaction (%d messages)",
+                len(self._messages),
+            )
 
-        if self._persist_path:
-            try:
-                with open(self._persist_path, "w", encoding="utf-8") as f:
-                    for msg in self._messages:
-                        f.write(
-                            json.dumps(
-                                msg.model_dump(exclude_none=True), ensure_ascii=False
-                            )
-                            + "\n"
-                        )
-                logger.info(
-                    "Rewrote session JSONL after compaction (%d messages)",
-                    len(self._messages),
+    def _rewrite_persisted(self) -> bool:
+        """Write the in-memory history over the session JSONL."""
+        if not self._persist_path:
+            return False
+        try:
+            tmp = self._persist_path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                for msg in self._messages:
+                    f.write(json.dumps(msg.model_dump(exclude_none=True), ensure_ascii=False) + "\n")
+            tmp.replace(self._persist_path)
+            return True
+        except Exception as e:
+            logger.warning("Failed to rewrite session JSONL %s: %s", self._persist_path, e)
+            return False
+
+    def trim_history(
+        self,
+        *,
+        max_user_turns: int,
+        keep_user_turns: int,
+        stale_tool_turns: int,
+        stub_min_chars: int = 300,
+    ) -> dict | None:
+        """Shrink the stored history in one go; meant for idle time.
+
+        - More than ``max_user_turns`` user turns: archive everything before
+          the last ``keep_user_turns`` (the gap between both numbers means
+          this happens once in a while, not every turn).
+        - Tool results older than the last ``stale_tool_turns`` user turns
+          (and longer than ``stub_min_chars``) are replaced by a short note:
+          they are stale snapshots (e.g. the whole home state) the model must
+          re-query anyway. The assistant's replies, which carry what was
+          concluded from them, stay.
+
+        Every change rewrites the prompt prefix, so callers should run this
+        when nobody is waiting and warm the prompt cache afterwards.
+        Returns what changed, or None if nothing did.
+        """
+        users = [i for i, m in enumerate(self._messages) if m.role == "user"]
+        dropped: list[Message] = []
+        if keep_user_turns > 0 and len(users) > max(max_user_turns, keep_user_turns):
+            cut = users[-keep_user_turns]
+            dropped = self._messages[:cut]
+            self._messages = self._messages[cut:]
+            users = [i for i, m in enumerate(self._messages) if m.role == "user"]
+
+        stubbed = saved = 0
+        if stale_tool_turns > 0 and len(users) > stale_tool_turns:
+            boundary = users[-stale_tool_turns]
+            for i in range(boundary):
+                msg = self._messages[i]
+                content = msg.content or ""
+                if msg.role != "tool" or len(content) <= stub_min_chars or content.startswith(_STALE_TOOL_PREFIX):
+                    continue
+                note = (
+                    f'{_STALE_TOOL_PREFIX}"resultado de una consulta antigua ({len(content)} '
+                    'caracteres) omitido; si hace falta el dato actual, vuelve a llamar a '
+                    'la herramienta"}'
                 )
-            except Exception as e:
-                logger.warning("Failed to rewrite JSONL after compaction: %s", e)
+                self._messages[i] = msg.model_copy(update={"content": note})
+                stubbed += 1
+                saved += len(content) - len(note)
+
+        if not dropped and not stubbed:
+            return None
+        archived = self._archive_trimmed(dropped) if dropped else None
+        self._rewrite_persisted()
+        stats = {
+            "dropped_messages": len(dropped),
+            "stubbed_tool_results": stubbed,
+            "chars_saved": saved + sum(len(m.content or "") for m in dropped),
+            "archived": str(archived) if archived else None,
+        }
+        logger.info("Session '%s' — history trimmed: %s", self.session_id, stats)
+        return stats
+
+    def _archive_trimmed(self, messages: list[Message]) -> Path | None:
+        if not self._persist_path:
+            return None
+        from datetime import datetime
+
+        archive_dir = self._persist_path.parent / "archive"
+        if self._compactor is not None and self._compactor._config.archive_dir:
+            archive_dir = Path(self._compactor._config.archive_dir).expanduser()
+        try:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = archive_dir / f"{self._persist_path.stem}.{stamp}.trimmed.jsonl"
+            with open(path, "w", encoding="utf-8") as f:
+                for msg in messages:
+                    f.write(json.dumps(msg.model_dump(exclude_none=True), ensure_ascii=False) + "\n")
+            return path
+        except Exception as e:
+            logger.warning("Could not archive trimmed history: %s", e)
+            return None

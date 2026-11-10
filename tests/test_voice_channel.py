@@ -78,3 +78,52 @@ def test_strip_wake_phrase():
     assert _strip_wake_phrase("Oye Aitor, ¿qué hora es?") == "¿qué hora es?"
     assert _strip_wake_phrase("Enciende el flexo.") == "Enciende el flexo."
     assert _strip_wake_phrase("Javier ha llamado") == "Javier ha llamado"
+
+
+class _FakeSession:
+    def __init__(self, changed) -> None:
+        self.changed = changed
+        self.trims: list[dict] = []
+        self.warms = 0
+
+    def trim_history(self, **kw):
+        self.trims.append(kw)
+        return self.changed
+
+    async def warm_up(self):
+        self.warms += 1
+
+
+class _FakeManager:
+    def __init__(self, session) -> None:
+        self.session = session
+
+    def get_or_create(self, sid):
+        return self.session
+
+
+def test_housekeeping_rewarms_only_when_history_changed():
+    async def go(changed):
+        s = _FakeSession(changed)
+        ch = VoiceChannel(session_manager=_FakeManager(s), cfg=VoiceChannelConfig(history_keep_turns=7))
+        ch._housekeeping()
+        if ch._warm_task:
+            await ch._warm_task
+        return s
+
+    s = asyncio.run(go({"stubbed_tool_results": 2}))
+    assert s.warms == 1 and s.trims[0]["keep_user_turns"] == 7
+    assert asyncio.run(go(None)).warms == 0
+
+
+def test_warm_up_after_current_waits_and_runs_again():
+    async def go():
+        s = _FakeSession(None)
+        ch = VoiceChannel(session_manager=_FakeManager(s), cfg=VoiceChannelConfig())
+        ch._start_warm_up()
+        ch._start_warm_up()  # already running: ignored
+        ch._start_warm_up(after_current=True)  # prefix changed: queued after it
+        await ch._warm_task
+        return s.warms
+
+    assert asyncio.run(go()) == 2

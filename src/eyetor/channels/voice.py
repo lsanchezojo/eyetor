@@ -126,6 +126,7 @@ class VoiceChannel(BaseChannel):
         self._chime = b""
         self._warm_task: asyncio.Task | None = None
         self._wake_tail: list[np.ndarray] = []
+        self._in_conversation = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -142,6 +143,8 @@ class VoiceChannel(BaseChannel):
         self._chime = _chime_pcm(self._voice.config.sample_rate)
         self._task = asyncio.current_task()
         reader = asyncio.create_task(self._read_mic())
+        rewarm = asyncio.create_task(self._rewarm_loop())
+        self._housekeeping()  # warms the cache itself when it trims
         self._start_warm_up()
         logger.info(
             "Voice channel listening (input=%s, wake word=%s, threshold=%.2f)",
@@ -152,11 +155,17 @@ class VoiceChannel(BaseChannel):
         try:
             while self._running:
                 await self._wait_for_wake_word()
-                await self._conversation()
+                self._in_conversation = True
+                try:
+                    await self._conversation()
+                finally:
+                    self._in_conversation = False
+                self._housekeeping()
         except asyncio.CancelledError:
             pass
         finally:
             reader.cancel()
+            rewarm.cancel()
             self._running = False
             await self._kill_mic()
 
@@ -366,18 +375,24 @@ class VoiceChannel(BaseChannel):
     # Conversation
     # ------------------------------------------------------------------
 
-    def _start_warm_up(self) -> None:
+    def _start_warm_up(self, *, after_current: bool = False) -> None:
         """Refill the LLM prompt cache in the background.
 
-        The local server has a single slot shared with every other channel,
-        so any Telegram or scheduler turn evicts the voice prefix. Warming up
-        on the wake word overlaps that prefill with the user speaking.
+        The local server has a single slot shared with every other channel;
+        its RAM prompt cache usually restores the voice prefix, but not after
+        a server restart. Warming up on the wake word overlaps any prefill
+        with the user speaking. ``after_current``: the prefix just changed, so
+        warm again even if a warm-up is already running.
         """
-        if self._warm_task and not self._warm_task.done():
+        running = self._warm_task is not None and not self._warm_task.done()
+        if running and not after_current:
             return
-        self._warm_task = asyncio.create_task(self._warm_up())
+        previous = self._warm_task if running else None
+        self._warm_task = asyncio.create_task(self._warm_up(previous))
 
-    async def _warm_up(self) -> None:
+    async def _warm_up(self, previous: asyncio.Task | None = None) -> None:
+        if previous is not None:
+            await asyncio.gather(previous, return_exceptions=True)
         t0 = time.monotonic()
         try:
             await self._manager.get_or_create(self._cfg.session_id).warm_up()
@@ -385,6 +400,30 @@ class VoiceChannel(BaseChannel):
             logger.warning("Voice: prompt cache warm-up failed: %s", exc)
             return
         logger.info("Voice: prompt cache warmed in %.1fs", time.monotonic() - t0)
+
+    async def _rewarm_loop(self) -> None:
+        interval = self._cfg.rewarm_interval
+        if interval <= 0:
+            return
+        while self._running:
+            await asyncio.sleep(interval)
+            if not self._in_conversation:
+                self._start_warm_up()
+
+    def _housekeeping(self) -> None:
+        """Shrink the voice history while idle, then re-warm the cache."""
+        session = self._manager.get_or_create(self._cfg.session_id)
+        try:
+            changed = session.trim_history(
+                max_user_turns=self._cfg.history_max_turns,
+                keep_user_turns=self._cfg.history_keep_turns,
+                stale_tool_turns=self._cfg.stale_tool_turns,
+            )
+        except Exception as exc:
+            logger.warning("Voice: history housekeeping failed: %s", exc)
+            return
+        if changed:
+            self._start_warm_up(after_current=True)
 
     async def _conversation(self) -> None:
         self._start_warm_up()

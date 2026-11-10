@@ -168,6 +168,18 @@ channels:
   # Actívalo en ~/.eyetor/config.yaml con enabled, input_device, wake_word_model…
   voice:
     enabled: false
+    # Mantenimiento en reposo (al acabar cada conversación, nadie esperando):
+    # con más de history_max_turns turnos se archivan todos menos los últimos
+    # history_keep_turns, y los resultados de herramientas de más de
+    # stale_tool_turns turnos atrás se sustituyen por una nota (estados viejos
+    # de la casa). Después se recalienta la caché del prompt. Así el prompt de
+    # voz no crece hasta la compactación, que se haría en mitad de una orden.
+    # history_max_turns: 20
+    # history_keep_turns: 12
+    # stale_tool_turns: 3
+    # Recalentar la caché del prompt cada N s en reposo: ~0,2 s si sigue
+    # caliente; la rellena si el servidor LLM se ha reiniciado (0 = no).
+    # rewarm_interval: 600
 
 scheduler:
   enabled: true
