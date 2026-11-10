@@ -75,8 +75,48 @@ class App:
         )
 
 
-def build_system_prompt(cfg, *, use_host_tools: bool, host_profile: dict, skill_reg) -> str:
-    """Base system prompt: identity, tool-use rules, date, host, skills, AGENTS.md."""
+def model_display_name(pcfg, key: str) -> str:
+    """Human name of a provider's model, for the system prompt."""
+    if pcfg.display_name:
+        return pcfg.display_name
+    model = (pcfg.model or "").strip()
+    if pcfg.type == "llamacpp" and model in ("", "default"):
+        # llama-server serves whatever GGUF it was started with: ask it.
+        try:
+            import httpx
+
+            resp = httpx.get(f"{pcfg.base_url.rstrip('/')}/models", timeout=2.0)
+            resp.raise_for_status()
+            body = resp.json()
+            entries = body.get("data") or body.get("models") or []
+            ident = entries[0].get("id") or entries[0].get("model") or entries[0].get("name")
+            if ident:
+                return Path(ident).name.removesuffix(".gguf")
+        except Exception as exc:
+            logger.info("Could not ask %s for its model name: %s", pcfg.base_url, exc)
+        return key
+    return model or key
+
+
+def describe_models(cfg, chain: list[str]) -> str:
+    """Line naming the primary LLM, appended to the host environment facts.
+
+    Wording measured with the tool_choice eval on Bolt: a plain fact is
+    harmless, but an imperative sentence, the fallback list or a mention of
+    it running "locally" pulled requests like "where is X cheapest" towards
+    web_search (8/8 → 1-2/8).
+    """
+    for key in chain:
+        pcfg = cfg.providers.get(key)
+        if pcfg is not None:
+            return f"Eyetor is powered by {model_display_name(pcfg, key)}"
+    return ""
+
+
+def build_system_prompt(
+    cfg, *, use_host_tools: bool, host_profile: dict, skill_reg, model_chain: list[str] | None = None
+) -> str:
+    """Base system prompt: identity, tool-use rules, models, date, host, skills, AGENTS.md."""
     from eyetor.host_info import format_host_prompt
 
     if use_host_tools:
@@ -105,6 +145,9 @@ def build_system_prompt(cfg, *, use_host_tools: bool, host_profile: dict, skill_
     base_system = f"{base_system}\n\nCurrent date/time: {now_str}"
 
     host_context = format_host_prompt(host_profile)
+    models_line = describe_models(cfg, model_chain or [])
+    if models_line:
+        host_context = f"{host_context}\n{models_line}" if host_context else models_line
     if host_context:
         base_system = f"{base_system}\n\n{host_context}"
 
@@ -185,7 +228,11 @@ async def build_app(
     agent_reg.discover(cfg.agents_dirs)
 
     base_system = build_system_prompt(
-        cfg, use_host_tools=use_host_tools, host_profile=host_profile, skill_reg=skill_reg
+        cfg,
+        use_host_tools=use_host_tools,
+        host_profile=host_profile,
+        skill_reg=skill_reg,
+        model_chain=cfg.fallback.fallback_chain if agent_provider == "fallback" else [agent_provider],
     )
 
     plugin_registry = None

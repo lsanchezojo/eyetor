@@ -6,6 +6,9 @@
 # sustituyen al de aquí. (Con `eyetor -c fichero.yaml` se usa solo ese fichero.)
 
 providers:
+  # Cada proveedor admite display_name: el nombre que da el asistente si le
+  # preguntan qué modelo es (por defecto el id del modelo; con llama.cpp y
+  # model: default, el nombre del GGUF cargado). Se usa el primero de la cadena.
   openrouter:
     type: openrouter
     ssl_verify: false

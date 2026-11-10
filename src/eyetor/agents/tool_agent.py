@@ -103,9 +103,9 @@ class ToolAgent:
                 messages.append(Message(
                     role="user",
                     content=(
-                        "IMPORTANT: You seem to be stuck in a loop calling the same tools repeatedly. "
-                        "Please provide your final answer now using the information you already have. "
-                        "Do NOT call any more tools."
+                        "IMPORTANTE: estás repitiendo las mismas llamadas a herramientas en bucle. "
+                        "Da ahora tu respuesta final, en español, con la información que ya tienes. "
+                        "NO llames a más herramientas."
                     ),
                 ))
                 with tracking_context(

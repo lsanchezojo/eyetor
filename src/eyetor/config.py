@@ -18,6 +18,9 @@ class ProviderConfig(BaseModel):
     base_url: str
     api_key: str | None = None
     model: str
+    # Name the assistant gives when asked which model it is (default: the
+    # model id, or for llama.cpp with model "default" the loaded GGUF name)
+    display_name: str | None = None
     ssl_verify: bool | str = True  # False to disable, or path to CA bundle
     temperature: float = 0.7  # Sampling temperature sent in every request
     thinking: bool = False  # Enable thinking/reasoning mode (llamacpp/ollama)
