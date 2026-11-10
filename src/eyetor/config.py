@@ -312,7 +312,9 @@ class KnowledgeEmbeddingConfig(BaseModel):
     """Local embedding model settings (fastembed + sqlite-vec)."""
 
     enabled: bool = True
-    model: str = "intfloat/multilingual-e5-small"
+    # Must be a fastembed-supported model (TextEmbedding.list_supported_models());
+    # dim must match it.
+    model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     model_dir: str = "~/.eyetor/models/fastembed"
     dim: int = 384
     batch_size: int = 64

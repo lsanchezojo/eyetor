@@ -47,7 +47,11 @@ class KnowledgeManager:
     def from_config(cls, cfg: "KnowledgeConfig") -> "KnowledgeManager":
         embedder = Embedder.from_config(cfg.embedding)
         dim = embedder.dim if embedder is not None else 384
-        store = KnowledgeStore.from_path(cfg.db_path, vector_dim=dim)
+        store = KnowledgeStore.from_path(
+            cfg.db_path,
+            vector_dim=dim,
+            vector_model=embedder.model_name if embedder is not None else None,
+        )
         indexer = Indexer(
             store=store,
             embedder=embedder,

@@ -42,6 +42,7 @@ class IndexReport:
     pruned: int = 0
     errors: int = 0
     chunks_written: int = 0
+    vectors_backfilled: int = 0
     duration_s: float = 0.0
 
     def as_dict(self) -> dict:
@@ -55,6 +56,7 @@ class IndexReport:
             "pruned": self.pruned,
             "errors": self.errors,
             "chunks_written": self.chunks_written,
+            "vectors_backfilled": self.vectors_backfilled,
             "duration_s": round(self.duration_s, 2),
         }
 
@@ -264,6 +266,7 @@ class Indexer:
 
         if prune:
             report.pruned = self._prune_removed(spec.name, seen_rel)
+        report.vectors_backfilled = self._backfill_vectors(spec.name)
 
         report.duration_s = time.monotonic() - start
         logger.info(
@@ -314,6 +317,31 @@ class Indexer:
         except Exception as exc:
             logger.warning("Embedding failed, falling back to BM25-only for this doc: %s", exc)
             return None
+
+    def _backfill_vectors(self, workspace: str, batch: int = 256) -> int:
+        """Embed chunks stored without a vector (e.g. indexed before
+        sqlite-vec/fastembed were installed). Unchanged docs are skipped by
+        the sha1 check, so without this they would never get one."""
+        if self.embedder is None or not getattr(self.store, "vector_enabled", False):
+            return 0
+        done = 0
+        while True:
+            missing = self.store.chunks_missing_vectors(workspace, limit=batch)
+            if not missing:
+                break
+            ids = [cid for cid, _ in missing]
+            try:
+                vectors = self.embedder.embed_documents([text for _, text in missing])
+            except Exception as exc:
+                logger.warning("kb: vector backfill failed for %s: %s", workspace, exc)
+                break
+            written = self.store.add_vectors(ids, vectors)
+            done += written
+            if written < len(ids):  # wrong dimension: retrying would loop forever
+                break
+        if done:
+            logger.info("kb: workspace=%s backfilled %d chunk vectors", workspace, done)
+        return done
 
     def _prune_removed(self, workspace: str, seen_rel: set[str]) -> int:
         pruned = 0

@@ -54,6 +54,8 @@ dev = [
     "pytest>=8",
     "numpy>=1.24",
     "ruff>=0.6",
+    # KB vector tests (they use a fake embedder, so no fastembed/model)
+    "sqlite-vec>=0.1",
 ]
 
 [build-system]

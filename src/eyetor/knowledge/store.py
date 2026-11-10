@@ -10,10 +10,13 @@ If sqlite-vec is unavailable, the store falls back transparently to BM25-only:
 
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 import re
 import sqlite3
 import struct
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -118,6 +121,11 @@ PRAGMA journal_mode = WAL;
 PRAGMA synchronous  = NORMAL;
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE IF NOT EXISTS kb_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS workspaces (
     name        TEXT PRIMARY KEY,
     root_path   TEXT NOT NULL,
@@ -184,13 +192,26 @@ def _encode_vector(vec: list[float]) -> bytes:
 class KnowledgeStore:
     """SQLite store for knowledge-base workspaces/docs/chunks with FTS5 + vec."""
 
-    def __init__(self, db_path: str | Path, *, vector_dim: int = 384) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        vector_dim: int = 384,
+        vector_model: str | None = None,
+    ) -> None:
         path = Path(db_path).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
         self._path = path
         self._vector_dim = vector_dim
+        # Model that produces the stored vectors; None = no embedder this run
+        # (stored vectors are then left alone).
+        self._vector_model = vector_model
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # One connection is shared by the event loop and worker threads
+        # (background reindex, uploads, searches); every public method holds
+        # this lock, see _serialize_public_methods at the end of the module.
+        self._lock = threading.RLock()
         self.vector_enabled = self._try_load_sqlite_vec()
         self._conn.executescript(_DDL)
         self._migrate()
@@ -212,8 +233,14 @@ class KnowledgeStore:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_path(cls, db_path: str | Path, *, vector_dim: int = 384) -> "KnowledgeStore":
-        return cls(db_path, vector_dim=vector_dim)
+    def from_path(
+        cls,
+        db_path: str | Path,
+        *,
+        vector_dim: int = 384,
+        vector_model: str | None = None,
+    ) -> "KnowledgeStore":
+        return cls(db_path, vector_dim=vector_dim, vector_model=vector_model)
 
     def _try_load_sqlite_vec(self) -> bool:
         global _SQLITE_VEC_WARNING_LOGGED
@@ -241,6 +268,25 @@ class KnowledgeStore:
             return False
 
     def _create_vec_table(self) -> None:
+        # Vectors from another model (or dimension) are not comparable with
+        # the current one's: drop them and let the indexer backfill.
+        if self._vector_model is not None:
+            signature = f"{self._vector_model}:{self._vector_dim}"
+            row = self._conn.execute(
+                "SELECT value FROM kb_meta WHERE key = 'vector_signature'"
+            ).fetchone()
+            if row is None or row[0] != signature:
+                if row is not None:
+                    logger.info(
+                        "kb: embedding model changed (%s → %s), rebuilding vectors",
+                        row[0],
+                        signature,
+                    )
+                self._conn.execute("DROP TABLE IF EXISTS chunks_vec")
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO kb_meta (key, value) VALUES ('vector_signature', ?)",
+                    (signature,),
+                )
         self._conn.execute(
             f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
@@ -432,27 +478,62 @@ class KnowledgeStore:
             )
             new_ids.append(cur.lastrowid)
 
-        if (
-            embeddings
-            and self.vector_enabled
-            and len(embeddings) == len(new_ids)
-        ):
-            for chunk_id, emb in zip(new_ids, embeddings):
-                if len(emb) != self._vector_dim:
-                    logger.warning(
-                        "Skipping embedding for chunk %d: expected dim %d, got %d",
-                        chunk_id,
-                        self._vector_dim,
-                        len(emb),
-                    )
-                    continue
-                self._conn.execute(
-                    "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)",
-                    (chunk_id, _encode_vector(emb)),
-                )
+        if embeddings and len(embeddings) == len(new_ids):
+            self._insert_vectors(zip(new_ids, embeddings))
 
         self._conn.commit()
         return new_ids
+
+    def _insert_vectors(self, pairs) -> int:
+        if not self.vector_enabled:
+            return 0
+        written = 0
+        for chunk_id, emb in pairs:
+            if len(emb) != self._vector_dim:
+                logger.warning(
+                    "Skipping embedding for chunk %d: expected dim %d, got %d",
+                    chunk_id,
+                    self._vector_dim,
+                    len(emb),
+                )
+                continue
+            self._conn.execute(
+                "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)",
+                (chunk_id, _encode_vector(emb)),
+            )
+            written += 1
+        return written
+
+    def chunks_missing_vectors(
+        self, workspace: str, limit: int = 256
+    ) -> list[tuple[int, str]]:
+        """(chunk_id, content) of chunks in ``workspace`` with no embedding yet.
+
+        Chunks indexed while sqlite-vec or fastembed were unavailable (or
+        whose embedding failed) have none; the indexer backfills them.
+        """
+        if not self.vector_enabled:
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT c.id, c.content FROM chunks c
+            JOIN docs d ON d.id = c.doc_id
+            WHERE d.workspace = ?
+              AND c.id NOT IN (SELECT chunk_id FROM chunks_vec)
+            ORDER BY c.id
+            LIMIT ?
+            """,
+            (workspace, limit),
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def add_vectors(self, chunk_ids: list[int], embeddings: list[list[float]]) -> int:
+        """Store embeddings for existing chunks. Returns how many were written."""
+        if len(chunk_ids) != len(embeddings):
+            raise ValueError("chunk_ids and embeddings differ in length")
+        written = self._insert_vectors(zip(chunk_ids, embeddings))
+        self._conn.commit()
+        return written
 
     def _delete_vec_rows(self, chunk_ids: list[int]) -> None:
         if not chunk_ids or not self.vector_enabled:
@@ -510,6 +591,10 @@ class KnowledgeStore:
             )
             return []
         vec_blob = _encode_vector(query_embedding)
+        # sqlite-vec picks the k nearest chunks of ALL workspaces before the
+        # workspace filter applies; oversample so a small workspace next to a
+        # big one still gets hits. (vec0 caps k at 4096.)
+        knn_k = k if workspace is None else min(max(k * 10, 200), 4096)
         # sqlite-vec's KNN uses `embedding MATCH ? AND k = ?`.
         sql = """
             SELECT c.id AS id
@@ -523,12 +608,12 @@ class KnowledgeStore:
         """
         try:
             rows = self._conn.execute(
-                sql, (vec_blob, k, workspace, workspace)
+                sql, (vec_blob, knn_k, workspace, workspace)
             ).fetchall()
         except sqlite3.OperationalError as exc:
             logger.debug("vector_search failed: %s", exc)
             return []
-        return [r["id"] for r in rows]
+        return [r["id"] for r in rows][:k]
 
     def fetch_chunks(self, chunk_ids: list[int]) -> list[ChunkRow]:
         """Hydrate a list of chunk ids with their content and doc metadata."""
@@ -676,3 +761,23 @@ class KnowledgeStore:
 
     def close(self) -> None:
         self._conn.close()
+
+
+def _serialize_public_methods(cls: type) -> type:
+    """Make every public method of ``cls`` hold ``self._lock``."""
+
+    def locked(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            with self._lock:
+                return fn(self, *args, **kwargs)
+
+        return wrapper
+
+    for name, member in list(vars(cls).items()):
+        if not name.startswith("_") and inspect.isfunction(member):
+            setattr(cls, name, locked(member))
+    return cls
+
+
+_serialize_public_methods(KnowledgeStore)

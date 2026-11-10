@@ -306,7 +306,11 @@ knowledge:
     rrf_k: 60
     candidate_multiplier: 3
   embedding:
-    enabled: false   # BM25-only: evita cargar fastembed/ONNX (~400 MB RAM residentes)
+    # BM25-only: fastembed/ONNX deja el proceso en ~1,1 GB RSS (medido con
+    # MiniLM y potion-multilingual sobre la KB de Dragonbane) para una mejora
+    # ligera. Al activarlo, los chunks ya indexados se embeben solos al
+    # arrancar, y cambiar de modelo regenera los vectores.
+    enabled: false
     model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
     model_dir: ~/.eyetor/models/fastembed
     dim: 384
