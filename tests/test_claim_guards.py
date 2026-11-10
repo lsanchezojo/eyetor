@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import asyncio
 
-from eyetor.chat.session import ChatSession, _MEMORY_CLAIM_RE, _REMINDER_CLAIM_RE
+from eyetor.chat.guards import _MEMORY_CLAIM_RE, _REMINDER_CLAIM_RE
+from eyetor.chat.session import ChatSession
 from eyetor.models.agents import AgentConfig
 from eyetor.models.messages import CompletionResult, FunctionCall, Message, ToolCall
 from eyetor.models.tools import ToolDefinition, ToolRegistry

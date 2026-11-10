@@ -229,7 +229,6 @@ def extract_docx(path: Path) -> ExtractedDoc | None:
     current_start = 0
 
     def flush_section(end_line: int) -> None:
-        nonlocal current_path, current_start
         if current_path is not None and end_line >= current_start:
             sections.append(
                 ExtractedSection(

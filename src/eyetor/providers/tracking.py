@@ -5,11 +5,15 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, AsyncIterator
 
 from eyetor.models.messages import CompletionResult, Message, StreamingResponse
 from eyetor.models.tools import ToolDefinition
 from eyetor.providers.base import BaseProvider
+
+if TYPE_CHECKING:
+    from eyetor.tracking.pricing import CostEstimator
+    from eyetor.tracking.usage import UsageTracker
 
 logger = logging.getLogger(__name__)
 

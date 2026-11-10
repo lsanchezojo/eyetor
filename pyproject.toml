@@ -49,6 +49,12 @@ knowledge-full = [
     "fastembed>=0.3",
     "sqlite-vec>=0.1",
 ]
+# Development: tests (numpy is used by the voice-channel tests) and linting
+dev = [
+    "pytest>=8",
+    "numpy>=1.24",
+    "ruff>=0.6",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -59,3 +65,10 @@ packages = ["src/eyetor"]
 
 [project.scripts]
 eyetor = "eyetor.cli:main_sync"
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+# Real errors only (pyflakes + syntax); style is not enforced.
+select = ["F", "E9"]

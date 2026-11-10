@@ -89,6 +89,14 @@ source .venv/bin/activate
 pip install -e ".[telegram]"
 ```
 
+Tests and lint (the same checks CI runs on every push, see `.github/workflows/ci.yml`):
+
+```bash
+pip install -e ".[telegram,dev]"
+ruff check src tests evals skills
+pytest -q
+```
+
 If the service is running, restart it to pick up the new code:
 
 ```bash

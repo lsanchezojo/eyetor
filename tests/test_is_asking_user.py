@@ -1,4 +1,4 @@
-"""Tests for eyetor.chat.session._is_asking_user.
+"""Tests for eyetor.chat.guards._is_asking_user.
 
 Regression coverage for a false-positive in the announce-without-call nudge
 gate: a '?' inside a URL query string (e.g. `?item=10523`) or inside a code
@@ -8,7 +8,7 @@ and let the model end its turn with an unfulfilled announcement.
 
 from __future__ import annotations
 
-from eyetor.chat.session import (
+from eyetor.chat.guards import (
     _is_asking_user,
     _is_user_confirmation,
     _last_assistant_proposed_action,

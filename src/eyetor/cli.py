@@ -549,10 +549,10 @@ def mcp_list(ctx: click.Context) -> None:
         for name, srv in cfg.mcp_servers.items():
             endpoint = srv.url or f"{srv.command} {' '.join(srv.args)}"
             if name in report.failed:
-                status = f"[red]✗ Offline[/red]"
+                status = "[red]✗ Offline[/red]"
                 tools_count = "—"
             else:
-                status = f"[green]✓ Online[/green]"
+                status = "[green]✓ Online[/green]"
                 tools_count = str(len(registry.get_tools(name)))
             table.add_row(name, srv.transport, status, tools_count, endpoint)
         console.print(table)

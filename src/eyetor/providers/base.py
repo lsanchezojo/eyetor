@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from eyetor.models.messages import CompletionResult, Message, StreamingResponse
 from eyetor.models.tools import ToolDefinition
+
+if TYPE_CHECKING:
+    import httpx
 
 logger = logging.getLogger(__name__)
 

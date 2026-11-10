@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from eyetor.knowledge.embedder import Embedder
-from eyetor.knowledge.store import ChunkRow, KnowledgeStore
+from eyetor.knowledge.store import ChunkRow
 
 logger = logging.getLogger(__name__)
 

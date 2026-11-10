@@ -1,4 +1,4 @@
-"""Tests for eyetor.chat.session._is_scaffolding_leak.
+"""Tests for eyetor.chat.guards._is_scaffolding_leak.
 
 Safety net for the "Boteando" group incident: when the announce-without-call
 nudge fails to make the model emit a tool_call, a small model sometimes replies
@@ -10,7 +10,7 @@ reference so a normal answer that merely mentions a tool does not trip it.
 
 from __future__ import annotations
 
-from eyetor.chat.session import _is_scaffolding_leak
+from eyetor.chat.guards import _is_scaffolding_leak
 
 
 # ── Must be detected as a leak ────────────────────────────────────────

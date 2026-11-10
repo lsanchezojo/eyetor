@@ -10,7 +10,7 @@ from pathlib import Path
 
 import httpx
 
-from eyetor.models.images import ImageFile, ImageGenerationRequest, ImageGenerationResult
+from eyetor.models.images import ImageGenerationRequest, ImageGenerationResult
 
 logger = logging.getLogger(__name__)
 

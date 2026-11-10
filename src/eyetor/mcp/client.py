@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import itertools
-import json
 import logging
 from typing import Any
 
-from eyetor.mcp.transport import BaseTransport, HttpTransport, StdioTransport
+from eyetor.mcp.transport import BaseTransport, HttpTransport
 from eyetor.models.tools import ToolDefinition
 
 logger = logging.getLogger(__name__)

@@ -1,4 +1,4 @@
-"""Tests for eyetor.chat.session._TOOL_INTENT_RE.
+"""Tests for eyetor.chat.guards._TOOL_INTENT_RE.
 
 Regression coverage for an announce-without-call miss: the old pattern only
 matched an enumerated verb list ("voy a ejecutar/llamar/usar/..."), so
@@ -10,7 +10,7 @@ legitimate requests for user input from being nudged.
 
 from __future__ import annotations
 
-from eyetor.chat.session import _TOOL_INTENT_RE, _is_asking_user
+from eyetor.chat.guards import _TOOL_INTENT_RE, _is_asking_user
 
 
 def _announces(text: str) -> bool:

@@ -130,7 +130,8 @@ def cmd_grep(path: str, pattern: str, ext: str | None) -> None:
     if not p.exists():
         _err(f"Path not found: {path}")
     results = []
-    glob = f"**/*{ext}" if ext else "**/*"
+    if ext and not ext.startswith("."):
+        ext = "." + ext
     try:
         regex = re.compile(pattern, re.IGNORECASE)
     except re.error as e:

@@ -6,7 +6,6 @@ import logging
 from pathlib import Path
 
 from eyetor.memory.store import MemoryStore
-from eyetor.models.messages import Message
 
 logger = logging.getLogger(__name__)
 

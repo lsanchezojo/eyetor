@@ -2,11 +2,9 @@
 
 import argparse
 import base64
-import email as email_lib
 import json
 import os
 import sys
-from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 sys.path.insert(0, os.path.dirname(__file__))

@@ -66,7 +66,7 @@ def create_image_provider(
 
     if base_url is None:
         raise ValueError(
-            f"Image provider config has no base_url and no provider reference to inherit from"
+            "Image provider config has no base_url and no provider reference to inherit from"
         )
 
     cls = _IMAGE_PROVIDER_MAP.get(config.type)

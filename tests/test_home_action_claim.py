@@ -9,11 +9,8 @@ from __future__ import annotations
 
 import asyncio
 
-from eyetor.chat.session import (
-    ChatSession,
-    _HOME_ACTION_CLAIM_RE,
-    _is_home_action_tool,
-)
+from eyetor.chat.guards import _HOME_ACTION_CLAIM_RE, _is_home_action_tool
+from eyetor.chat.session import ChatSession
 from eyetor.config import VectorConfig
 from eyetor.models.agents import AgentConfig
 from eyetor.models.messages import CompletionResult, FunctionCall, Message, ToolCall

@@ -25,8 +25,9 @@ CLAUDE.md
 #Codex
 .codex/
 
-#github copilot
-.github/
+#github copilot (los workflows de CI sí se publican)
+.github/*
+!.github/workflows/
 
 #Skills locales (no se publican)
 skills/claude-code/
